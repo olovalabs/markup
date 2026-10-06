@@ -340,12 +340,13 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let default_title = SharedString::from(shell_cmd.clone());
+                    let (_, shell_name) = detect_shell();
+                    let default_title = SharedString::from(shell_name);
                     let terminal_placeholder = cx.new(|_cx| {
                         // Temporary dummy until TerminalView is constructed below
                         TerminalWindow {
                             terminal: None,
-                            title: default_title.clone(),
+                            title: default_title,
                         }
                     });
 
