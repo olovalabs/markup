@@ -52,6 +52,7 @@ pub struct Session {
     pub title: SharedString,
     pub terminal: Entity<TerminalView>,
     pub status: SessionStatus,
+    pub pid: Option<u32>,
 }
 pub struct Project {
     pub id: usize,
@@ -88,7 +89,7 @@ impl AppState {
         window_title_target: gpui::WeakEntity<Self>,
         session_id: usize,
         cx: &mut Context<Self>,
-    ) -> Result<Entity<TerminalView>> {
+    ) -> Result<(Entity<TerminalView>, Option<u32>)> {
         let (shell_cmd, _) = detect_shell();
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -111,10 +112,11 @@ impl AppState {
         cmd.env("LANG", "en_US.UTF-8");
         cmd.env("LC_ALL", "en_US.UTF-8");
 
-        let _child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| anyhow::anyhow!("Spawn shell error: {e}"))?;
+        let pid = child.process_id();
 
         let writer = pair.master.take_writer().map_err(|e| anyhow::anyhow!("{e}"))?;
         let reader = pair
@@ -177,7 +179,7 @@ impl AppState {
                     });
                 })
         });
-        Ok(terminal)
+        Ok((terminal, pid))
     }
 
     fn update_session_title(&mut self, session_id: usize, title: &str, cx: &mut Context<Self>) {
@@ -223,57 +225,144 @@ impl AppState {
         }
     }
 
-    /// Evaluates terminal bottom buffer lines and OSC title using Herdr-style detection rules.
-    fn evaluate_agent_status(lines: &[String], title: &str) -> SessionStatus {
+    /// Check if a process is still running
+    #[cfg(unix)]
+    fn is_pid_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    #[cfg(not(unix))]
+    fn is_pid_alive(_pid: u32) -> bool {
+        true
+    }
+
+    /// Retrieve child / descendant process info (matching Herdr's /proc inspection)
+    #[cfg(target_os = "linux")]
+    fn get_descendant_commands(parent_pid: u32) -> Vec<String> {
+        let mut commands = Vec::new();
+        let mut pids_to_check = vec![parent_pid];
+        let mut seen = std::collections::HashSet::new();
+
+        while let Some(current_ppid) = pids_to_check.pop() {
+            if seen.contains(&current_ppid) {
+                continue;
+            }
+            seen.insert(current_ppid);
+
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    if let Ok(pid) = file_name.to_string_lossy().parse::<u32>() {
+                        if pid == current_ppid {
+                            continue;
+                        }
+                        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                            let parts: Vec<&str> = stat.split_whitespace().collect();
+                            if parts.len() > 3 && parts[3] == current_ppid.to_string() {
+                                pids_to_check.push(pid);
+                                if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
+                                    let clean_cmd = cmdline.replace('\0', " ").trim().to_string();
+                                    if !clean_cmd.is_empty() {
+                                        commands.push(clean_cmd);
+                                    }
+                                } else {
+                                    let comm = parts[1].trim_matches(|c| c == '(' || c == ')').to_string();
+                                    commands.push(comm);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        commands
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn get_descendant_commands(_parent_pid: u32) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Evaluates terminal bottom buffer lines, OSC title, and process tree
+    fn evaluate_agent_status(lines: &[String], title: &str, pid: Option<u32>) -> SessionStatus {
+        if let Some(p) = pid {
+            if !Self::is_pid_alive(p) {
+                return SessionStatus::Done;
+            }
+        }
+
         let title_lower = title.to_lowercase();
-        // Check for Herdr spinners or active keywords in OSC title
+        // 1. Check Herdr OSC title rules
         if title_lower.contains("working")
             || title_lower.contains("baking")
             || title_lower.contains("thinking")
+            || title_lower.contains("generating")
             || title.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒', '·', '✢', '✳', '✶', '✻', '✽'])
         {
             return SessionStatus::Working;
         }
 
-        // Check recent screen lines (bottom of the viewport)
-        for line in lines.iter().rev().take(6) {
+        // 2. Check recent bottom screen buffer (Herdr bottom_lines / whole_recent inspection)
+        for line in lines.iter().rev().take(8) {
             let l = line.trim();
             if l.is_empty() {
                 continue;
             }
 
-            // Blocked: Prompt awaiting human decision or tool approval
-            if l.contains("esc to cancel")
-                || l.contains("[y/n]")
-                || l.contains("[Y/n]")
-                || l.contains("[y/N]")
-                || l.contains("Allow tool execution?")
-                || l.contains("Do you want to run:")
-                || l.contains("Press Enter to continue")
+            // Blocked: Awaiting human confirmation, decision or tool permission
+            let l_lower = l.to_lowercase();
+            if l_lower.contains("esc to cancel")
+                || l_lower.contains("[y/n]")
+                || l_lower.contains("(y/n)")
+                || l_lower.contains("[y/n")
+                || l_lower.contains("allow tool execution?")
+                || l_lower.contains("do you want to proceed?")
+                || l_lower.contains("do you want to run:")
+                || l_lower.contains("press enter to continue")
+                || l_lower.contains("permission required")
             {
                 return SessionStatus::Blocked;
             }
 
-            // Working: Active spinner glyphs, progress bars, or work verbs
+            // Working: Activity spinners, animated characters, or active work verbs
             if l.contains("Working...")
                 || l.contains("Thinking...")
                 || l.contains("Generating...")
                 || l.contains("Running...")
+                || l.contains("Executing...")
                 || l.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒'])
             {
                 return SessionStatus::Working;
             }
 
-            // Idle: Waiting at command or prompt input box
-            if l.starts_with('❯') || l.starts_with('▸') || l.starts_with('➜') || l.starts_with('$') || l.starts_with('>') {
+            // Idle: Waiting at command prompt
+            if l.starts_with('❯') || l.starts_with('▸') || l.starts_with('➜') || l.ends_with('$') || l.ends_with('>') || l.ends_with('#') {
                 return SessionStatus::Idle;
+            }
+        }
+
+        // 3. Check foreground child processes (Herdr process-info inspection)
+        if let Some(p) = pid {
+            let child_commands = Self::get_descendant_commands(p);
+            for cmd in child_commands {
+                let cmd_lower = cmd.to_lowercase();
+                // If a non-shell child process is actively running, it is in a working/executing turn
+                if !cmd_lower.is_empty()
+                    && !cmd_lower.ends_with("bash")
+                    && !cmd_lower.ends_with("zsh")
+                    && !cmd_lower.ends_with("fish")
+                    && !cmd_lower.ends_with("sh")
+                {
+                    // Check if it's an agent or child tool execution
+                    return SessionStatus::Working;
+                }
             }
         }
 
         SessionStatus::Idle
     }
 
-    /// Periodic detection tick matching Herdr's screen and title manifest evaluation
+    /// Periodic detection tick matching Herdr's screen, title, and process inspection
     pub fn poll_sessions_status(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
         for project in &mut self.projects {
@@ -283,8 +372,8 @@ impl AppState {
                 }
                 let terminal = session.terminal.read(cx);
                 let title = terminal.title().unwrap_or("");
-                let bottom_lines = terminal.bottom_lines(10);
-                let detected = Self::evaluate_agent_status(&bottom_lines, title);
+                let bottom_lines = terminal.bottom_lines(12);
+                let detected = Self::evaluate_agent_status(&bottom_lines, title, session.pid);
                 if session.status != detected {
                     session.status = detected;
                     changed = true;
@@ -305,7 +394,7 @@ impl AppState {
         self.next_id += 1;
 
         let dir = self.active_project().map(|p| p.path.clone());
-        if let Ok(terminal) = Self::spawn_terminal_view(
+        if let Ok((terminal, pid)) = Self::spawn_terminal_view(
             dir.as_ref(),
             self.palette.clone(),
             self_weak,
@@ -322,6 +411,7 @@ impl AppState {
                 title: SharedString::from(format!("terminal {}", session_count + 1)),
                 terminal,
                 status: SessionStatus::Idle,
+                pid,
             };
 
             if let Some(project) = self.active_project_mut() {
@@ -343,7 +433,7 @@ impl AppState {
             let next_id = self.next_id;
             self.next_id += 1;
 
-            if let Ok(terminal) = Self::spawn_terminal_view(
+            if let Ok((terminal, pid)) = Self::spawn_terminal_view(
                 Some(&folder),
                 self.palette.clone(),
                 self_weak,
@@ -356,8 +446,8 @@ impl AppState {
                     title: SharedString::from("terminal 1"),
                     terminal,
                     status: SessionStatus::Idle,
+                    pid,
                 };
-
                 let project = Project {
                     id: next_id,
                     name,
@@ -833,7 +923,7 @@ fn main() -> Result<()> {
                     let current_dir_clone = current_dir.clone();
                     let app_state = cx.new(|cx| {
                         let self_weak = cx.entity().downgrade();
-                        let initial_terminal = AppState::spawn_terminal_view(
+                        let (initial_terminal, pid) = AppState::spawn_terminal_view(
                             Some(&current_dir_clone),
                             palette_clone.clone(),
                             self_weak,
@@ -849,6 +939,7 @@ fn main() -> Result<()> {
                             title: SharedString::from("terminal 1"),
                             terminal: initial_terminal,
                             status: SessionStatus::Idle,
+                            pid,
                         };
 
                         let initial_project = Project {

@@ -16,6 +16,7 @@ alacritty_terminal = "0.25.1"
 anyhow = "1"
 parking_lot = "0.12"
 rfd = "0.15"
+libc = "0.2"
 
 [patch.crates-io]
 gpui = { path = "components/gpui" }
