@@ -20,8 +20,28 @@ parking_lot = "0.12"
 gpui = { path = "components/gpui" }
 gpui-component = { path = "components" }
 
-[profile.dev.package.gpui-component]
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.markup]
 opt-level = 2
 
+[profile.dev.package.gpui]
+opt-level = 3
+
+[profile.dev.package.gpui-component]
+opt-level = 3
+
 [profile.dev.package.gpui-terminal]
-opt-level = 2
+opt-level = 3
+
+[profile.dev.package.alacritty_terminal]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
