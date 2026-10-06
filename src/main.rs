@@ -39,23 +39,20 @@ impl std::io::Write for SharedWriter {
 struct TerminalWindow {
     terminal: Option<Entity<TerminalView>>,
     title: SharedString,
-    title_locked: bool,
 }
 
 impl TerminalWindow {
     fn set_title(&mut self, title: &str, cx: &mut Context<Self>) {
-        if self.title_locked {
-            return;
-        }
-
         let trimmed = title.trim();
-        // Ignore empty or generic shell prompts; capture the first meaningful title
-        if !trimmed.is_empty() && trimmed != "bash" && trimmed != "zsh" && trimmed != "sh" && trimmed != "fish" {
-            self.title = SharedString::from(trimmed.to_string());
-            self.title_locked = true;
-            cx.notify();
-        } else if !trimmed.is_empty() && self.title.as_ref() != trimmed {
-            self.title = SharedString::from(trimmed.to_string());
+        let next_title = if trimmed.is_empty() {
+            let (_, shell_name) = detect_shell();
+            SharedString::from(shell_name)
+        } else {
+            SharedString::from(trimmed.to_string())
+        };
+
+        if self.title != next_title {
+            self.title = next_title;
             cx.notify();
         }
     }
@@ -354,14 +351,14 @@ fn main() -> Result<()> {
                         TerminalWindow {
                             terminal: None,
                             title: default_title,
-                            title_locked: false,
                         }
                     });
                     let weak_window = terminal_placeholder.downgrade();
                     let terminal = cx.new(|cx| {
                         TerminalView::new(shared_writer, reader, config, cx)
                             .with_resize_callback(resize_callback)
-                            .with_title_callback(move |_window, cx, title| {
+                            .with_title_callback(move |window, cx, title| {
+                                window.set_window_title(title);
                                 let _ = weak_window.update(cx, |w, cx| {
                                     w.set_title(title, cx);
                                 });
