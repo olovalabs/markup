@@ -16,8 +16,12 @@ use parking_lot::Mutex;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde_json::Value;
 
+mod agent_rules;
 mod assets;
+mod status;
+
 use assets::{load_embedded_fonts, sync_component_fonts, CombinedAssets, MONO_FONT};
+use status::{SessionStatus, StatusInput};
 
 struct SharedWriter {
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
@@ -39,21 +43,27 @@ impl std::io::Write for SharedWriter {
         self.writer.lock().flush()
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionStatus {
-    Idle,
-    Working,
-    Blocked,
-    Done,
-}
-
 pub struct Session {
     pub id: usize,
     pub title: SharedString,
     pub terminal: Entity<TerminalView>,
     pub status: SessionStatus,
     pub pid: Option<u32>,
+    /// Screen fingerprint at the moment the user last looked at a finished or
+    /// failed terminal. While the screen still matches, the sticky Done/Error
+    /// badge stays acknowledged (Idle); any new output invalidates it and lets
+    /// a fresh Done/Error be raised.
+    pub ack_screen: Option<u64>,
+    /// A recognized agent CLI was the foreground process on the previous tick.
+    /// Its disappearance means the agent finished (Done), like herdr.
+    pub agent_active: bool,
+    /// When the terminal first showed an unacknowledged Done, for the short
+    /// auto-clear timeout in the spec.
+    pub done_since: Option<std::time::Instant>,
 }
+
+/// How long an unacknowledged Done badge lingers before it falls back to Idle.
+const DONE_LINGER: std::time::Duration = std::time::Duration::from_secs(30);
 pub struct Project {
     pub id: usize,
     pub name: String,
@@ -67,6 +77,9 @@ struct AppState {
     active_project_idx: usize,
     next_id: usize,
     palette: ColorPalette,
+    /// Session that currently owns keyboard focus, tracked every render frame
+    /// and consumed by the status poller (Active state, sticky-state clearing).
+    focused_session_id: Option<usize>,
 }
 
 impl AppState {
@@ -162,7 +175,6 @@ impl AppState {
         };
 
         let target = window_title_target.clone();
-        let target_for_exit = window_title_target.clone();
         let terminal = cx.new(|cx| {
             TerminalView::new(shared_writer, reader, config, cx)
                 .with_resize_callback(resize_callback)
@@ -173,11 +185,8 @@ impl AppState {
                         state.update_session_title(session_id, &title_str, cx);
                     });
                 })
-                .with_exit_callback(move |_window, cx| {
-                    let _ = target_for_exit.update(cx, |state, cx| {
-                        state.set_session_status(session_id, SessionStatus::Done, cx);
-                    });
-                })
+            // Exit status is intentionally not set here: the status poller
+            // derives Done/Error from the real exit code (see poll_sessions_status).
         });
         Ok((terminal, pid))
     }
@@ -201,118 +210,183 @@ impl AppState {
         }
     }
 
-    fn set_session_status(&mut self, session_id: usize, status: SessionStatus, cx: &mut Context<Self>) {
-        for project in &mut self.projects {
-            for session in &mut project.sessions {
-                if session.id == session_id {
-                    if session.status != status {
-                        session.status = status;
-                        cx.notify();
-                    }
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Check if a process is still running
-    #[cfg(unix)]
-    fn is_pid_alive(pid: u32) -> bool {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-
-    #[cfg(not(unix))]
-    fn is_pid_alive(_pid: u32) -> bool {
-        true
-    }
-
-
-    /// Evaluates terminal bottom buffer lines, OSC title, and process tree
-    fn evaluate_agent_status(lines: &[String], title: &str, pid: Option<u32>) -> SessionStatus {
-        if let Some(p) = pid {
-            if !Self::is_pid_alive(p) {
-                return SessionStatus::Done;
-            }
-        }
-
-        // 1. High priority: Inspect bottom visible lines (active prompt vs active work)
-        // In Herdr, `live_prompt_box` ('^\s*❯') has high priority to establish IDLE
-        for line in lines.iter().rev().take(6) {
-            let l = line.trim();
-            if l.is_empty() {
-                continue;
-            }
-
-            // A. Blocked: prompt awaiting human decision or tool approval
-            let l_lower = l.to_lowercase();
-            if l_lower.contains("esc to cancel")
-                || l_lower.contains("[y/n]")
-                || l_lower.contains("(y/n)")
-                || l_lower.contains("[y/n")
-                || l_lower.contains("allow tool execution?")
-                || l_lower.contains("do you want to proceed?")
-                || l_lower.contains("do you want to run:")
-                || l_lower.contains("press enter to continue")
-                || l_lower.contains("permission required")
-                || l_lower.contains("allow this command?")
-            {
-                return SessionStatus::Blocked;
-            }
-
-            // B. Idle prompt: Agent or shell is at an interactive prompt waiting for user input
-            if l.starts_with('❯')
-                || l.starts_with('▸')
-                || l.starts_with('➜')
-                || l.ends_with('$')
-                || l.ends_with('>')
-                || l.ends_with('#')
-                || l.ends_with('%')
-            {
-                return SessionStatus::Idle;
-            }
-
-            // C. Working: Active spinner or status verbs in bottom lines
-            if l.contains("Working...")
-                || l.contains("Thinking...")
-                || l.contains("Generating...")
-                || l.contains("Running...")
-                || l.contains("Executing...")
-                || l.contains("Synthesizing...")
-                || l.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒'])
-            {
-                return SessionStatus::Working;
-            }
-        }
-
-        // 2. OSC Title spinner inspection (Herdr osc_title_working)
-        let title_lower = title.to_lowercase();
-        if title_lower.contains("working")
-            || title_lower.contains("baking")
-            || title_lower.contains("thinking")
-            || title_lower.contains("generating")
-            || title_lower.contains("executing")
-            || title.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒', '·', '✢', '✳', '✶', '✻', '✽'])
-        {
-            return SessionStatus::Working;
-        }
-
-        SessionStatus::Idle
-    }
-
-    /// Periodic detection tick matching Herdr's screen, title, and process inspection
+    /// Periodic detection tick, herdr-style: screen scrape + OSC title +
+    /// foreground process tree, with sticky Done/Error and focus resolution.
     pub fn poll_sessions_status(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        let focused_id = self.focused_session_id;
+        // `T3_STATUS_DEBUG=1` dumps every detection pass: the facts that went in
+        // and the badge that came out. Without this the poller is invisible.
+        let debug = status::debug_enabled();
         for project in &mut self.projects {
             for session in &mut project.sessions {
-                if session.status == SessionStatus::Done {
-                    continue;
+                let focused = focused_id == Some(session.id);
+
+                // Background terminals never render, so their PTY events
+                // (title updates, child exit) must be drained here or the
+                // status would go stale while the user is in another tab.
+                if !focused {
+                    session.terminal.update(cx, |term, cx| {
+                        term.drain_background_events(cx);
+                    });
                 }
-                let terminal = session.terminal.read(cx);
-                let title = terminal.title().unwrap_or("");
-                let bottom_lines = terminal.bottom_lines(12);
-                let detected = Self::evaluate_agent_status(&bottom_lines, title, session.pid);
-                if session.status != detected {
-                    session.status = detected;
+
+                // Reused for both the debug dump and the agent lifecycle below.
+                let foreground = status::foreground_process_names(session.pid);
+
+                let (next, ack, screen_fp) = {
+                    let terminal = session.terminal.read(cx);
+                    // `bottom_lines` takes the last N *rows*, clamped to the
+                    // visible screen. Ask for the whole screen: a fresh shell
+                    // prints its prompt on row 0, well above a 12-row window
+                    // at the bottom. The rules skip blank rows themselves.
+                    let bottom_lines = terminal.bottom_lines(usize::MAX);
+                    let title = terminal.title().unwrap_or("");
+                    let screen_fp = screen_fingerprint(&bottom_lines, title);
+
+                    // Looking at a finished/failed terminal acknowledges it:
+                    // while the screen is unchanged the sticky badge stays
+                    // cleared; new output re-arms it.
+                    let ack = if focused
+                        && (terminal.has_exited()
+                            || matches!(session.status, SessionStatus::Done | SessionStatus::Error))
+                    {
+                        Some(screen_fp)
+                    } else {
+                        session.ack_screen
+                    };
+                    let acknowledged = ack == Some(screen_fp);
+
+                    // Exit of the PTY child wins: the real exit code decides
+                    // Done (0) vs Error (non-zero / signal), herdr-style.
+                    let next = if terminal.has_exited() {
+                        if acknowledged {
+                            SessionStatus::Idle
+                        } else {
+                            match terminal.exit_status() {
+                                Some(0) | None => SessionStatus::Done,
+                                Some(_) => SessionStatus::Error,
+                            }
+                        }
+                    } else {
+                        let input = StatusInput {
+                            lines: &bottom_lines,
+                            title: Some(title),
+                            foreground: &foreground,
+                        };
+                        let detected = status::evaluate(&input, session.status, focused);
+                        if acknowledged && matches!(detected, SessionStatus::Done | SessionStatus::Error) {
+                            if focused {
+                                SessionStatus::Active
+                            } else {
+                                SessionStatus::Idle
+                            }
+                        } else {
+                            detected
+                        }
+                    };
+
+                    if debug {
+                        let rule = status::explain(&StatusInput {
+                            lines: &bottom_lines,
+                            title: Some(title),
+                            foreground: &foreground,
+                        })
+                        .map_or_else(
+                            || "(no rule)".to_string(),
+                            |m| {
+                                format!(
+                                    "{}/{} v{} state={} priority={} region={} \
+                                     visible(working/blocker/idle)={}/{}/{} skip_update={}",
+                                    m.pack,
+                                    m.rule,
+                                    m.pack_version.as_deref().unwrap_or("?"),
+                                    m.state.label(),
+                                    m.priority,
+                                    m.region,
+                                    m.visible_working,
+                                    m.visible_blocker,
+                                    m.visible_idle,
+                                    m.skip_state_update,
+                                )
+                            },
+                        );
+                        eprintln!(
+                            "[status] session={} focused={focused} exited={} exit={:?} \
+                             pid={:?} fg={foreground:?} pack={:?} title={title:?} \
+                             prev={} next={} rule={rule}",
+                            session.id,
+                            terminal.has_exited(),
+                            terminal.exit_status(),
+                            session.pid,
+                            status::pack_for(&foreground),
+                            session.status.label(),
+                            next.label(),
+                        );
+                        let screen: Vec<&str> = bottom_lines
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|line| !line.trim().is_empty())
+                            .collect();
+                        let from = screen.len().saturating_sub(DEBUG_SCREEN_LINES);
+                        for line in &screen[from..] {
+                            eprintln!("[status]   | {line}");
+                        }
+                    }
+
+                    (next, ack, screen_fp)
+                };
+
+                // Agent lifecycle. Two ways a task counts as finished, because
+                // an agent CLI keeps running after it answers:
+                //
+                //  * the CLI itself exited (agent gone), or
+                //  * it stopped working and is back at rest (the response is
+                //    complete) — the usual case, and the one exit codes can
+                //    never catch, since the PTY child is the persistent shell.
+                //
+                // Either way the completion is reported as Done: herdr's "the
+                // agent finished and you have not looked at it yet". Reporting
+                // it only while unfocused is deliberate — a badge is for the
+                // tab you are *not* on.
+                let agent_now = foreground.iter().any(|name| status::is_agent_process(name));
+                let agent_exited = session.agent_active && !agent_now;
+                session.agent_active = agent_now;
+
+                let turn_finished = matches!(
+                    session.status,
+                    SessionStatus::Working | SessionStatus::Blocked
+                ) && next == SessionStatus::Idle;
+
+                let just_finished = agent_exited || turn_finished;
+                let next = if just_finished
+                    && next == SessionStatus::Idle
+                    && ack != Some(screen_fp)
+                    && !focused
+                {
+                    SessionStatus::Done
+                } else {
+                    next
+                };
+
+                // Spec: Done also drops back to Idle after a short timeout even
+                // if the user never focuses the terminal.
+                let next = if next == SessionStatus::Done {
+                    let since = *session.done_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= DONE_LINGER {
+                        session.done_since = None;
+                        SessionStatus::Idle
+                    } else {
+                        next
+                    }
+                } else {
+                    session.done_since = None;
+                    next
+                };
+
+                session.ack_screen = ack;
+                if session.status != next {
+                    session.status = next;
                     changed = true;
                 }
             }
@@ -349,6 +423,9 @@ impl AppState {
                 terminal,
                 status: SessionStatus::Idle,
                 pid,
+                ack_screen: None,
+                agent_active: false,
+                done_since: None,
             };
 
             if let Some(project) = self.active_project_mut() {
@@ -384,6 +461,9 @@ impl AppState {
                     terminal,
                     status: SessionStatus::Idle,
                     pid,
+                    ack_screen: None,
+                    agent_active: false,
+                    done_since: None,
                 };
                 let project = Project {
                     id: next_id,
@@ -429,6 +509,13 @@ impl AppState {
 
 impl Render for AppState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Track which session owns keyboard focus each frame; the poller uses
+        // this for Active-state resolution and for clearing sticky Done/Error.
+        self.focused_session_id = self.active_session().and_then(|s| {
+            let focused = s.terminal.read(cx).focus_handle().is_focused(_window);
+            focused.then_some(s.id)
+        });
+
         let active_title = self
             .active_session()
             .map(|s| s.title.clone())
@@ -440,6 +527,9 @@ impl Render for AppState {
             .unwrap_or_else(|| "No Project".to_string());
 
         let active_session_view = self.active_session().map(|s| s.terminal.clone());
+
+        // Focused terminal's status, mirrored in the title bar.
+        let titlebar_status = self.active_session().map(|s| s.status);
 
         div()
             .flex()
@@ -456,9 +546,30 @@ impl Render for AppState {
                         .flex()
                         .items_center()
                         .justify_center()
+                        .gap_2()
                         .text_size(px(12.5))
                         .text_color(rgba(0x8b949eff))
-                        .child(format!("{active_project_name} — {active_title}")),
+                        .child(format!("{active_project_name} — {active_title}"))
+                        .children(titlebar_status.map(|status| {
+                            let (dot_color, text_color, badge_bg) = status.colors();
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .bg(rgba(badge_bg))
+                                .text_color(rgba(text_color))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .rounded_full()
+                                        .bg(rgba(dot_color)),
+                                )
+                                .child(status.label())
+                        })),
                 ),
             )
             .child(
@@ -588,6 +699,7 @@ impl Render for AppState {
                                             // Sessions list for this project
                                             .children(project.sessions.iter().enumerate().map(|(s_idx, session)| {
                                                 let is_active_session = is_active_project && s_idx == project.active_session_idx;
+                                                let (dot_color, text_color, badge_bg) = session.status.colors();
                                                 div()
                                                     .id(("session-item", session.id))
                                                     .ml_3()
@@ -615,12 +727,7 @@ impl Render for AppState {
                                                                     .w(px(6.0))
                                                                     .h(px(6.0))
                                                                     .rounded_full()
-                                                                    .bg(match session.status {
-                                                                        SessionStatus::Idle => rgba(0x8b949eff),     // Muted gray
-                                                                        SessionStatus::Working => rgba(0x3fb950ff),  // Vibrant green
-                                                                        SessionStatus::Blocked => rgba(0xd29922ff),  // Warning amber
-                                                                        SessionStatus::Done => rgba(0x58a6ffff),     // Clean blue
-                                                                    })
+                                                                    .bg(rgba(dot_color))
                                                             )
                                                             .child(
                                                                 div()
@@ -639,24 +746,9 @@ impl Render for AppState {
                                                             .px_1p5()
                                                             .py_0p5()
                                                             .rounded_sm()
-                                                            .bg(match session.status {
-                                                                SessionStatus::Idle => rgba(0x21262d88),
-                                                                SessionStatus::Working => rgba(0x23863644),
-                                                                SessionStatus::Blocked => rgba(0x9e6a0344),
-                                                                SessionStatus::Done => rgba(0x1f6feb33),
-                                                            })
-                                                            .text_color(match session.status {
-                                                                SessionStatus::Idle => rgba(0x8b949eff),
-                                                                SessionStatus::Working => rgba(0x3fb950ff),
-                                                                SessionStatus::Blocked => rgba(0xd29922ff),
-                                                                SessionStatus::Done => rgba(0x58a6ffff),
-                                                            })
-                                                            .child(match session.status {
-                                                                SessionStatus::Idle => "idle",
-                                                                SessionStatus::Working => "working",
-                                                                SessionStatus::Blocked => "blocked",
-                                                                SessionStatus::Done => "done",
-                                                            }),
+                                                            .bg(rgba(badge_bg))
+                                                            .text_color(rgba(text_color))
+                                                            .child(session.status.label()),
                                                     )
                                                     .on_mouse_down(
                                                         MouseButton::Left,
@@ -688,6 +780,19 @@ impl Render for AppState {
                     ),
             )
     }
+}
+
+/// How many non-empty screen lines `T3_STATUS_DEBUG` prints per terminal.
+const DEBUG_SCREEN_LINES: usize = 14;
+
+/// Cheap, stable fingerprint of what is on screen, used to tell whether the
+/// user has already looked at a finished/failed terminal.
+fn screen_fingerprint(lines: &[String], title: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lines.hash(&mut hasher);
+    title.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -877,6 +982,9 @@ fn main() -> Result<()> {
                             terminal: initial_terminal,
                             status: SessionStatus::Idle,
                             pid,
+                            ack_screen: None,
+                            agent_active: false,
+                            done_since: None,
                         };
 
                         let initial_project = Project {
@@ -892,6 +1000,7 @@ fn main() -> Result<()> {
                             active_project_idx: 0,
                             next_id: 2,
                             palette: palette_clone,
+                            focused_session_id: None,
                         }
                     });
 
@@ -918,4 +1027,107 @@ fn main() -> Result<()> {
         });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod xtgettcap_tests {
+    //! End-to-end check of the terminal crate's XTGETTCAP passthrough: a
+    //! capability query must produce a reply on the PTY writer and must never
+    //! reach the grid as printable output.
+
+    use alacritty_terminal::event::WindowSize;
+    use gpui_terminal::{ColorPalette, GpuiEventProxy, PtyWriter, TerminalNotifier, TerminalState};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    /// Writer sink that records everything the terminal writes back.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A terminal with a real PTY writer installed, like the app has.
+    fn terminal_with_capture() -> (TerminalState, Capture) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let proxy = GpuiEventProxy::new(tx);
+        // The notifier slot is shared with the proxy/Term, so installing the
+        // writer after construction is exactly what `TerminalView` does.
+        let slot = proxy.notifier_slot();
+        let state = TerminalState::new(80, 24, proxy);
+
+        let capture = Capture::default();
+        let writer: PtyWriter = Arc::new(Mutex::new(
+            Box::new(capture.clone()) as Box<dyn std::io::Write + Send>
+        ));
+        *slot.lock() = Some(TerminalNotifier::new(
+            writer,
+            Arc::new(Mutex::new(WindowSize {
+                num_lines: 24,
+                num_cols: 80,
+                cell_width: 8,
+                cell_height: 16,
+            })),
+            Arc::new(Mutex::new(ColorPalette::default())),
+        ));
+
+        (state, capture)
+    }
+
+    #[test]
+    fn rgb_capability_is_answered_with_a_value() {
+        let (mut state, capture) = terminal_with_capture();
+
+        // "RGB" hex-encoded is `524742`.
+        state.process_bytes(b"\x1bP+q524742\x1b\\");
+
+        let reply = String::from_utf8_lossy(&capture.0.lock()).to_string();
+        // `1` hex-encoded is `31`.
+        assert_eq!(reply, "\x1bP1+r524742=31\x1b\\");
+    }
+
+    #[test]
+    fn unknown_capability_gets_the_invalid_reply() {
+        let (mut state, capture) = terminal_with_capture();
+
+        // "XYZ" hex-encoded is `58595a`.
+        state.process_bytes(b"\x1bP+q58595a\x1b\\");
+
+        let reply = String::from_utf8_lossy(&capture.0.lock()).to_string();
+        assert_eq!(reply, "\x1bP0+r58595a\x1b\\");
+    }
+
+    #[test]
+    fn multiple_capabilities_get_one_reply_each() {
+        let (mut state, capture) = terminal_with_capture();
+
+        // "RGB;XYZ" -> `524742;58595a`
+        state.process_bytes(b"\x1bP+q524742;58595a\x1b\\");
+
+        let reply = String::from_utf8_lossy(&capture.0.lock()).to_string();
+        assert_eq!(reply, "\x1bP1+r524742=31\x1b\\\x1bP0+r58595a\x1b\\");
+    }
+
+    #[test]
+    fn query_is_not_printed_to_the_grid() {
+        let (mut state, capture) = terminal_with_capture();
+
+        state.process_bytes(b"before \x1bP+q524742\x1b\\ after\r\n");
+
+        // Content starts on the top row, so read the whole visible screen.
+        let screen = state.bottom_lines(usize::MAX).join("\n");
+        assert!(
+            screen.contains("before  after"),
+            "query text leaked into the grid: {screen:?}"
+        );
+        assert!(!capture.0.lock().is_empty(), "the query should have been answered");
+    }
 }

@@ -181,6 +181,9 @@ pub struct TerminalView {
     title: Option<String>,
     exit_status: Option<i32>,
     exited: bool,
+    /// Events a background drain (`drain_background_events`) could not fully
+    /// process and is saving for the next foreground render.
+    deferred_events: Vec<TerminalEvent>,
 }
 
 impl TerminalView {
@@ -311,6 +314,7 @@ impl TerminalView {
             title: None,
             exit_status: None,
             exited: false,
+            deferred_events: Vec::new(),
         }
     }
 
@@ -1285,6 +1289,9 @@ impl TerminalView {
         while let Ok(event) = self.event_rx.try_recv() {
             events.push(event);
         }
+        if !self.deferred_events.is_empty() {
+            events.extend(self.deferred_events.drain(..));
+        }
 
         for event in events {
             match event {
@@ -1352,6 +1359,55 @@ impl TerminalView {
                         self.exit_callback = Some(callback);
                     }
                 }
+            }
+        }
+    }
+
+    /// Consume pending PTY events for a *background* terminal.
+    ///
+    /// Background terminals are not painted, so their `render` never runs and
+    /// `Title` / `ChildExit` events would otherwise queue up until the user
+    /// switches to that tab. A host status poller calls this each tick so
+    /// `title()`, `exit_status()` and `has_exited()` stay current for every
+    /// session at once. Events that genuinely need a window (the `Exit`
+    /// callback, clipboard interactions) are buffered in `deferred_events` and
+    /// replayed by the next foreground `process_events`.
+    pub fn drain_background_events(&mut self, cx: &mut Context<Self>) {
+        let mut events = Vec::new();
+        while let Ok(event) = self.event_rx.try_recv() {
+            events.push(event);
+        }
+
+        for event in events {
+            match event {
+                TerminalEvent::Title(title) => {
+                    self.title = Some(title);
+                    cx.notify();
+                }
+                TerminalEvent::ResetTitle => {
+                    self.title = None;
+                    cx.notify();
+                }
+                TerminalEvent::ChildExit(code) => {
+                    self.exit_status = Some(code);
+                    cx.notify();
+                }
+                // State-only: keep the flag, leave the callback for the
+                // foreground render.
+                TerminalEvent::Exit => {
+                    self.exited = true;
+                    self.blink_task = None;
+                    self.drag_scroll_task = None;
+                    self.deferred_events.push(TerminalEvent::Exit);
+                    cx.notify();
+                }
+                // No state impact for an unfocused terminal: drop.
+                TerminalEvent::Wakeup
+                | TerminalEvent::MouseCursorDirty
+                | TerminalEvent::Bell
+                | TerminalEvent::CursorBlinkingChange
+                | TerminalEvent::ClipboardStore(..)
+                | TerminalEvent::ClipboardLoad(..) => {}
             }
         }
     }

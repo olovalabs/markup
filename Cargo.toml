@@ -18,6 +18,7 @@ parking_lot = "0.12"
 rfd = "0.15"
 libc = "0.2"
 regex = "1"
+toml = "1"
 
 [patch.crates-io]
 gpui = { path = "components/gpui" }

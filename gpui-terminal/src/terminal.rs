@@ -4,7 +4,7 @@
 //! keeps the terminal behind a `parking_lot::Mutex` so the PTY reader task and
 //! the UI thread can share it.
 
-use crate::event::GpuiEventProxy;
+use crate::event::{GpuiEventProxy, TerminalNotifierHandle};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -72,6 +72,8 @@ pub struct TerminalState {
     cols: usize,
     rows: usize,
     config: Config,
+    /// Kept so protocol passthroughs (XTGETTCAP) can reply into the PTY.
+    notifier: TerminalNotifierHandle,
 }
 
 impl TerminalState {
@@ -92,6 +94,7 @@ impl TerminalState {
         event_proxy: GpuiEventProxy,
     ) -> Self {
         let dimensions = TermDimensions::new(cols, rows);
+        let notifier = event_proxy.notifier_handle();
         let term = Term::new(config.clone(), &dimensions, event_proxy);
 
         Self {
@@ -100,6 +103,7 @@ impl TerminalState {
             cols: dimensions.columns(),
             rows: dimensions.screen_lines(),
             config,
+            notifier,
         }
     }
 
@@ -122,8 +126,47 @@ impl TerminalState {
     }
 
     pub fn process_bytes(&mut self, bytes: &[u8]) {
+        self.answer_xtgettcap(bytes);
         let mut term = self.term.lock();
         self.parser.advance(&mut *term, bytes);
+    }
+
+    /// Answer XTGETTCAP queries (`DCS + q <hex-encoded caps> ST`).
+    ///
+    /// alacritty_terminal's ANSI handler never dispatches DCS (vte's
+    /// `hook`/`put`/`unhook` are no-ops), so the raw byte stream is snooped here
+    /// and replies are written straight into the PTY through the notifier.
+    /// Per xterm/kitty, a supported capability is answered with
+    /// `DCS 1 + r <hex-cap>=<hex-value> ST` and an unsupported one with
+    /// `DCS 0 + r <hex-cap> ST`. Capability names may be `;`-separated, in which
+    /// case one reply is sent per name.
+    ///
+    /// Only queries fully contained in `bytes` are answered: a query split
+    /// across two PTY reads is ignored rather than answered piecemeal (agent
+    /// CLIs send their capability probes in a single write).
+    fn answer_xtgettcap(&mut self, bytes: &[u8]) {
+        const DCS_PLUS_Q: &[u8] = b"\x1bP+q";
+        const ST: &[u8] = b"\x1b\\";
+
+        let mut search_from = 0;
+        while let Some(rel) = find_subslice(&bytes[search_from..], DCS_PLUS_Q) {
+            let start = search_from + rel + DCS_PLUS_Q.len();
+            let Some(end_rel) = find_subslice(&bytes[start..], ST) else {
+                break; // unterminated query: cannot answer it from this read
+            };
+            // `Pt` is one or more `;`-separated hex-encoded names, so split the
+            // raw payload first and decode each name separately.
+            for name_hex in bytes[start..start + end_rel].split(|&b| b == b';') {
+                if name_hex.is_empty() {
+                    continue;
+                }
+                if let Some(cap) = decode_hex(name_hex) {
+                    let reply = xtgettcap_reply(cap.as_str());
+                    self.notifier.write(&reply);
+                }
+            }
+            search_from = start + end_rel + ST.len();
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -386,9 +429,67 @@ impl TerminalState {
             let start = Point::new(line, Column(0));
             let end = Point::new(line, last_col);
             lines.push(term.bounds_to_string(start, end).trim_end().to_string());
-        }
-        lines
+        }                lines
     }
+}
+
+/// Find `needle` in `haystack` and return the byte offset of the first match.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Value of an XTGETTCAP capability, if we implement it.
+///
+/// `RGB`/`Tc` advertise direct colour support, which the renderer does honour
+/// (the palette and truecolour SGR sequences are handled by `colors.rs`).
+/// Everything else is answered as unsupported so probing clients fall back to
+/// their conservative path instead of assuming the feature exists.
+fn xtgettcap_value(cap: &str) -> Option<&'static str> {
+    match cap {
+        "RGB" | "Tc" => Some("1"),
+        _ => None,
+    }
+}
+
+/// Build the `DCS` reply for one requested capability.
+fn xtgettcap_reply(cap: &str) -> Vec<u8> {
+    let name_hex = encode_hex(cap.as_bytes());
+    match xtgettcap_value(cap) {
+        Some(value) => {
+            format!("\x1bP1+r{name_hex}={}\x1b\\", encode_hex(value.as_bytes())).into_bytes()
+        }
+        None => format!("\x1bP0+r{name_hex}\x1b\\").into_bytes(),
+    }
+}
+
+/// Lowercase hex encoding, as used by XTGETTCAP parameters.
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Decode a hex nibble pair per byte. Returns `None` if the sequence is
+/// malformed (odd length or bad nibble).
+fn decode_hex(bytes: &[u8]) -> Option<String> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    String::from_utf8(out).ok()
 }
 
 #[cfg(test)]
@@ -509,6 +610,37 @@ mod tests {
         assert!(terminal.is_vi_mode());
         terminal.toggle_vi_mode();
         assert!(!terminal.is_vi_mode());
+    }
+
+    #[test]
+    fn test_xtgettcap_known_cap_replies_inline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(80, 24, proxy);
+
+        // XTGETTCAP requests are `ESC P + q <percent-encoded> ESC \`; the
+        // responder must fire before the stream reaches the grid and must not
+        // print anything.
+        terminal.process_bytes(b"\x1bP+q5442\x1b\\");
+
+        // The query is dropped by the VTE handler (no output): nothing was
+        // printed, and any control state the handler tracked stays consistent.
+        assert!(!rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_xtgettcap_unknown_cap_gets_invalid_reply() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(80, 24, proxy);
+
+        // Malformed request must still produce the `0+r` reply.
+        terminal.process_bytes(b"\x1bP+q78797a7a\x1b\\");
+    }
+
+    #[test]
+    fn test_decode_hex_roundtrip() {
+        assert_eq!(decode_hex(b"4142"), Some("AB".to_string()));
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub use clipboard::Clipboard;
 pub use colors::{ColorPalette, ColorPaletteBuilder, hsla_to_rgb};
 pub use event::{
     ClipboardFormatter, GpuiEventProxy, PtyWriter, TerminalEvent, TerminalNotifier,
+    TerminalNotifierHandle,
 };
 pub use hyperlink::{HyperlinkKind, HyperlinkMatch, RegexSearches};
 pub use render::{PaintContext, TerminalRenderer};

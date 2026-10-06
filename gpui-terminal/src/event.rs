@@ -135,6 +135,27 @@ impl fmt::Debug for TerminalEvent {
 /// writer to the proxy *after* the terminal has been constructed.
 pub type NotifierSlot = Arc<Mutex<Option<TerminalNotifier>>>;
 
+/// Cheap, clonable handle to the shared PTY notifier slot.
+///
+/// `GpuiEventProxy` itself is not `Clone` (its event channel is not), but the
+/// notifier lives behind an `Arc`, so this handle can be stored anywhere.
+/// A write before the host installs the notifier is dropped, which is also
+/// what the inline path does.
+#[derive(Clone)]
+pub struct TerminalNotifierHandle {
+    notifier: NotifierSlot,
+}
+
+impl TerminalNotifierHandle {
+    /// Write raw bytes into the PTY, flushing immediately. No-op until the
+    /// host installs the PTY notifier via `notifier_slot`.
+    pub fn write(&self, bytes: &[u8]) {
+        if let Some(notifier) = self.notifier.lock().as_ref() {
+            notifier.write(bytes);
+        }
+    }
+}
+
 pub struct GpuiEventProxy {
     tx: Sender<TerminalEvent>,
     notifier: NotifierSlot,
@@ -151,6 +172,12 @@ impl GpuiEventProxy {
     /// Handle used to install the PTY notifier once the writer exists.
     pub fn notifier_slot(&self) -> NotifierSlot {
         Arc::clone(&self.notifier)
+    }
+
+    /// Cheap, clonable write-side handle for embedders that answer protocol
+    /// queries outside the normal event flow (e.g. the XTGETTCAP passthrough).
+    pub fn notifier_handle(&self) -> TerminalNotifierHandle {
+        TerminalNotifierHandle { notifier: Arc::clone(&self.notifier) }
     }
 
     fn send(&self, event: TerminalEvent) {

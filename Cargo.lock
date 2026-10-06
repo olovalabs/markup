@@ -3466,6 +3466,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "toml 1.1.6+spec-1.1.0",
 ]
 
 [[package]]
