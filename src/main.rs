@@ -3,8 +3,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use gpui::{
     px, size, App, AppContext, Application, Bounds, Context, Edges, Entity,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, Styled, Window,
-    WindowBounds, WindowDecorations, WindowOptions, div, rgba,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled,
+    Window, WindowBounds, WindowDecorations, WindowOptions, div, rgba,
 };
 use gpui_component::{Root, TitleBar};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
@@ -37,32 +37,42 @@ impl std::io::Write for SharedWriter {
 }
 
 struct TerminalWindow {
-    terminal: Entity<TerminalView>,
+    terminal: Option<Entity<TerminalView>>,
+    title: SharedString,
 }
 
 impl TerminalWindow {
-    fn new(terminal: Entity<TerminalView>) -> Self {
-        Self { terminal }
+
+    fn set_title(&mut self, title: &str, cx: &mut Context<Self>) {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() && self.title.as_ref() != trimmed {
+            self.title = SharedString::from(trimmed.to_string());
+            cx.notify();
+        }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
 
         if keystroke.modifiers.control && (keystroke.key == "+" || keystroke.key == "=") {
-            self.terminal.update(cx, |terminal, cx| {
-                let mut config = terminal.config().clone();
-                config.font_size += px(1.0);
-                terminal.update_config(config, cx);
-            });
+            if let Some(terminal) = &self.terminal {
+                terminal.update(cx, |terminal, cx| {
+                    let mut config = terminal.config().clone();
+                    config.font_size += px(1.0);
+                    terminal.update_config(config, cx);
+                });
+            }
             cx.stop_propagation();
         } else if keystroke.modifiers.control && keystroke.key == "-" {
-            self.terminal.update(cx, |terminal, cx| {
-                let mut config = terminal.config().clone();
-                if config.font_size > px(6.0) {
-                    config.font_size -= px(1.0);
-                    terminal.update_config(config, cx);
-                }
-            });
+            if let Some(terminal) = &self.terminal {
+                terminal.update(cx, |terminal, cx| {
+                    let mut config = terminal.config().clone();
+                    if config.font_size > px(6.0) {
+                        config.font_size -= px(1.0);
+                        terminal.update_config(config, cx);
+                    }
+                });
+            }
             cx.stop_propagation();
         }
     }
@@ -86,7 +96,7 @@ impl Render for TerminalWindow {
                         .justify_center()
                         .text_size(px(13.0))
                         .text_color(rgba(0xf0f6fcff))
-                        .child("ezicode Terminal"),
+                        .child(self.title.clone()),
                 ),
             )
             .child(
@@ -94,7 +104,7 @@ impl Render for TerminalWindow {
                     .flex_1()
                     .size_full()
                     .overflow_hidden()
-                    .child(self.terminal.clone()),
+                    .children(self.terminal.clone()),
             )
     }
 }
@@ -330,22 +340,39 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
+                    let default_title = SharedString::from(shell_cmd.clone());
+                    let terminal_placeholder = cx.new(|_cx| {
+                        // Temporary dummy until TerminalView is constructed below
+                        TerminalWindow {
+                            terminal: None,
+                            title: default_title.clone(),
+                        }
+                    });
+
+                    let weak_window = terminal_placeholder.downgrade();
                     let terminal = cx.new(|cx| {
                         TerminalView::new(shared_writer, reader, config, cx)
                             .with_resize_callback(resize_callback)
+                            .with_title_callback(move |_window, cx, title| {
+                                let _ = weak_window.update(cx, |w, cx| {
+                                    w.set_title(title, cx);
+                                });
+                            })
                             .with_exit_callback(|_window, cx| {
                                 cx.quit();
                             })
                     });
 
+                    terminal_placeholder.update(cx, |w, _cx| {
+                        w.terminal = Some(terminal.clone());
+                    });
+
                     terminal.read(cx).focus_handle().focus(window);
 
-                    let view = cx.new(|_cx| TerminalWindow::new(terminal));
-                    cx.new(|cx| Root::new(view, window, cx))
+                    cx.new(|cx| Root::new(terminal_placeholder, window, cx))
                 },
             )
             .expect("Failed to open window");
-
             cx.activate(true);
         });
 
