@@ -302,6 +302,7 @@ const BLOCKED_PATTERNS: &[&str] = &[
     "do you want to allow",
     "press enter to continue",
     "press enter to confirm",
+    "enter to confirm",
     "permission required",
     "allow this command?",
     "waiting for permission",
@@ -313,6 +314,9 @@ fn is_blocked_line(lower: &str) -> bool {
 }
 
 fn is_prompt_line(line: &str) -> bool {
+    if has_progress_run(line) {
+        return false; // "■■■■ 60%" is progress output, not a zsh '%' prompt
+    }
     line.starts_with('❯')
         || line.starts_with('▸')
         || line.starts_with('➜')
@@ -323,7 +327,7 @@ fn is_prompt_line(line: &str) -> bool {
 }
 
 fn is_working_line(line: &str, lower: &str) -> bool {
-    if lower.contains("esc to interrupt")
+    if lower.contains("to interrupt") // "esc to interrupt", "ctrl+c to interrupt", …
         || lower.contains("working…")
         || lower.contains("working...")
         || lower.contains("thinking")
@@ -336,14 +340,36 @@ fn is_working_line(line: &str, lower: &str) -> bool {
     {
         return true;
     }
+    if has_progress_run(line) {
+        return true;
+    }
     line.chars().next().is_some_and(is_spinner_char)
 }
 
+/// A run of 4+ progress-bar glyphs (herdr's opencode `progress_bar_working`
+/// rule matches `(■|⬝){4,}`).
+fn has_progress_run(line: &str) -> bool {
+    let mut run = 0usize;
+    for c in line.chars() {
+        if matches!(c, '■' | '⬝' | '█' | '▰') {
+            run += 1;
+            if run >= 4 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
 /// Spinner glyphs used by agent CLIs (braille range covers Claude ≤ 2.1.227,
-/// half-circles cover the newer busy spinner; `✻✳✽·` are Claude/Codex idle
-/// and working marks — see herdr's `claude.toml` manifest).
+/// half-circles cover the newer busy spinner; `✻✳✽·` are Claude/Codex working
+/// marks — see herdr's `claude.toml` manifest). Deliberately NOT in this set:
+/// `⏸`/`⏵` — those only count together with an interrupt hint, which
+/// `is_working_line` matches via "to interrupt".
 pub fn is_spinner_char(c: char) -> bool {
-    matches!(c, '◐' | '◓' | '◑' | '◒' | '·' | '✢' | '✳' | '✶' | '✻' | '✽' | '⏸' | '⏵')
+    matches!(c, '◐' | '◓' | '◑' | '◒' | '·' | '✢' | '✳' | '✶' | '✻' | '✽')
         || ('\u{2800}'..='\u{28FF}').contains(&c)
 }
 
@@ -433,6 +459,37 @@ mod tests {
     fn detects_spinner_working() {
         let s = scan_screen(&lines(&["⠙ Thinking… (3s · esc to interrupt)"]));
         assert!(s.working);
+    }
+
+    #[test]
+    fn detects_progress_bar_and_interrupt_variants() {
+        // herdr opencode.toml: progress_bar_working + interrupt_hint_working
+        assert!(scan_screen(&lines(&["■■■■■■ 60%"])).working);
+        assert!(scan_screen(&lines(&["streaming… ctrl+c to interrupt"])).working);
+    }
+
+    #[test]
+    fn lone_media_glyph_is_not_working() {
+        // ⏵/⏸ without an interrupt hint are UI chrome, not work.
+        let s = scan_screen(&lines(&["⏵ select an option"]));
+        assert!(!s.working && !s.blocked);
+    }
+
+    #[test]
+    fn detects_opencode_permission_dialog() {
+        let s = scan_screen(&lines(&[
+            "△ Permission required",
+            "Allow opencode to run `git commit`?",
+            "↑↓ select · enter to confirm · esc dismiss",
+        ]));
+        assert!(s.blocked);
+    }
+
+    #[test]
+    fn agent_idle_prompt_box_is_not_working() {
+        // An agent TUI sitting at its input box shows no working evidence.
+        let s = scan_screen(&lines(&["┌────────────────────────┐", "> ", "└────────────────────────┘"]));
+        assert!(!s.working && !s.blocked);
     }
 
     #[test]

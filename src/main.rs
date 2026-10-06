@@ -30,6 +30,16 @@ const FINISHED_HOLD: Duration = Duration::from_secs(10);
 /// A running command that produces no output for this long and shows no
 /// visible working signal is considered stuck (Blocked).
 const STUCK_AFTER: Duration = Duration::from_secs(45);
+/// Grace window after an agent process first appears (herdr's
+/// AGENT_STARTUP_GRACE_WINDOW): startup UI churn must not count as work.
+const AGENT_STARTUP_GRACE: Duration = Duration::from_secs(3);
+/// An agent's working stretch is only over once working evidence has been
+/// absent for this long (herdr debounces Working→Idle with pending-idle
+/// confirmations to ride out screen redraw gaps).
+const WORK_END_CONFIRM: Duration = Duration::from_millis(1500);
+/// An agent working stretch must last at least this long for its end to be
+/// reported as Done; shorter bursts are startup/UI noise.
+const MIN_WORK_STRETCH: Duration = Duration::from_secs(5);
 
 struct SharedWriter {
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
@@ -122,6 +132,14 @@ pub struct Session {
     /// AI agent CLI identified by process name (e.g. `claude`), if one is
     /// running or just finished.
     pub agent: Option<String>,
+    /// An agent process was present in the process tree as of the last tick.
+    pub agent_process_present: bool,
+    /// Startup grace window after an agent process first appeared.
+    pub agent_grace_until: Option<Instant>,
+    /// Start of the agent's current uninterrupted working stretch.
+    pub working_since: Option<Instant>,
+    /// Last moment positive working evidence was seen in the current stretch.
+    pub last_work_activity: Option<Instant>,
     /// A foreground command was running as of the last detection tick.
     pub busy: bool,
     /// The shell exited (terminal is dead); status is pinned to Done/Error.
@@ -422,11 +440,11 @@ impl AppState {
                     .last_screen_change
                     .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
 
-                // Completion detection: a command/agent that was running is
-                // gone (herdr: the foreground job disappearing is the
-                // authoritative "finished" signal). Classify the outcome by
-                // the recent output since the shell already reaped the child
-                // and its exit code is not available to us.
+                // Completion detection for one-shot commands: something that
+                // was running is gone (herdr: the foreground job disappearing
+                // is the authoritative "finished" signal). Classify the
+                // outcome by the recent output since the shell already reaped
+                // the child and its exit code is not available to us.
                 if session.busy && !scan.busy {
                     let outcome = if signals.error_hint {
                         SessionStatus::Error
@@ -435,15 +453,94 @@ impl AppState {
                     };
                     session.finished_status = Some(outcome);
                     session.finished_at = Some(now);
+                    session.working_since = None;
+                    session.last_work_activity = None;
                 }
                 session.busy = scan.busy;
                 if let Some(agent) = scan.agent {
                     session.agent = Some(agent);
                 }
 
+                // ---- Agent lifecycle (herdr-style) ----
+                // An identified agent CLI is NOT "working" just because its
+                // process exists: launched-but-waiting-at-its-prompt means
+                // Idle (herdr's known-agent idle fallback). Working needs
+                // positive screen evidence (spinner, "esc to interrupt",
+                // progress bar, working verbs).
+                let agent_present = scan.agent.is_some();
+                if agent_present && !session.agent_process_present {
+                    // Agent process just appeared: startup grace, like
+                    // herdr's AGENT_STARTUP_GRACE_WINDOW.
+                    session.agent_grace_until = Some(now + AGENT_STARTUP_GRACE);
+                    session.working_since = None;
+                    session.last_work_activity = None;
+                }
+                session.agent_process_present = agent_present;
+                if !agent_present {
+                    session.agent_grace_until = None;
+                }
+
+                let in_grace = session.agent_grace_until.is_some_and(|until| now < until);
+                let working_evidence = signals.working || title_working;
+
+                if agent_present && working_evidence && !in_grace {
+                    if session.working_since.is_none() {
+                        session.working_since = Some(now);
+                    }
+                    session.last_work_activity = Some(now);
+                } else if agent_present && session.working_since.is_some() && !signals.blocked {
+                    // Working evidence is gone. Debounce before declaring the
+                    // stretch over (herdr's pending-idle confirmations) so a
+                    // brief redraw gap doesn't flicker the badge.
+                    let end_confirmed = session.last_work_activity.map_or(true, |t| {
+                        now.saturating_duration_since(t) >= WORK_END_CONFIRM
+                    });
+                    if end_confirmed {
+                        let since = session.working_since.take();
+                        session.last_work_activity = None;
+                        if let Some(since) = since
+                            && now.saturating_duration_since(since) >= MIN_WORK_STRETCH
+                        {
+                            // The agent finished a real task and returned to
+                            // its prompt: flash Done.
+                            session.finished_status = Some(SessionStatus::Done);
+                            session.finished_at = Some(now);
+                        }
+                    }
+                }
+
                 let mut detected = if signals.blocked {
                     SessionStatus::Blocked
+                } else if agent_present {
+                    if session.working_since.is_some() {
+                        // Positive working evidence (or the debounce window
+                        // right after it): the agent is processing.
+                        SessionStatus::Working
+                    } else if let Some(outcome) = session.finished_status {
+                        // Fresh "task done" flash after an agent working
+                        // stretch ended (or the shell-exit outcome).
+                        let fresh = session
+                            .finished_at
+                            .map_or(false, |t| now.saturating_duration_since(t) < FINISHED_HOLD);
+                        if fresh {
+                            outcome
+                        } else {
+                            session.finished_status = None;
+                            session.finished_at = None;
+                            if session.focused {
+                                SessionStatus::Active
+                            } else {
+                                SessionStatus::Idle
+                            }
+                        }
+                    } else {
+                        // Agent is alive but shows no working evidence: it
+                        // sits at its input prompt waiting for the next task
+                        // (herdr's DEFAULT_KNOWN_AGENT_IDLE_FALLBACK).
+                        SessionStatus::Idle
+                    }
                 } else if scan.busy {
+                    // One-shot command running: Working by process presence.
                     if !signals.working && !title_working && silent_for >= STUCK_AFTER {
                         SessionStatus::Blocked
                     } else {
@@ -471,8 +568,8 @@ impl AppState {
                         }
                     }
                 } else if (title_working || signals.working) && !signals.prompt {
-                    // Spinner on screen / OSC title: keep Working even when
-                    // the process lives somewhere we can't see (ssh,
+                    // Spinner on screen / OSC title without any local
+                    // process: keep Working for agents we can't see (ssh,
                     // container) — unless the shell prompt is already back,
                     // which wins (prompt-first idle).
                     SessionStatus::Working
@@ -482,8 +579,15 @@ impl AppState {
                     SessionStatus::Idle
                 };
 
-                // New foreground activity supersedes any stale terminal state.
-                if scan.busy || signals.blocked {
+                // New work supersedes any stale terminal outcome. For agents
+                // "new work" means a fresh working stretch (process presence
+                // alone is not work); for commands it means a running process.
+                let new_work_active = if agent_present {
+                    session.working_since.is_some()
+                } else {
+                    scan.busy
+                };
+                if new_work_active || signals.blocked {
                     session.finished_status = None;
                     session.finished_at = None;
                 }
@@ -559,6 +663,10 @@ impl AppState {
                 shell_name,
                 focused: true,
                 agent: None,
+                agent_process_present: false,
+                agent_grace_until: None,
+                working_since: None,
+                last_work_activity: None,
                 busy: false,
                 shell_exited: false,
                 finished_status: None,
@@ -605,6 +713,10 @@ impl AppState {
                     shell_name,
                     focused: true,
                     agent: None,
+                    agent_process_present: false,
+                    agent_grace_until: None,
+                    working_since: None,
+                    last_work_activity: None,
                     busy: false,
                     shell_exited: false,
                     finished_status: None,
@@ -1131,6 +1243,10 @@ fn main() -> Result<()> {
                             shell_name,
                             focused: true,
                             agent: None,
+                            agent_process_present: false,
+                            agent_grace_until: None,
+                            working_since: None,
+                            last_work_activity: None,
                             busy: false,
                             shell_exited: false,
                             finished_status: None,
