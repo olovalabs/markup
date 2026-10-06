@@ -3461,6 +3461,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "portable-pty 0.8.1",
+ "regex",
  "rfd",
  "rust-embed",
  "serde",

@@ -290,57 +290,58 @@ impl AppState {
                 return SessionStatus::Done;
             }
         }
-
         let title_lower = title.to_lowercase();
-        // 1. Check Herdr OSC title rules
+        // 1. High-priority OSC Title match (Herdr priority: 1100)
+        // Matches Braille, geometric spinners, or active status verbs
         if title_lower.contains("working")
             || title_lower.contains("baking")
             || title_lower.contains("thinking")
             || title_lower.contains("generating")
+            || title_lower.contains("executing")
             || title.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒', '·', '✢', '✳', '✶', '✻', '✽'])
         {
             return SessionStatus::Working;
         }
 
-        // 2. Check recent bottom screen buffer (Herdr bottom_lines / whole_recent inspection)
+        // 2. Screen buffer inspection (Herdr prompt_box_body, whole_recent, bottom lines)
+        let joined_screen = lines.join("\n").to_lowercase();
+
+        // Blocked: Awaiting human confirmation, permission approval, or choice
+        static BLOCKED_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?i)(esc to cancel|\[y/n\]|\(y/n\)|allow tool execution|do you want to (proceed|run)|press enter to continue|permission required|approve|confirm\?)").unwrap()
+        });
+
+        if BLOCKED_REGEX.is_match(&joined_screen) {
+            return SessionStatus::Blocked;
+        }
+
+        // Working: Active spinner characters, animated glyphs, and runtime verbs
+        static WORKING_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?i)(working\.\.\.|thinking\.\.\.|generating\.\.\.|running\.\.\.|executing\.\.\.|fetching\.\.\.|searching\.\.\.|synthesizing\.\.\.|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒·✢✳✶✻✽])").unwrap()
+        });
+
         for line in lines.iter().rev().take(8) {
             let l = line.trim();
             if l.is_empty() {
                 continue;
             }
 
-            // Blocked: Awaiting human confirmation, decision or tool permission
-            let l_lower = l.to_lowercase();
-            if l_lower.contains("esc to cancel")
-                || l_lower.contains("[y/n]")
-                || l_lower.contains("(y/n)")
-                || l_lower.contains("[y/n")
-                || l_lower.contains("allow tool execution?")
-                || l_lower.contains("do you want to proceed?")
-                || l_lower.contains("do you want to run:")
-                || l_lower.contains("press enter to continue")
-                || l_lower.contains("permission required")
-            {
-                return SessionStatus::Blocked;
-            }
-
-            // Working: Activity spinners, animated characters, or active work verbs
-            if l.contains("Working...")
-                || l.contains("Thinking...")
-                || l.contains("Generating...")
-                || l.contains("Running...")
-                || l.contains("Executing...")
-                || l.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒'])
-            {
+            if WORKING_REGEX.is_match(l) {
                 return SessionStatus::Working;
             }
 
-            // Idle: Waiting at command prompt
-            if l.starts_with('❯') || l.starts_with('▸') || l.starts_with('➜') || l.ends_with('$') || l.ends_with('>') || l.ends_with('#') {
+            // Idle: Matches prompt glyphs waiting for input (Herdr live_prompt_box: '^\s*❯')
+            if l.starts_with('❯')
+                || l.starts_with('▸')
+                || l.starts_with('➜')
+                || l.ends_with('$')
+                || l.ends_with('>')
+                || l.ends_with('#')
+                || l.ends_with('%')
+            {
                 return SessionStatus::Idle;
             }
         }
-
         // 3. Check foreground child processes (Herdr process-info inspection)
         if let Some(p) = pid {
             let child_commands = Self::get_descendant_commands(p);
