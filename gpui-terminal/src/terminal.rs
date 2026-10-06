@@ -372,6 +372,23 @@ impl TerminalState {
         let end = Point::new(line, term.last_column());
         term.bounds_to_string(start, end).trim_end().to_string()
     }
+
+    /// Retrieve the bottom N lines from the visible viewport.
+    pub fn bottom_lines(&self, n: usize) -> Vec<String> {
+        let term = self.term.lock();
+        let screen_lines = self.rows;
+        let last_col = term.last_column();
+        let count = n.min(screen_lines);
+        let start_row = screen_lines.saturating_sub(count);
+        let mut lines = Vec::with_capacity(count);
+        for row in start_row..screen_lines {
+            let line = Line(row as i32);
+            let start = Point::new(line, Column(0));
+            let end = Point::new(line, last_col);
+            lines.push(term.bounds_to_string(start, end).trim_end().to_string());
+        }
+        lines
+    }
 }
 
 #[cfg(test)]

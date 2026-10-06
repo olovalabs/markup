@@ -42,7 +42,8 @@ impl std::io::Write for SharedWriter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
     Idle,
-    Running,
+    Working,
+    Blocked,
     Done,
 }
 
@@ -194,9 +195,8 @@ impl AppState {
                         changed = true;
                     }
                     if session.status != SessionStatus::Done {
-                        // Title activity indicates the agent is running/working
-                        if session.status != SessionStatus::Running {
-                            session.status = SessionStatus::Running;
+                        if session.status != SessionStatus::Working {
+                            session.status = SessionStatus::Working;
                             changed = true;
                         }
                     }
@@ -220,6 +220,79 @@ impl AppState {
                     return;
                 }
             }
+        }
+    }
+
+    /// Evaluates terminal bottom buffer lines and OSC title using Herdr-style detection rules.
+    fn evaluate_agent_status(lines: &[String], title: &str) -> SessionStatus {
+        let title_lower = title.to_lowercase();
+        // Check for Herdr spinners or active keywords in OSC title
+        if title_lower.contains("working")
+            || title_lower.contains("baking")
+            || title_lower.contains("thinking")
+            || title.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒', '·', '✢', '✳', '✶', '✻', '✽'])
+        {
+            return SessionStatus::Working;
+        }
+
+        // Check recent screen lines (bottom of the viewport)
+        for line in lines.iter().rev().take(6) {
+            let l = line.trim();
+            if l.is_empty() {
+                continue;
+            }
+
+            // Blocked: Prompt awaiting human decision or tool approval
+            if l.contains("esc to cancel")
+                || l.contains("[y/n]")
+                || l.contains("[Y/n]")
+                || l.contains("[y/N]")
+                || l.contains("Allow tool execution?")
+                || l.contains("Do you want to run:")
+                || l.contains("Press Enter to continue")
+            {
+                return SessionStatus::Blocked;
+            }
+
+            // Working: Active spinner glyphs, progress bars, or work verbs
+            if l.contains("Working...")
+                || l.contains("Thinking...")
+                || l.contains("Generating...")
+                || l.contains("Running...")
+                || l.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒'])
+            {
+                return SessionStatus::Working;
+            }
+
+            // Idle: Waiting at command or prompt input box
+            if l.starts_with('❯') || l.starts_with('▸') || l.starts_with('➜') || l.starts_with('$') || l.starts_with('>') {
+                return SessionStatus::Idle;
+            }
+        }
+
+        SessionStatus::Idle
+    }
+
+    /// Periodic detection tick matching Herdr's screen and title manifest evaluation
+    pub fn poll_sessions_status(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                if session.status == SessionStatus::Done {
+                    continue;
+                }
+                let terminal = session.terminal.read(cx);
+                let title = terminal.title().unwrap_or("");
+                let bottom_lines = terminal.bottom_lines(10);
+                let detected = Self::evaluate_agent_status(&bottom_lines, title);
+                if session.status != detected {
+                    session.status = detected;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            cx.notify();
         }
     }
     fn create_new_session_for_active_project(
@@ -517,7 +590,8 @@ impl Render for AppState {
                                                                     .rounded_full()
                                                                     .bg(match session.status {
                                                                         SessionStatus::Idle => rgba(0x8b949eff),     // Muted gray
-                                                                        SessionStatus::Running => rgba(0x3fb950ff),  // Vibrant green
+                                                                        SessionStatus::Working => rgba(0x3fb950ff),  // Vibrant green
+                                                                        SessionStatus::Blocked => rgba(0xd29922ff),  // Warning amber
                                                                         SessionStatus::Done => rgba(0x58a6ffff),     // Clean blue
                                                                     })
                                                             )
@@ -540,17 +614,20 @@ impl Render for AppState {
                                                             .rounded_sm()
                                                             .bg(match session.status {
                                                                 SessionStatus::Idle => rgba(0x21262d88),
-                                                                SessionStatus::Running => rgba(0x23863644),
+                                                                SessionStatus::Working => rgba(0x23863644),
+                                                                SessionStatus::Blocked => rgba(0x9e6a0344),
                                                                 SessionStatus::Done => rgba(0x1f6feb33),
                                                             })
                                                             .text_color(match session.status {
                                                                 SessionStatus::Idle => rgba(0x8b949eff),
-                                                                SessionStatus::Running => rgba(0x3fb950ff),
+                                                                SessionStatus::Working => rgba(0x3fb950ff),
+                                                                SessionStatus::Blocked => rgba(0xd29922ff),
                                                                 SessionStatus::Done => rgba(0x58a6ffff),
                                                             })
                                                             .child(match session.status {
                                                                 SessionStatus::Idle => "idle",
-                                                                SessionStatus::Running => "running",
+                                                                SessionStatus::Working => "working",
+                                                                SessionStatus::Blocked => "blocked",
                                                                 SessionStatus::Done => "done",
                                                             }),
                                                     )
@@ -789,6 +866,20 @@ fn main() -> Result<()> {
                             palette: palette_clone,
                         }
                     });
+
+                    let app_state_weak = app_state.downgrade();
+                    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                        loop {
+                            cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                            let res = app_state_weak.update(cx, |state, cx| {
+                                state.poll_sessions_status(cx);
+                            });
+                            if res.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
 
                     cx.new(|cx| Root::new(app_state, window, cx))
                 },

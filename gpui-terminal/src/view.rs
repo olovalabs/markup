@@ -1382,6 +1382,10 @@ impl TerminalView {
         self.title.as_deref()
     }
 
+    /// Read bottom N lines of visible terminal text
+    pub fn bottom_lines(&self, n: usize) -> Vec<String> {
+        self.state.bottom_lines(n)
+    }
     /// `true` once the child process is gone.
     pub fn has_exited(&self) -> bool {
         self.exited
