@@ -18,6 +18,9 @@ parking_lot = "0.12"
 rfd = "0.15"
 libc = "0.2"
 regex = "1"
+# Process-tree inspection for terminal status detection (agent CLI /
+# foreground command discovery). See src/detect.rs.
+sysinfo = "0.39"
 
 [patch.crates-io]
 gpui = { path = "components/gpui" }

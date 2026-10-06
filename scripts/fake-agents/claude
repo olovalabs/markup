@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Fake `claude` CLI to test AI-agent detection by process name.
+# Usage:  PATH="$PWD/scripts/fake-agents:$PATH" claude
+# Expect: badge shows "working · claude", then "done · claude".
+echo "✻ Welcome to fake Claude Code"
+sleep 1
+frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+i=0
+SECONDS=0
+while [ "$SECONDS" -lt 20 ]; do
+  printf '\r  %s Thinking… (%ss · esc to interrupt)        ' "${frames[i%10]}" "$SECONDS"
+  i=$((i + 1))
+  sleep 0.15
+done
+printf '\r%-60s\n' " "
+echo "✔ done — badge should now read 'done · claude'"

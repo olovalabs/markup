@@ -1,6 +1,8 @@
+use std::hash::Hasher as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use anyhow::Result;
 use gpui::{
     px, size, App, AppContext, Application, Bounds, Context, CursorStyle, Edges, Entity,
@@ -17,7 +19,17 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde_json::Value;
 
 mod assets;
+mod detect;
 use assets::{load_embedded_fonts, sync_component_fonts, CombinedAssets, MONO_FONT};
+
+/// How often terminal statuses are re-evaluated.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How long a terminal keeps its Done/Error badge before falling back to
+/// Idle (it also clears immediately when the terminal is focused).
+const FINISHED_HOLD: Duration = Duration::from_secs(10);
+/// A running command that produces no output for this long and shows no
+/// visible working signal is considered stuck (Blocked).
+const STUCK_AFTER: Duration = Duration::from_secs(45);
 
 struct SharedWriter {
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
@@ -39,12 +51,60 @@ impl std::io::Write for SharedWriter {
         self.writer.lock().flush()
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Live status shown for a terminal. Variants are ordered by priority
+/// (lowest → highest); when several signals apply at once the highest wins.
+/// Priority: Error > Blocked > Working > Done > Active > Idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SessionStatus {
+    /// Not focused and nothing is running.
     Idle,
-    Working,
-    Blocked,
+    /// The user is currently focused/typing in this terminal.
+    Active,
+    /// The last task finished successfully.
     Done,
+    /// An AI agent CLI or command is running.
+    Working,
+    /// The process is waiting for input/approval, or is stuck.
+    Blocked,
+    /// The process failed (non-zero exit, crash, or error output).
+    Error,
+}
+
+impl SessionStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionStatus::Idle => "idle",
+            SessionStatus::Active => "active",
+            SessionStatus::Done => "done",
+            SessionStatus::Working => "working",
+            SessionStatus::Blocked => "blocked",
+            SessionStatus::Error => "error",
+        }
+    }
+
+    /// Status dot / badge text color (GitHub dark palette).
+    pub fn color(self) -> u32 {
+        match self {
+            SessionStatus::Idle => 0x8b949eff,    // gray
+            SessionStatus::Active => 0x58a6ffff,  // blue
+            SessionStatus::Done => 0x3fb950ff,    // green
+            SessionStatus::Working => 0xd29922ff, // yellow
+            SessionStatus::Blocked => 0xf0883eff, // orange
+            SessionStatus::Error => 0xf85149ff,   // red
+        }
+    }
+
+    /// Badge background color.
+    pub fn badge_bg(self) -> u32 {
+        match self {
+            SessionStatus::Idle => 0x21262d88,
+            SessionStatus::Active => 0x1f6feb33,
+            SessionStatus::Done => 0x23863644,
+            SessionStatus::Working => 0x9e6a0344,
+            SessionStatus::Blocked => 0xdb6d2844,
+            SessionStatus::Error => 0xda363344,
+        }
+    }
 }
 
 pub struct Session {
@@ -53,6 +113,28 @@ pub struct Session {
     pub terminal: Entity<TerminalView>,
     pub status: SessionStatus,
     pub pid: Option<u32>,
+    /// Basename of the shell spawned in this session. Nested interactive
+    /// shells of the same kind are ignored when scanning the process tree so
+    /// they don't count as "work running".
+    pub shell_name: String,
+    /// Whether this session's terminal currently holds keyboard focus.
+    pub focused: bool,
+    /// AI agent CLI identified by process name (e.g. `claude`), if one is
+    /// running or just finished.
+    pub agent: Option<String>,
+    /// A foreground command was running as of the last detection tick.
+    pub busy: bool,
+    /// The shell exited (terminal is dead); status is pinned to Done/Error.
+    pub shell_exited: bool,
+    /// Terminal outcome (Done/Error) recorded when the last command finished.
+    pub finished_status: Option<SessionStatus>,
+    pub finished_at: Option<Instant>,
+    /// Screen-quietness tracking for the "stuck" heuristic.
+    pub last_screen_hash: u64,
+    pub last_screen_change: Option<Instant>,
+    /// Focus subscriptions for the terminal view (kept alive here).
+    focus_wired: bool,
+    focus_subs: Vec<gpui::Subscription>,
 }
 pub struct Project {
     pub id: usize,
@@ -67,6 +149,8 @@ struct AppState {
     active_project_idx: usize,
     next_id: usize,
     palette: ColorPalette,
+    /// Process table used by status detection, refreshed once per poll tick.
+    sys: sysinfo::System,
 }
 
 impl AppState {
@@ -89,8 +173,8 @@ impl AppState {
         window_title_target: gpui::WeakEntity<Self>,
         session_id: usize,
         cx: &mut Context<Self>,
-    ) -> Result<(Entity<TerminalView>, Option<u32>)> {
-        let (shell_cmd, _) = detect_shell();
+    ) -> Result<(Entity<TerminalView>, Option<u32>, String)> {
+        let (shell_cmd, shell_name) = detect_shell();
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -175,11 +259,11 @@ impl AppState {
                 })
                 .with_exit_callback(move |_window, cx| {
                     let _ = target_for_exit.update(cx, |state, cx| {
-                        state.set_session_status(session_id, SessionStatus::Done, cx);
+                        state.on_shell_exit(session_id, cx);
                     });
                 })
         });
-        Ok((terminal, pid))
+        Ok((terminal, pid, shell_name))
     }
 
     fn update_session_title(&mut self, session_id: usize, title: &str, cx: &mut Context<Self>) {
@@ -201,116 +285,211 @@ impl AppState {
         }
     }
 
-    fn set_session_status(&mut self, session_id: usize, status: SessionStatus, cx: &mut Context<Self>) {
-        for project in &mut self.projects {
-            for session in &mut project.sessions {
-                if session.id == session_id {
-                    if session.status != status {
-                        session.status = status;
-                        cx.notify();
-                    }
-                    return;
-                }
-            }
-        }
+    fn session_mut(&mut self, session_id: usize) -> Option<&mut Session> {
+        self.projects
+            .iter_mut()
+            .flat_map(|p| p.sessions.iter_mut())
+            .find(|s| s.id == session_id)
     }
 
-    /// Check if a process is still running
-    #[cfg(unix)]
-    fn is_pid_alive(pid: u32) -> bool {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+    /// Called when the session's shell exits (PTY EOF). The exit status code
+    /// decides between Done (0 / unknown) and Error (non-zero): herdr treats
+    /// process exit as the authoritative completion signal.
+    fn on_shell_exit(&mut self, session_id: usize, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        if session.shell_exited {
+            return;
+        }
+        session.shell_exited = true;
+        let exit_code = session.terminal.read(cx).exit_status();
+        let outcome = match exit_code {
+            Some(code) if code != 0 => SessionStatus::Error,
+            _ => SessionStatus::Done,
+        };
+        session.finished_status = Some(outcome);
+        session.finished_at = Some(now);
+        session.status = outcome;
+        session.busy = false;
+        cx.notify();
     }
 
-    #[cfg(not(unix))]
-    fn is_pid_alive(_pid: u32) -> bool {
-        true
+    /// Focus moved into this terminal: it becomes Active unless a higher
+    /// priority state (Working/Blocked/Error…) is in effect. Focusing also
+    /// acknowledges and clears a Done/Error badge.
+    fn on_terminal_focused(&mut self, session_id: usize, cx: &mut Context<Self>) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.focused = true;
+        match session.status {
+            SessionStatus::Done | SessionStatus::Error => {
+                session.finished_status = None;
+                session.finished_at = None;
+                session.status = SessionStatus::Active;
+            }
+            SessionStatus::Idle => {
+                session.status = SessionStatus::Active;
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Focus left this terminal. Working/Blocked/Error/Done are untouched —
+    /// switching away must never reset them.
+    fn on_terminal_blurred(&mut self, session_id: usize, cx: &mut Context<Self>) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.focused = false;
+        if session.status == SessionStatus::Active {
+            session.status = SessionStatus::Idle;
+        }
+        cx.notify();
     }
 
 
-    /// Evaluates terminal bottom buffer lines, OSC title, and process tree
-    fn evaluate_agent_status(lines: &[String], title: &str, pid: Option<u32>) -> SessionStatus {
-        if let Some(p) = pid {
-            if !Self::is_pid_alive(p) {
-                return SessionStatus::Done;
-            }
-        }
-
-        // 1. High priority: Inspect bottom visible lines (active prompt vs active work)
-        // In Herdr, `live_prompt_box` ('^\s*❯') has high priority to establish IDLE
-        for line in lines.iter().rev().take(6) {
-            let l = line.trim();
-            if l.is_empty() {
-                continue;
-            }
-
-            // A. Blocked: prompt awaiting human decision or tool approval
-            let l_lower = l.to_lowercase();
-            if l_lower.contains("esc to cancel")
-                || l_lower.contains("[y/n]")
-                || l_lower.contains("(y/n)")
-                || l_lower.contains("[y/n")
-                || l_lower.contains("allow tool execution?")
-                || l_lower.contains("do you want to proceed?")
-                || l_lower.contains("do you want to run:")
-                || l_lower.contains("press enter to continue")
-                || l_lower.contains("permission required")
-                || l_lower.contains("allow this command?")
-            {
-                return SessionStatus::Blocked;
-            }
-
-            // B. Idle prompt: Agent or shell is at an interactive prompt waiting for user input
-            if l.starts_with('❯')
-                || l.starts_with('▸')
-                || l.starts_with('➜')
-                || l.ends_with('$')
-                || l.ends_with('>')
-                || l.ends_with('#')
-                || l.ends_with('%')
-            {
-                return SessionStatus::Idle;
-            }
-
-            // C. Working: Active spinner or status verbs in bottom lines
-            if l.contains("Working...")
-                || l.contains("Thinking...")
-                || l.contains("Generating...")
-                || l.contains("Running...")
-                || l.contains("Executing...")
-                || l.contains("Synthesizing...")
-                || l.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒'])
-            {
-                return SessionStatus::Working;
-            }
-        }
-
-        // 2. OSC Title spinner inspection (Herdr osc_title_working)
-        let title_lower = title.to_lowercase();
-        if title_lower.contains("working")
-            || title_lower.contains("baking")
-            || title_lower.contains("thinking")
-            || title_lower.contains("generating")
-            || title_lower.contains("executing")
-            || title.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒', '·', '✢', '✳', '✶', '✻', '✽'])
-        {
-            return SessionStatus::Working;
-        }
-
-        SessionStatus::Idle
-    }
-
-    /// Periodic detection tick matching Herdr's screen, title, and process inspection
+    /// Periodic detection tick. Mirrors herdr's approach: process-tree
+    /// inspection (agent CLI running?), screen-tail + OSC-title pattern
+    /// matching (blocked / working / prompt), and process exit as the
+    /// authoritative completion signal.
     pub fn poll_sessions_status(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        // One process-table refresh per tick, shared by all sessions.
+        detect::refresh_processes(&mut self.sys);
+
         let mut changed = false;
         for project in &mut self.projects {
             for session in &mut project.sessions {
-                if session.status == SessionStatus::Done {
+                let before = session.status;
+
+                if session.shell_exited {
+                    // Terminal is dead: hold Done/Error until it decays.
+                    if Self::decay_finished(session, now) {
+                        changed = true;
+                    }
                     continue;
                 }
-                let terminal = session.terminal.read(cx);
-                let title = terminal.title().unwrap_or("");
-                let bottom_lines = terminal.bottom_lines(12);
-                let detected = Self::evaluate_agent_status(&bottom_lines, title, session.pid);
+
+                let (exited, exit_code, title, lines) = {
+                    let terminal = session.terminal.read(cx);
+                    (
+                        terminal.has_exited(),
+                        terminal.exit_status(),
+                        terminal.title().unwrap_or("").to_string(),
+                        terminal.bottom_lines(24),
+                    )
+                };
+
+                // Backstop for the exit callback (EOF on the PTY).
+                if exited {
+                    session.shell_exited = true;
+                    let outcome = match exit_code {
+                        Some(code) if code != 0 => SessionStatus::Error,
+                        _ => SessionStatus::Done,
+                    };
+                    session.finished_status = Some(outcome);
+                    session.finished_at = Some(now);
+                    session.status = outcome;
+                    session.busy = false;
+                    if before != outcome {
+                        changed = true;
+                    }
+                    continue;
+                }
+
+                let scan = detect::scan_session_processes(&self.sys, session.pid, &session.shell_name);
+                let signals = detect::scan_screen(&lines);
+                let title_working = detect::title_indicates_working(&title);
+
+                // Track how long the visible screen has been unchanged; a
+                // long-silent running command with no visible working signal
+                // is considered stuck (Blocked).
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                for line in lines.iter().rev().take(16) {
+                    hasher.write(line.as_bytes());
+                    hasher.write_u8(0);
+                }
+                let screen_hash = hasher.finish();
+                if screen_hash != session.last_screen_hash {
+                    session.last_screen_hash = screen_hash;
+                    session.last_screen_change = Some(now);
+                }
+                let silent_for = session
+                    .last_screen_change
+                    .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+
+                // Completion detection: a command/agent that was running is
+                // gone (herdr: the foreground job disappearing is the
+                // authoritative "finished" signal). Classify the outcome by
+                // the recent output since the shell already reaped the child
+                // and its exit code is not available to us.
+                if session.busy && !scan.busy {
+                    let outcome = if signals.error_hint {
+                        SessionStatus::Error
+                    } else {
+                        SessionStatus::Done
+                    };
+                    session.finished_status = Some(outcome);
+                    session.finished_at = Some(now);
+                }
+                session.busy = scan.busy;
+                if let Some(agent) = scan.agent {
+                    session.agent = Some(agent);
+                }
+
+                let mut detected = if signals.blocked {
+                    SessionStatus::Blocked
+                } else if scan.busy {
+                    if !signals.working && !title_working && silent_for >= STUCK_AFTER {
+                        SessionStatus::Blocked
+                    } else {
+                        SessionStatus::Working
+                    }
+                } else if (title_working || signals.working) && !signals.prompt {
+                    // Spinner on screen / OSC title: keep Working even when
+                    // the process lives somewhere we can't see (ssh,
+                    // container) — unless the shell prompt is already back,
+                    // which wins (prompt-first idle).
+                    SessionStatus::Working
+                } else if let Some(outcome) = session.finished_status {
+                    // Sticky Done/Error after a finished command. Focusing
+                    // the terminal acknowledges it (see on_terminal_focused).
+                    let fresh = session
+                        .finished_at
+                        .map_or(false, |t| now.saturating_duration_since(t) < FINISHED_HOLD);
+                    if fresh {
+                        outcome
+                    } else {
+                        session.finished_status = None;
+                        session.finished_at = None;
+                        session.agent = None;
+                        if session.focused {
+                            SessionStatus::Active
+                        } else {
+                            SessionStatus::Idle
+                        }
+                    }
+                } else if session.focused {
+                    SessionStatus::Active
+                } else {
+                    SessionStatus::Idle
+                };
+
+                // New foreground activity supersedes any stale terminal state.
+                if scan.busy || signals.blocked {
+                    session.finished_status = None;
+                    session.finished_at = None;
+                }
+
+                // Focus is only a status when nothing higher-priority applies.
+                if detected == SessionStatus::Idle && session.focused {
+                    detected = SessionStatus::Active;
+                }
+
                 if session.status != detected {
                     session.status = detected;
                     changed = true;
@@ -321,6 +500,31 @@ impl AppState {
             cx.notify();
         }
     }
+
+    /// Decay a Done/Error badge to Idle/Active once FINISHED_HOLD elapsed.
+    /// Returns true when the status changed.
+    fn decay_finished(session: &mut Session, now: Instant) -> bool {
+        let Some(at) = session.finished_at else {
+            return false;
+        };
+        if now.saturating_duration_since(at) < FINISHED_HOLD {
+            return false;
+        }
+        session.finished_status = None;
+        session.finished_at = None;
+        session.agent = None;
+        let next = if session.focused {
+            SessionStatus::Active
+        } else {
+            SessionStatus::Idle
+        };
+        if session.status == next {
+            return false;
+        }
+        session.status = next;
+        true
+    }
+
     fn create_new_session_for_active_project(
         &mut self,
         window: &mut Window,
@@ -331,7 +535,7 @@ impl AppState {
         self.next_id += 1;
 
         let dir = self.active_project().map(|p| p.path.clone());
-        if let Ok((terminal, pid)) = Self::spawn_terminal_view(
+        if let Ok((terminal, pid, shell_name)) = Self::spawn_terminal_view(
             dir.as_ref(),
             self.palette.clone(),
             self_weak,
@@ -347,8 +551,19 @@ impl AppState {
                 id: next_id,
                 title: SharedString::from(format!("terminal {}", session_count + 1)),
                 terminal,
-                status: SessionStatus::Idle,
+                status: SessionStatus::Active,
                 pid,
+                shell_name,
+                focused: true,
+                agent: None,
+                busy: false,
+                shell_exited: false,
+                finished_status: None,
+                finished_at: None,
+                last_screen_hash: 0,
+                last_screen_change: None,
+                focus_wired: false,
+                focus_subs: Vec::new(),
             };
 
             if let Some(project) = self.active_project_mut() {
@@ -370,7 +585,7 @@ impl AppState {
             let next_id = self.next_id;
             self.next_id += 1;
 
-            if let Ok((terminal, pid)) = Self::spawn_terminal_view(
+            if let Ok((terminal, pid, shell_name)) = Self::spawn_terminal_view(
                 Some(&folder),
                 self.palette.clone(),
                 self_weak,
@@ -382,8 +597,19 @@ impl AppState {
                     id: next_id,
                     title: SharedString::from("terminal 1"),
                     terminal,
-                    status: SessionStatus::Idle,
+                    status: SessionStatus::Active,
                     pid,
+                    shell_name,
+                    focused: true,
+                    agent: None,
+                    busy: false,
+                    shell_exited: false,
+                    finished_status: None,
+                    finished_at: None,
+                    last_screen_hash: 0,
+                    last_screen_change: None,
+                    focus_wired: false,
+                    focus_subs: Vec::new(),
                 };
                 let project = Project {
                     id: next_id,
@@ -428,7 +654,33 @@ impl AppState {
 }
 
 impl Render for AppState {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Lazily wire focus listeners for each terminal so the Active state
+        // follows focus in real time (and Done/Error clear when focused).
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                if !session.focus_wired {
+                    let handle = session.terminal.read(cx).focus_handle().clone();
+                    let session_id = session.id;
+                    session.focus_wired = true;
+                    session.focus_subs.push(cx.on_focus(
+                        &handle,
+                        window,
+                        move |this, _window, cx| {
+                            this.on_terminal_focused(session_id, cx);
+                        },
+                    ));
+                    session.focus_subs.push(cx.on_blur(
+                        &handle,
+                        window,
+                        move |this, _window, cx| {
+                            this.on_terminal_blurred(session_id, cx);
+                        },
+                    ));
+                }
+            }
+        }
+
         let active_title = self
             .active_session()
             .map(|s| s.title.clone())
@@ -615,12 +867,7 @@ impl Render for AppState {
                                                                     .w(px(6.0))
                                                                     .h(px(6.0))
                                                                     .rounded_full()
-                                                                    .bg(match session.status {
-                                                                        SessionStatus::Idle => rgba(0x8b949eff),     // Muted gray
-                                                                        SessionStatus::Working => rgba(0x3fb950ff),  // Vibrant green
-                                                                        SessionStatus::Blocked => rgba(0xd29922ff),  // Warning amber
-                                                                        SessionStatus::Done => rgba(0x58a6ffff),     // Clean blue
-                                                                    })
+                                                                    .bg(rgba(session.status.color()))
                                                             )
                                                             .child(
                                                                 div()
@@ -639,23 +886,24 @@ impl Render for AppState {
                                                             .px_1p5()
                                                             .py_0p5()
                                                             .rounded_sm()
-                                                            .bg(match session.status {
-                                                                SessionStatus::Idle => rgba(0x21262d88),
-                                                                SessionStatus::Working => rgba(0x23863644),
-                                                                SessionStatus::Blocked => rgba(0x9e6a0344),
-                                                                SessionStatus::Done => rgba(0x1f6feb33),
-                                                            })
-                                                            .text_color(match session.status {
-                                                                SessionStatus::Idle => rgba(0x8b949eff),
-                                                                SessionStatus::Working => rgba(0x3fb950ff),
-                                                                SessionStatus::Blocked => rgba(0xd29922ff),
-                                                                SessionStatus::Done => rgba(0x58a6ffff),
-                                                            })
-                                                            .child(match session.status {
-                                                                SessionStatus::Idle => "idle",
-                                                                SessionStatus::Working => "working",
-                                                                SessionStatus::Blocked => "blocked",
-                                                                SessionStatus::Done => "done",
+                                                            .bg(rgba(session.status.badge_bg()))
+                                                            .text_color(rgba(session.status.color()))
+                                                            .child({
+                                                                let label = session.status.label();
+                                                                match session.agent.as_deref() {
+                                                                    Some(agent)
+                                                                        if matches!(
+                                                                            session.status,
+                                                                            SessionStatus::Working
+                                                                                | SessionStatus::Blocked
+                                                                                | SessionStatus::Done
+                                                                                | SessionStatus::Error
+                                                                        ) =>
+                                                                    {
+                                                                        format!("{label} · {agent}")
+                                                                    }
+                                                                    _ => label.to_string(),
+                                                                }
                                                             }),
                                                     )
                                                     .on_mouse_down(
@@ -860,7 +1108,7 @@ fn main() -> Result<()> {
                     let current_dir_clone = current_dir.clone();
                     let app_state = cx.new(|cx| {
                         let self_weak = cx.entity().downgrade();
-                        let (initial_terminal, pid) = AppState::spawn_terminal_view(
+                        let (initial_terminal, pid, shell_name) = AppState::spawn_terminal_view(
                             Some(&current_dir_clone),
                             palette_clone.clone(),
                             self_weak,
@@ -875,8 +1123,19 @@ fn main() -> Result<()> {
                             id: 1,
                             title: SharedString::from("terminal 1"),
                             terminal: initial_terminal,
-                            status: SessionStatus::Idle,
+                            status: SessionStatus::Active,
                             pid,
+                            shell_name,
+                            focused: true,
+                            agent: None,
+                            busy: false,
+                            shell_exited: false,
+                            finished_status: None,
+                            finished_at: None,
+                            last_screen_hash: 0,
+                            last_screen_change: None,
+                            focus_wired: false,
+                            focus_subs: Vec::new(),
                         };
 
                         let initial_project = Project {
@@ -892,13 +1151,14 @@ fn main() -> Result<()> {
                             active_project_idx: 0,
                             next_id: 2,
                             palette: palette_clone,
+                            sys: sysinfo::System::new(),
                         }
                     });
 
                     let app_state_weak = app_state.downgrade();
                     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
                         loop {
-                            cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                            cx.background_executor().timer(POLL_INTERVAL).await;
                             let res = app_state_weak.update(cx, |state, cx| {
                                 state.poll_sessions_status(cx);
                             });

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake `gemini` CLI to test AI-agent detection by process name.
+# Usage:  PATH="$PWD/scripts/fake-agents:$PATH" gemini
+echo "✦ fake gemini session starting"
+sleep 1
+frames=(✶ ✷ ✸ ✹ ✺)
+i=0
+SECONDS=0
+while [ "$SECONDS" -lt 20 ]; do
+  printf '\r  %s Generating… (%ss)        ' "${frames[i%5]}" "$SECONDS"
+  i=$((i + 1))
+  sleep 0.2
+done
+printf '\r%-60s\n' " "
+echo "✔ done — badge should now read 'done · gemini'"
