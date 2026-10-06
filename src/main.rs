@@ -1,11 +1,14 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use anyhow::Result;
 use gpui::{
-    px, size, App, AppContext, Application, Bounds, Context, Edges, Entity,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled,
-    Window, WindowBounds, WindowDecorations, WindowOptions, div, rgba,
+    px, size, App, AppContext, Application, Bounds, Context, CursorStyle, Edges, Entity,
+    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
+    SharedString, Styled, Window, WindowBounds, WindowDecorations,
+    WindowOptions, div, rgba,
 };
+use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Root, TitleBar};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use parking_lot::Mutex;
@@ -36,32 +39,235 @@ impl std::io::Write for SharedWriter {
     }
 }
 
-struct TerminalWindow {
-    terminal: Option<Entity<TerminalView>>,
-    title: SharedString,
+pub struct Session {
+    pub id: usize,
+    pub title: SharedString,
+    pub terminal: Entity<TerminalView>,
 }
 
-impl TerminalWindow {
-    fn set_title(&mut self, title: &str, cx: &mut Context<Self>) {
-        let trimmed = title.trim();
-        let next_title = if trimmed.is_empty() {
-            let (_, shell_name) = detect_shell();
-            SharedString::from(shell_name)
-        } else {
-            SharedString::from(trimmed.to_string())
+pub struct Project {
+    pub id: usize,
+    pub name: String,
+    pub path: PathBuf,
+    pub sessions: Vec<Session>,
+    pub active_session_idx: usize,
+}
+
+struct AppState {
+    projects: Vec<Project>,
+    active_project_idx: usize,
+    next_id: usize,
+    palette: ColorPalette,
+}
+
+impl AppState {
+    fn active_project(&self) -> Option<&Project> {
+        self.projects.get(self.active_project_idx)
+    }
+
+    fn active_project_mut(&mut self) -> Option<&mut Project> {
+        self.projects.get_mut(self.active_project_idx)
+    }
+
+    fn active_session(&self) -> Option<&Session> {
+        let project = self.active_project()?;
+        project.sessions.get(project.active_session_idx)
+    }
+
+    fn spawn_terminal_view(
+        dir: Option<&PathBuf>,
+        palette: ColorPalette,
+        window_title_target: gpui::WeakEntity<Self>,
+        session_id: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<Entity<TerminalView>> {
+        let (shell_cmd, _) = detect_shell();
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| anyhow::anyhow!("PTY open error: {e}"))?;
+
+        let mut cmd = CommandBuilder::new(&shell_cmd);
+        if let Some(d) = dir {
+            cmd.cwd(d);
+        }
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "t3code-terminal");
+        cmd.env("TERM_PROGRAM_VERSION", "0.1.0");
+        cmd.env("LANG", "en_US.UTF-8");
+        cmd.env("LC_ALL", "en_US.UTF-8");
+
+        let _child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| anyhow::anyhow!("Spawn shell error: {e}"))?;
+
+        let writer = pair.master.take_writer().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let pty_master = Arc::new(Mutex::new(pair.master));
+        let read_only = Arc::new(AtomicBool::new(false));
+
+        let pty_writer: Arc<Mutex<Box<dyn std::io::Write + Send>>> = Arc::new(Mutex::new(writer));
+        let shared_writer = SharedWriter {
+            writer: pty_writer,
+            read_only,
         };
 
-        if self.title != next_title {
-            self.title = next_title;
-            cx.notify();
+        let config = TerminalConfig {
+            font_family: MONO_FONT.into(),
+            font_size: px(13.5),
+            cols: 80,
+            rows: 24,
+            scrollback: 10_000,
+            line_height_multiplier: 1.2,
+            padding: Edges::all(px(8.0)),
+            colors: palette,
+            cursor_blink: true,
+            copy_on_select: false,
+            right_click_paste: false,
+            alternate_scroll: true,
+            detect_path_links: true,
+            show_scrollbar: true,
+            ..TerminalConfig::default()
+        };
+
+        let pty_for_resize = pty_master;
+        let resize_callback = move |cols: usize, rows: usize| {
+            let _ = pty_for_resize.lock().resize(PtySize {
+                cols: cols as u16,
+                rows: rows as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        };
+
+        let target = window_title_target.clone();
+        let terminal = cx.new(|cx| {
+            TerminalView::new(shared_writer, reader, config, cx)
+                .with_resize_callback(resize_callback)
+                .with_title_callback(move |window, cx, title| {
+                    window.set_window_title(title);
+                    let title_str = title.to_string();
+                    let _ = target.update(cx, |state, cx| {
+                        state.update_session_title(session_id, &title_str, cx);
+                    });
+                })
+        });
+
+        Ok(terminal)
+    }
+
+    fn update_session_title(&mut self, session_id: usize, title: &str, cx: &mut Context<Self>) {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                if session.id == session_id {
+                    let next = SharedString::from(trimmed.to_string());
+                    if session.title != next {
+                        session.title = next;
+                        cx.notify();
+                    }
+                    return;
+                }
+            }
         }
     }
+
+    fn create_new_session_for_active_project(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let self_weak = cx.entity().downgrade();
+        let next_id = self.next_id;
+        self.next_id += 1;
+
+        let dir = self.active_project().map(|p| p.path.clone());
+        if let Ok(terminal) = Self::spawn_terminal_view(
+            dir.as_ref(),
+            self.palette.clone(),
+            self_weak,
+            next_id,
+            cx,
+        ) {
+            terminal.read(cx).focus_handle().focus(window);
+            let session_count = self
+                .active_project()
+                .map(|p| p.sessions.len())
+                .unwrap_or(0);
+            let session = Session {
+                id: next_id,
+                title: SharedString::from(format!("terminal {}", session_count + 1)),
+                terminal,
+            };
+
+            if let Some(project) = self.active_project_mut() {
+                project.sessions.push(session);
+                project.active_session_idx = project.sessions.len() - 1;
+                cx.notify();
+            }
+        }
+    }
+
+    fn select_folder_and_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            let name = folder
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+
+            let self_weak = cx.entity().downgrade();
+            let next_id = self.next_id;
+            self.next_id += 1;
+
+            if let Ok(terminal) = Self::spawn_terminal_view(
+                Some(&folder),
+                self.palette.clone(),
+                self_weak,
+                next_id,
+                cx,
+            ) {
+                terminal.read(cx).focus_handle().focus(window);
+                let session = Session {
+                    id: next_id,
+                    title: SharedString::from("terminal 1"),
+                    terminal,
+                };
+
+                let project = Project {
+                    id: next_id,
+                    name,
+                    path: folder,
+                    sessions: vec![session],
+                    active_session_idx: 0,
+                };
+
+                self.projects.push(project);
+                self.active_project_idx = self.projects.len() - 1;
+                cx.notify();
+            }
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
 
         if keystroke.modifiers.control && (keystroke.key == "+" || keystroke.key == "=") {
-            if let Some(terminal) = &self.terminal {
-                terminal.update(cx, |terminal, cx| {
+            if let Some(session) = self.active_session() {
+                session.terminal.update(cx, |terminal, cx| {
                     let mut config = terminal.config().clone();
                     config.font_size += px(1.0);
                     terminal.update_config(config, cx);
@@ -69,8 +275,8 @@ impl TerminalWindow {
             }
             cx.stop_propagation();
         } else if keystroke.modifiers.control && keystroke.key == "-" {
-            if let Some(terminal) = &self.terminal {
-                terminal.update(cx, |terminal, cx| {
+            if let Some(session) = self.active_session() {
+                session.terminal.update(cx, |terminal, cx| {
                     let mut config = terminal.config().clone();
                     if config.font_size > px(6.0) {
                         config.font_size -= px(1.0);
@@ -83,13 +289,26 @@ impl TerminalWindow {
     }
 }
 
-impl Render for TerminalWindow {
+impl Render for AppState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_title = self
+            .active_session()
+            .map(|s| s.title.clone())
+            .unwrap_or_else(|| SharedString::from("Terminal"));
+
+        let active_project_name = self
+            .active_project()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "No Project".to_string());
+
+        let active_session_view = self.active_session().map(|s| s.terminal.clone());
+
         div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(gpui::rgb(0x010409))
+            .bg(rgba(0x0f1115ff))
+            .text_color(rgba(0xe6edf3ff))
             .on_key_down(cx.listener(Self::on_key_down))
             .child(
                 TitleBar::new().child(
@@ -99,17 +318,191 @@ impl Render for TerminalWindow {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(13.0))
-                        .text_color(rgba(0xf0f6fcff))
-                        .child(self.title.clone()),
+                        .text_size(px(12.5))
+                        .text_color(rgba(0x8b949eff))
+                        .child(format!("{active_project_name} — {active_title}")),
                 ),
             )
             .child(
                 div()
+                    .flex()
                     .flex_1()
                     .size_full()
                     .overflow_hidden()
-                    .children(self.terminal.clone()),
+                    // SIDEBAR: T3 Code Inspired UI
+                    .child(
+                        div()
+                            .w(px(250.0))
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .bg(rgba(0x090a0dff))
+                            .border_r_1()
+                            .border_color(rgba(0x1e2229ff))
+                            // Sidebar Header
+                            .child(
+                                div()
+                                    .p_3()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .border_b_1()
+                                    .border_color(rgba(0x1e2229ff))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(rgba(0x58a6ffff))
+                                                    .child("T3 Code"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("open-folder-btn")
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_md()
+                                                    .bg(rgba(0x1f242cff))
+                                                    .hover(|s| s.bg(rgba(0x2d333bff)))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .text_xs()
+                                                    .text_color(rgba(0xc9d1d9ff))
+                                                    .child("+ Folder")
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, window, cx| {
+                                                            this.select_folder_and_add_project(window, cx);
+                                                        }),
+                                                    ),
+                                            ),
+                                    ),
+                            )
+                            // Projects & Sessions List
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_y_scrollbar()
+                                    .p_2()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .children(self.projects.iter().enumerate().map(|(p_idx, project)| {
+                                        let is_active_project = p_idx == self.active_project_idx;
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .id(("project-header", project.id))
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_md()
+                                                    .bg(if is_active_project {
+                                                        rgba(0x161b22ff)
+                                                    } else {
+                                                        rgba(0x00000000)
+                                                    })
+                                                    .hover(|s| s.bg(rgba(0x161b2299)))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                            .text_color(if is_active_project {
+                                                                rgba(0x58a6ffff)
+                                                            } else {
+                                                                rgba(0x8b949eff)
+                                                            })
+                                                            .child(project.name.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id(("add-session-btn", project.id))
+                                                            .text_xs()
+                                                            .text_color(rgba(0x8b949eff))
+                                                            .hover(|s| s.text_color(rgba(0xffffffff)))
+                                                            .child("+")
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(move |this, _, window, cx| {
+                                                                    this.active_project_idx = p_idx;
+                                                                    this.create_new_session_for_active_project(window, cx);
+                                                                }),
+                                                            ),
+                                                    )
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, window, cx| {
+                                                            this.active_project_idx = p_idx;
+                                                            if let Some(session) = this.active_session() {
+                                                                session.terminal.read(cx).focus_handle().focus(window);
+                                                            }
+                                                            cx.notify();
+                                                        }),
+                                                    ),
+                                            )
+                                            // Sessions list for this project
+                                            .children(project.sessions.iter().enumerate().map(|(s_idx, session)| {
+                                                let is_active_session = is_active_project && s_idx == project.active_session_idx;
+                                                div()
+                                                    .id(("session-item", session.id))
+                                                    .ml_3()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_md()
+                                                    .bg(if is_active_session {
+                                                        rgba(0x21262dff)
+                                                    } else {
+                                                        rgba(0x00000000)
+                                                    })
+                                                    .hover(|s| s.bg(rgba(0x161b22ff)))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .flex()
+                                                    .items_center()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(if is_active_session {
+                                                                rgba(0xf0f6fcff)
+                                                            } else {
+                                                                rgba(0x8b949eff)
+                                                            })
+                                                            .child(session.title.clone()),
+                                                    )
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, window, cx| {
+                                                            this.active_project_idx = p_idx;
+                                                            if let Some(p) = this.projects.get_mut(p_idx) {
+                                                                p.active_session_idx = s_idx;
+                                                            }
+                                                            if let Some(session) = this.active_session() {
+                                                                session.terminal.read(cx).focus_handle().focus(window);
+                                                            }
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                            }))
+                                    })),
+                            ),
+                    )
+                    // MAIN CONTENT AREA: Terminal
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .bg(rgba(0x010409ff))
+                            .overflow_hidden()
+                            .children(active_session_view),
+                    ),
             )
     }
 }
@@ -264,120 +657,64 @@ fn main() -> Result<()> {
             sync_component_fonts(cx);
 
             let palette = load_github_dark_palette();
+            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let current_name = current_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Workspace".to_string());
 
-            let (shell_cmd, _) = detect_shell();
-            let working_dir = std::env::current_dir().ok();
-
-            let pty_system = native_pty_system();
-            let pair = pty_system
-                .openpty(PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .expect("Failed to open PTY");
-
-            let mut cmd = CommandBuilder::new(&shell_cmd);
-            if let Some(dir) = &working_dir {
-                cmd.cwd(dir);
-            }
-            cmd.env("TERM", "xterm-256color");
-            cmd.env("COLORTERM", "truecolor");
-            cmd.env("TERM_PROGRAM", "ezicode");
-            cmd.env("TERM_PROGRAM_VERSION", "0.1.0");
-            cmd.env("LANG", "en_US.UTF-8");
-            cmd.env("LC_ALL", "en_US.UTF-8");
-
-            let _child = pair.slave.spawn_command(cmd).expect("Failed to spawn shell");
-
-            let writer = pair.master.take_writer().expect("Failed to get PTY writer");
-            let reader = pair
-                .master
-                .try_clone_reader()
-                .expect("Failed to get PTY reader");
-
-            let pty_master = Arc::new(Mutex::new(pair.master));
-            let read_only = Arc::new(AtomicBool::new(false));
-
-            let pty_writer: Arc<Mutex<Box<dyn std::io::Write + Send>>> = Arc::new(Mutex::new(writer));
-            let shared_writer = SharedWriter {
-                writer: pty_writer.clone(),
-                read_only: read_only.clone(),
-            };
-
-            // Exactly ezicode's terminal config
-            let config = TerminalConfig {
-                font_family: MONO_FONT.into(),
-                font_size: px(13.5),
-                cols: 80,
-                rows: 24,
-                scrollback: 10_000,
-                line_height_multiplier: 1.2,
-                padding: Edges::all(px(6.0)),
-                colors: palette,
-                cursor_blink: true,
-                copy_on_select: false,
-                right_click_paste: false,
-                alternate_scroll: true,
-                detect_path_links: true,
-                show_scrollbar: true,
-                ..TerminalConfig::default()
-            };
-
-            let pty_for_resize = pty_master.clone();
-            let resize_callback = move |cols: usize, rows: usize| {
-                let _ = pty_for_resize.lock().resize(PtySize {
-                    cols: cols as u16,
-                    rows: rows as u16,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
-            };
-
-            let bounds = Bounds::centered(None, size(px(1000.), px(650.)), cx);
+            let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitleBar::title_bar_options()),
                     window_decorations: Some(WindowDecorations::Client),
-                    app_id: Some("ezicode-terminal".to_string()),
+                    app_id: Some("t3code-terminal".to_string()),
                     ..Default::default()
                 },
                 |window, cx| {
-                    let (_, shell_name) = detect_shell();
-                    let default_title = SharedString::from(shell_name);
-                    let terminal_placeholder = cx.new(|_cx| {
-                        TerminalWindow {
-                            terminal: None,
-                            title: default_title,
+                    let palette_clone = palette.clone();
+                    let current_dir_clone = current_dir.clone();
+                    let app_state = cx.new(|cx| {
+                        let self_weak = cx.entity().downgrade();
+                        let initial_terminal = AppState::spawn_terminal_view(
+                            Some(&current_dir_clone),
+                            palette_clone.clone(),
+                            self_weak,
+                            1,
+                            cx,
+                        )
+                        .expect("Failed to spawn initial terminal");
+
+                        initial_terminal.read(cx).focus_handle().focus(window);
+
+                        let initial_session = Session {
+                            id: 1,
+                            title: SharedString::from("terminal 1"),
+                            terminal: initial_terminal,
+                        };
+
+                        let initial_project = Project {
+                            id: 1,
+                            name: current_name,
+                            path: current_dir_clone,
+                            sessions: vec![initial_session],
+                            active_session_idx: 0,
+                        };
+
+                        AppState {
+                            projects: vec![initial_project],
+                            active_project_idx: 0,
+                            next_id: 2,
+                            palette: palette_clone,
                         }
                     });
-                    let weak_window = terminal_placeholder.downgrade();
-                    let terminal = cx.new(|cx| {
-                        TerminalView::new(shared_writer, reader, config, cx)
-                            .with_resize_callback(resize_callback)
-                            .with_title_callback(move |window, cx, title| {
-                                window.set_window_title(title);
-                                let _ = weak_window.update(cx, |w, cx| {
-                                    w.set_title(title, cx);
-                                });
-                            })
-                            .with_exit_callback(|_window, cx| {
-                                cx.quit();
-                            })
-                    });
 
-                    terminal_placeholder.update(cx, |w, _cx| {
-                        w.terminal = Some(terminal.clone());
-                    });
-
-                    terminal.read(cx).focus_handle().focus(window);
-
-                    cx.new(|cx| Root::new(terminal_placeholder, window, cx))
+                    cx.new(|cx| Root::new(app_state, window, cx))
                 },
             )
             .expect("Failed to open window");
+
             cx.activate(true);
         });
 
