@@ -8,6 +8,7 @@ use gpui::{
     SharedString, Styled, Window, WindowBounds, WindowDecorations,
     WindowOptions, div, rgba,
 };
+use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Root, TitleBar};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
@@ -324,21 +325,19 @@ impl Render for AppState {
                 ),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .size_full()
-                    .overflow_hidden()
-                    // SIDEBAR: T3 Code Inspired UI
+                h_resizable("workspace-resizable-layout")
                     .child(
-                        div()
-                            .w(px(250.0))
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .bg(rgba(0x090a0dff))
-                            .border_r_1()
-                            .border_color(rgba(0x1e2229ff))
+                        resizable_panel()
+                            .size(px(260.0))
+                            .size_range(px(180.0)..px(600.0))
+                            .child(
+                                div()
+                                    .size_full()
+                                    .flex()
+                                    .flex_col()
+                                    .bg(rgba(0x090a0dff))
+                                    .border_r_1()
+                                    .border_color(rgba(0x1e2229ff))
                             // Sidebar Header
                             .child(
                                 div()
@@ -493,15 +492,17 @@ impl Render for AppState {
                                             }))
                                     })),
                             ),
+                            )
                     )
-                    // MAIN CONTENT AREA: Terminal
                     .child(
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .bg(rgba(0x010409ff))
-                            .overflow_hidden()
-                            .children(active_session_view),
+                        resizable_panel().child(
+                            div()
+                                .flex_1()
+                                .size_full()
+                                .bg(rgba(0x010409ff))
+                                .overflow_hidden()
+                                .children(active_session_view),
+                        )
                     ),
             )
     }
