@@ -449,15 +449,12 @@ impl AppState {
                     } else {
                         SessionStatus::Working
                     }
-                } else if (title_working || signals.working) && !signals.prompt {
-                    // Spinner on screen / OSC title: keep Working even when
-                    // the process lives somewhere we can't see (ssh,
-                    // container) — unless the shell prompt is already back,
-                    // which wins (prompt-first idle).
-                    SessionStatus::Working
                 } else if let Some(outcome) = session.finished_status {
-                    // Sticky Done/Error after a finished command. Focusing
-                    // the terminal acknowledges it (see on_terminal_focused).
+                    // Sticky Done/Error right after a command finished.
+                    // Process exit is authoritative (herdr): it beats a stale
+                    // spinner still visible on screen or in the OSC title.
+                    // Focusing the terminal acknowledges it (see
+                    // on_terminal_focused).
                     let fresh = session
                         .finished_at
                         .map_or(false, |t| now.saturating_duration_since(t) < FINISHED_HOLD);
@@ -473,6 +470,12 @@ impl AppState {
                             SessionStatus::Idle
                         }
                     }
+                } else if (title_working || signals.working) && !signals.prompt {
+                    // Spinner on screen / OSC title: keep Working even when
+                    // the process lives somewhere we can't see (ssh,
+                    // container) — unless the shell prompt is already back,
+                    // which wins (prompt-first idle).
+                    SessionStatus::Working
                 } else if session.focused {
                     SessionStatus::Active
                 } else {
