@@ -5,13 +5,23 @@ edition = "2024"
 
 [dependencies]
 gpui = "0.2.2"
+gpui-component = { version = "0.5.1" }
+gpui-component-assets = "0.5.1"
 gpui-terminal = { path = "gpui-terminal" }
-portable-pty = "0.9"
+rust-embed = "8.12.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.8"
+alacritty_terminal = "0.25.1"
 anyhow = "1"
 parking_lot = "0.12"
 
 [patch.crates-io]
 gpui = { path = "components/gpui" }
+gpui-component = { path = "components" }
+
+[profile.dev.package.gpui-component]
+opt-level = 2
 
 [profile.dev.package.gpui-terminal]
 opt-level = 2
