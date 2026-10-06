@@ -243,6 +243,7 @@ fn main() -> Result<()> {
     Application::new()
         .with_assets(CombinedAssets)
         .run(|cx: &mut App| {
+            gpui_component::init(cx);
             gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
             load_embedded_fonts(cx);
             sync_component_fonts(cx);
