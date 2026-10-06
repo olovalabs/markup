@@ -191,18 +191,8 @@ impl AppState {
             for session in &mut project.sessions {
                 if session.id == session_id {
                     let next = SharedString::from(trimmed.to_string());
-                    let mut changed = false;
                     if session.title != next {
                         session.title = next;
-                        changed = true;
-                    }
-                    if session.status != SessionStatus::Done {
-                        if session.status != SessionStatus::Working {
-                            session.status = SessionStatus::Working;
-                            changed = true;
-                        }
-                    }
-                    if changed {
                         cx.notify();
                     }
                     return;
@@ -236,52 +226,6 @@ impl AppState {
         true
     }
 
-    /// Retrieve child / descendant process info (matching Herdr's /proc inspection)
-    #[cfg(target_os = "linux")]
-    fn get_descendant_commands(parent_pid: u32) -> Vec<String> {
-        let mut commands = Vec::new();
-        let mut pids_to_check = vec![parent_pid];
-        let mut seen = std::collections::HashSet::new();
-
-        while let Some(current_ppid) = pids_to_check.pop() {
-            if seen.contains(&current_ppid) {
-                continue;
-            }
-            seen.insert(current_ppid);
-
-            if let Ok(entries) = std::fs::read_dir("/proc") {
-                for entry in entries.flatten() {
-                    let file_name = entry.file_name();
-                    if let Ok(pid) = file_name.to_string_lossy().parse::<u32>() {
-                        if pid == current_ppid {
-                            continue;
-                        }
-                        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                            let parts: Vec<&str> = stat.split_whitespace().collect();
-                            if parts.len() > 3 && parts[3] == current_ppid.to_string() {
-                                pids_to_check.push(pid);
-                                if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
-                                    let clean_cmd = cmdline.replace('\0', " ").trim().to_string();
-                                    if !clean_cmd.is_empty() {
-                                        commands.push(clean_cmd);
-                                    }
-                                } else {
-                                    let comm = parts[1].trim_matches(|c| c == '(' || c == ')').to_string();
-                                    commands.push(comm);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        commands
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn get_descendant_commands(_parent_pid: u32) -> Vec<String> {
-        Vec::new()
-    }
 
     /// Evaluates terminal bottom buffer lines, OSC title, and process tree
     fn evaluate_agent_status(lines: &[String], title: &str, pid: Option<u32>) -> SessionStatus {
@@ -290,47 +234,32 @@ impl AppState {
                 return SessionStatus::Done;
             }
         }
-        let title_lower = title.to_lowercase();
-        // 1. High-priority OSC Title match (Herdr priority: 1100)
-        // Matches Braille, geometric spinners, or active status verbs
-        if title_lower.contains("working")
-            || title_lower.contains("baking")
-            || title_lower.contains("thinking")
-            || title_lower.contains("generating")
-            || title_lower.contains("executing")
-            || title.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒', '·', '✢', '✳', '✶', '✻', '✽'])
-        {
-            return SessionStatus::Working;
-        }
 
-        // 2. Screen buffer inspection (Herdr prompt_box_body, whole_recent, bottom lines)
-        let joined_screen = lines.join("\n").to_lowercase();
-
-        // Blocked: Awaiting human confirmation, permission approval, or choice
-        static BLOCKED_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"(?i)(esc to cancel|\[y/n\]|\(y/n\)|allow tool execution|do you want to (proceed|run)|press enter to continue|permission required|approve|confirm\?)").unwrap()
-        });
-
-        if BLOCKED_REGEX.is_match(&joined_screen) {
-            return SessionStatus::Blocked;
-        }
-
-        // Working: Active spinner characters, animated glyphs, and runtime verbs
-        static WORKING_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"(?i)(working\.\.\.|thinking\.\.\.|generating\.\.\.|running\.\.\.|executing\.\.\.|fetching\.\.\.|searching\.\.\.|synthesizing\.\.\.|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒·✢✳✶✻✽])").unwrap()
-        });
-
-        for line in lines.iter().rev().take(8) {
+        // 1. High priority: Inspect bottom visible lines (active prompt vs active work)
+        // In Herdr, `live_prompt_box` ('^\s*❯') has high priority to establish IDLE
+        for line in lines.iter().rev().take(6) {
             let l = line.trim();
             if l.is_empty() {
                 continue;
             }
 
-            if WORKING_REGEX.is_match(l) {
-                return SessionStatus::Working;
+            // A. Blocked: prompt awaiting human decision or tool approval
+            let l_lower = l.to_lowercase();
+            if l_lower.contains("esc to cancel")
+                || l_lower.contains("[y/n]")
+                || l_lower.contains("(y/n)")
+                || l_lower.contains("[y/n")
+                || l_lower.contains("allow tool execution?")
+                || l_lower.contains("do you want to proceed?")
+                || l_lower.contains("do you want to run:")
+                || l_lower.contains("press enter to continue")
+                || l_lower.contains("permission required")
+                || l_lower.contains("allow this command?")
+            {
+                return SessionStatus::Blocked;
             }
 
-            // Idle: Matches prompt glyphs waiting for input (Herdr live_prompt_box: '^\s*❯')
+            // B. Idle prompt: Agent or shell is at an interactive prompt waiting for user input
             if l.starts_with('❯')
                 || l.starts_with('▸')
                 || l.starts_with('➜')
@@ -341,23 +270,30 @@ impl AppState {
             {
                 return SessionStatus::Idle;
             }
-        }
-        // 3. Check foreground child processes (Herdr process-info inspection)
-        if let Some(p) = pid {
-            let child_commands = Self::get_descendant_commands(p);
-            for cmd in child_commands {
-                let cmd_lower = cmd.to_lowercase();
-                // If a non-shell child process is actively running, it is in a working/executing turn
-                if !cmd_lower.is_empty()
-                    && !cmd_lower.ends_with("bash")
-                    && !cmd_lower.ends_with("zsh")
-                    && !cmd_lower.ends_with("fish")
-                    && !cmd_lower.ends_with("sh")
-                {
-                    // Check if it's an agent or child tool execution
-                    return SessionStatus::Working;
-                }
+
+            // C. Working: Active spinner or status verbs in bottom lines
+            if l.contains("Working...")
+                || l.contains("Thinking...")
+                || l.contains("Generating...")
+                || l.contains("Running...")
+                || l.contains("Executing...")
+                || l.contains("Synthesizing...")
+                || l.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒'])
+            {
+                return SessionStatus::Working;
             }
+        }
+
+        // 2. OSC Title spinner inspection (Herdr osc_title_working)
+        let title_lower = title.to_lowercase();
+        if title_lower.contains("working")
+            || title_lower.contains("baking")
+            || title_lower.contains("thinking")
+            || title_lower.contains("generating")
+            || title_lower.contains("executing")
+            || title.starts_with(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒', '·', '✢', '✳', '✶', '✻', '✽'])
+        {
+            return SessionStatus::Working;
         }
 
         SessionStatus::Idle
