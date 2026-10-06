@@ -39,18 +39,26 @@ impl std::io::Write for SharedWriter {
 struct TerminalWindow {
     terminal: Option<Entity<TerminalView>>,
     title: SharedString,
+    title_locked: bool,
 }
 
 impl TerminalWindow {
-
     fn set_title(&mut self, title: &str, cx: &mut Context<Self>) {
+        if self.title_locked {
+            return;
+        }
+
         let trimmed = title.trim();
-        if !trimmed.is_empty() && self.title.as_ref() != trimmed {
+        // Ignore empty or generic shell prompts; capture the first meaningful title
+        if !trimmed.is_empty() && trimmed != "bash" && trimmed != "zsh" && trimmed != "sh" && trimmed != "fish" {
+            self.title = SharedString::from(trimmed.to_string());
+            self.title_locked = true;
+            cx.notify();
+        } else if !trimmed.is_empty() && self.title.as_ref() != trimmed {
             self.title = SharedString::from(trimmed.to_string());
             cx.notify();
         }
     }
-
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
 
@@ -343,13 +351,12 @@ fn main() -> Result<()> {
                     let (_, shell_name) = detect_shell();
                     let default_title = SharedString::from(shell_name);
                     let terminal_placeholder = cx.new(|_cx| {
-                        // Temporary dummy until TerminalView is constructed below
                         TerminalWindow {
                             terminal: None,
                             title: default_title,
+                            title_locked: false,
                         }
                     });
-
                     let weak_window = terminal_placeholder.downgrade();
                     let terminal = cx.new(|cx| {
                         TerminalView::new(shared_writer, reader, config, cx)
