@@ -39,13 +39,19 @@ impl std::io::Write for SharedWriter {
         self.writer.lock().flush()
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    Idle,
+    Running,
+    Done,
+}
 
 pub struct Session {
     pub id: usize,
     pub title: SharedString,
     pub terminal: Entity<TerminalView>,
+    pub status: SessionStatus,
 }
-
 pub struct Project {
     pub id: usize,
     pub name: String,
@@ -153,6 +159,7 @@ impl AppState {
         };
 
         let target = window_title_target.clone();
+        let target_for_exit = window_title_target.clone();
         let terminal = cx.new(|cx| {
             TerminalView::new(shared_writer, reader, config, cx)
                 .with_resize_callback(resize_callback)
@@ -163,8 +170,12 @@ impl AppState {
                         state.update_session_title(session_id, &title_str, cx);
                     });
                 })
+                .with_exit_callback(move |_window, cx| {
+                    let _ = target_for_exit.update(cx, |state, cx| {
+                        state.set_session_status(session_id, SessionStatus::Done, cx);
+                    });
+                })
         });
-
         Ok(terminal)
     }
 
@@ -177,8 +188,19 @@ impl AppState {
             for session in &mut project.sessions {
                 if session.id == session_id {
                     let next = SharedString::from(trimmed.to_string());
+                    let mut changed = false;
                     if session.title != next {
                         session.title = next;
+                        changed = true;
+                    }
+                    if session.status != SessionStatus::Done {
+                        // Title activity indicates the agent is running/working
+                        if session.status != SessionStatus::Running {
+                            session.status = SessionStatus::Running;
+                            changed = true;
+                        }
+                    }
+                    if changed {
                         cx.notify();
                     }
                     return;
@@ -187,6 +209,19 @@ impl AppState {
         }
     }
 
+    fn set_session_status(&mut self, session_id: usize, status: SessionStatus, cx: &mut Context<Self>) {
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                if session.id == session_id {
+                    if session.status != status {
+                        session.status = status;
+                        cx.notify();
+                    }
+                    return;
+                }
+            }
+        }
+    }
     fn create_new_session_for_active_project(
         &mut self,
         window: &mut Window,
@@ -213,6 +248,7 @@ impl AppState {
                 id: next_id,
                 title: SharedString::from(format!("terminal {}", session_count + 1)),
                 terminal,
+                status: SessionStatus::Idle,
             };
 
             if let Some(project) = self.active_project_mut() {
@@ -246,6 +282,7 @@ impl AppState {
                     id: next_id,
                     title: SharedString::from("terminal 1"),
                     terminal,
+                    status: SessionStatus::Idle,
                 };
 
                 let project = Project {
@@ -466,15 +503,56 @@ impl Render for AppState {
                                                     .cursor(CursorStyle::PointingHand)
                                                     .flex()
                                                     .items_center()
+                                                    .justify_between()
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap_2()
+                                                            .child(
+                                                                // Status indicator dot
+                                                                div()
+                                                                    .w(px(6.0))
+                                                                    .h(px(6.0))
+                                                                    .rounded_full()
+                                                                    .bg(match session.status {
+                                                                        SessionStatus::Idle => rgba(0x8b949eff),     // Muted gray
+                                                                        SessionStatus::Running => rgba(0x3fb950ff),  // Vibrant green
+                                                                        SessionStatus::Done => rgba(0x58a6ffff),     // Clean blue
+                                                                    })
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(if is_active_session {
+                                                                        rgba(0xf0f6fcff)
+                                                                    } else {
+                                                                        rgba(0x8b949eff)
+                                                                    })
+                                                                    .child(session.title.clone()),
+                                                            ),
+                                                    )
                                                     .child(
                                                         div()
                                                             .text_xs()
-                                                            .text_color(if is_active_session {
-                                                                rgba(0xf0f6fcff)
-                                                            } else {
-                                                                rgba(0x8b949eff)
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .rounded_sm()
+                                                            .bg(match session.status {
+                                                                SessionStatus::Idle => rgba(0x21262d88),
+                                                                SessionStatus::Running => rgba(0x23863644),
+                                                                SessionStatus::Done => rgba(0x1f6feb33),
                                                             })
-                                                            .child(session.title.clone()),
+                                                            .text_color(match session.status {
+                                                                SessionStatus::Idle => rgba(0x8b949eff),
+                                                                SessionStatus::Running => rgba(0x3fb950ff),
+                                                                SessionStatus::Done => rgba(0x58a6ffff),
+                                                            })
+                                                            .child(match session.status {
+                                                                SessionStatus::Idle => "idle",
+                                                                SessionStatus::Running => "running",
+                                                                SessionStatus::Done => "done",
+                                                            }),
                                                     )
                                                     .on_mouse_down(
                                                         MouseButton::Left,
@@ -693,6 +771,7 @@ fn main() -> Result<()> {
                             id: 1,
                             title: SharedString::from("terminal 1"),
                             terminal: initial_terminal,
+                            status: SessionStatus::Idle,
                         };
 
                         let initial_project = Project {
