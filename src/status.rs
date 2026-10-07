@@ -160,29 +160,50 @@ pub fn foreground_process_names(pid: Option<u32>) -> Vec<String> {
         }
     };
 
-    if let Ok(comm) = std::fs::read_to_string(dir.join("comm")) {
-        push(comm);
+    fn read_proc_info(proc_dir: &Path, push: &mut impl FnMut(String)) {
+        if let Ok(comm) = std::fs::read_to_string(proc_dir.join("comm")) {
+            push(comm);
+        }
+
+        if let Ok(cmdline) = std::fs::read(proc_dir.join("cmdline")) {
+            fn basename(arg: &[u8]) -> String {
+                String::from_utf8_lossy(arg)
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            }
+            let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).collect();
+            if let Some(argv0) = args.first() {
+                push(basename(argv0));
+            }
+            if let Some(argv0) = args.first() {
+                const INTERPRETERS: &[&str] = &[
+                    "node", "nodejs", "python", "python3", "deno", "bun", "ruby", "perl", "sh",
+                    "bash", "npx", "bunx", "pnpm", "yarn", "sudo",
+                ];
+                let interpreter = basename(argv0).to_ascii_lowercase();
+                if INTERPRETERS.contains(&interpreter.as_str()) {
+                    // Find first non-flag argument
+                    for arg in &args[1..] {
+                        if !arg.starts_with(b"-") {
+                            push(basename(arg));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    if let Ok(cmdline) = std::fs::read(dir.join("cmdline")) {
-        fn basename(arg: &[u8]) -> String {
-            String::from_utf8_lossy(arg)
-                .rsplit('/')
-                .next()
-                .unwrap_or_default()
-                .to_string()
-        }
-        let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).collect();
-        if let Some(argv0) = args.first() {
-            push(basename(argv0));
-        }
-        if let (Some(argv0), Some(argv1)) = (args.first(), args.get(1)) {
-            const INTERPRETERS: &[&str] =
-                &["node", "nodejs", "python", "python3", "deno", "bun", "ruby", "perl", "sh", "bash"];
-            let interpreter = basename(argv0).to_ascii_lowercase();
-            if INTERPRETERS.contains(&interpreter.as_str()) {
-                push(basename(argv1));
-            }
+    read_proc_info(&dir, &mut push);
+
+    // Also inspect child processes of the group leader (e.g. wrappers like bash script running node)
+    let children_path = dir.join("task").join(tpgid.to_string()).join("children");
+    if let Ok(children_data) = std::fs::read_to_string(children_path) {
+        for child_pid_str in children_data.split_whitespace() {
+            let child_dir = Path::new("/proc").join(child_pid_str);
+            read_proc_info(&child_dir, &mut push);
         }
     }
 

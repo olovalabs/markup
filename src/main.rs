@@ -6,7 +6,7 @@ use gpui::{
     px, size, App, AppContext, Application, Bounds, Context, CursorStyle, Edges, Entity,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
     SharedString, Styled, Window, WindowBounds, WindowDecorations,
-    WindowOptions, div, rgba,
+    WindowOptions, div, rgba, svg,
 };
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement as _;
@@ -18,6 +18,7 @@ use serde_json::Value;
 
 mod agent_rules;
 mod assets;
+mod logos;
 mod status;
 
 use assets::{load_embedded_fonts, sync_component_fonts, CombinedAssets, MONO_FONT};
@@ -60,6 +61,8 @@ pub struct Session {
     /// When the terminal first showed an unacknowledged Done, for the short
     /// auto-clear timeout in the spec.
     pub done_since: Option<std::time::Instant>,
+    /// Path of the AI agent / command logo shown in the sidebar.
+    pub logo: SharedString,
 }
 
 /// How long an unacknowledged Done badge lingers before it falls back to Idle.
@@ -200,8 +203,22 @@ impl AppState {
             for session in &mut project.sessions {
                 if session.id == session_id {
                     let next = SharedString::from(trimmed.to_string());
+                    let mut updated = false;
                     if session.title != next {
                         session.title = next;
+                        updated = true;
+                    }
+                    let title_logo = logos::resolve_session_logo(
+                        &[],
+                        Some(trimmed),
+                        session.status,
+                        &session.logo,
+                    );
+                    if title_logo != logos::default_logo() && session.logo != title_logo {
+                        session.logo = title_logo;
+                        updated = true;
+                    }
+                    if updated {
                         cx.notify();
                     }
                     return;
@@ -389,6 +406,18 @@ impl AppState {
                     session.status = next;
                     changed = true;
                 }
+
+                let term_title = session.terminal.read(cx).title();
+                let next_logo = logos::resolve_session_logo(
+                    &foreground,
+                    term_title,
+                    session.status,
+                    &session.logo,
+                );
+                if session.logo != next_logo {
+                    session.logo = next_logo;
+                    changed = true;
+                }
             }
         }
         if changed {
@@ -426,6 +455,7 @@ impl AppState {
                 ack_screen: None,
                 agent_active: false,
                 done_since: None,
+                logo: logos::default_logo(),
             };
 
             if let Some(project) = self.active_project_mut() {
@@ -464,6 +494,7 @@ impl AppState {
                     ack_screen: None,
                     agent_active: false,
                     done_since: None,
+                    logo: logos::default_logo(),
                 };
                 let project = Project {
                     id: next_id,
@@ -528,8 +559,9 @@ impl Render for AppState {
 
         let active_session_view = self.active_session().map(|s| s.terminal.clone());
 
-        // Focused terminal's status, mirrored in the title bar.
+        // Focused terminal's status and logo, mirrored in the title bar.
         let titlebar_status = self.active_session().map(|s| s.status);
+        let titlebar_logo = self.active_session().map(|s| s.logo.clone());
 
         div()
             .flex()
@@ -549,6 +581,20 @@ impl Render for AppState {
                         .gap_2()
                         .text_size(px(12.5))
                         .text_color(rgba(0x8b949eff))
+                        .children(titlebar_logo.map(|logo| {
+                            div()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .flex_shrink_0()
+                                .child(
+                                    gpui::img(logo)
+                                        .size(px(14.0))
+                                        .rounded(px(2.0))
+                                )
+                        }))
                         .child(format!("{active_project_name} — {active_title}"))
                         .children(titlebar_status.map(|status| {
                             let (dot_color, text_color, badge_bg) = status.colors();
@@ -610,15 +656,21 @@ impl Render for AppState {
                                             .child(
                                                 div()
                                                     .id("open-folder-btn")
-                                                    .px_2()
-                                                    .py_0p5()
+                                                    .p_1p5()
                                                     .rounded_md()
                                                     .bg(rgba(0x1f242cff))
                                                     .hover(|s| s.bg(rgba(0x2d333bff)))
                                                     .cursor(CursorStyle::PointingHand)
-                                                    .text_xs()
-                                                    .text_color(rgba(0xc9d1d9ff))
-                                                    .child("+ Folder")
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(
+                                                        svg()
+                                                            .path("ui_icons/project-add.svg")
+                                                            .size(px(18.0))
+                                                            .text_color(rgba(0xc9d1d9ff))
+                                                            .hover(|s| s.text_color(rgba(0xffffffff)))
+                                                    )
                                                     .on_mouse_down(
                                                         MouseButton::Left,
                                                         cx.listener(|this, _, window, cx| {
@@ -673,10 +725,20 @@ impl Render for AppState {
                                                     .child(
                                                         div()
                                                             .id(("add-session-btn", project.id))
-                                                            .text_xs()
-                                                            .text_color(rgba(0x8b949eff))
-                                                            .hover(|s| s.text_color(rgba(0xffffffff)))
-                                                            .child("+")
+                                                            .p_1()
+                                                            .rounded_md()
+                                                            .hover(|s| s.bg(rgba(0x21262dff)))
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(
+                                                                svg()
+                                                                    .path("ui_icons/session-create.svg")
+                                                                    .size(px(18.0))
+                                                                    .text_color(rgba(0x8b949eff))
+                                                                    .hover(|s| s.text_color(rgba(0xffffffff)))
+                                                            )
                                                             .on_mouse_down(
                                                                 MouseButton::Left,
                                                                 cx.listener(move |this, _, window, cx| {
@@ -699,7 +761,13 @@ impl Render for AppState {
                                             // Sessions list for this project
                                             .children(project.sessions.iter().enumerate().map(|(s_idx, session)| {
                                                 let is_active_session = is_active_project && s_idx == project.active_session_idx;
-                                                let (dot_color, text_color, badge_bg) = session.status.colors();
+                                                let (_, text_color, badge_bg) = session.status.colors();
+                                                let display_title = if session.title.chars().count() > 160 {
+                                                    let truncated: String = session.title.chars().take(160).collect();
+                                                    format!("{truncated}...")
+                                                } else {
+                                                    session.title.to_string()
+                                                };
                                                 div()
                                                     .id(("session-item", session.id))
                                                     .ml_3()
@@ -716,32 +784,44 @@ impl Render for AppState {
                                                     .flex()
                                                     .items_center()
                                                     .justify_between()
+                                                    .gap_2()
                                                     .child(
                                                         div()
                                                             .flex()
                                                             .items_center()
                                                             .gap_2()
+                                                            .min_w_0()
+                                                            .flex_1()
                                                             .child(
-                                                                // Status indicator dot
+                                                                // AI Agent / Command logo
                                                                 div()
-                                                                    .w(px(6.0))
-                                                                    .h(px(6.0))
-                                                                    .rounded_full()
-                                                                    .bg(rgba(dot_color))
+                                                                    .w(px(16.0))
+                                                                    .h(px(16.0))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .flex_shrink_0()
+                                                                    .child(
+                                                                        gpui::img(session.logo.clone())
+                                                                            .size(px(15.0))
+                                                                            .rounded(px(2.0))
+                                                                    )
                                                             )
                                                             .child(
                                                                 div()
                                                                     .text_xs()
+                                                                    .truncate()
                                                                     .text_color(if is_active_session {
                                                                         rgba(0xf0f6fcff)
                                                                     } else {
                                                                         rgba(0x8b949eff)
                                                                     })
-                                                                    .child(session.title.clone()),
+                                                                    .child(display_title),
                                                             ),
                                                     )
                                                     .child(
                                                         div()
+                                                            .flex_shrink_0()
                                                             .text_xs()
                                                             .px_1p5()
                                                             .py_0p5()
@@ -985,6 +1065,7 @@ fn main() -> Result<()> {
                             ack_screen: None,
                             agent_active: false,
                             done_since: None,
+                            logo: logos::default_logo(),
                         };
 
                         let initial_project = Project {

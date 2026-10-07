@@ -22,6 +22,18 @@ impl gpui::AssetSource for CombinedAssets {
         if let Some(file) = AppAssets::get(path) {
             return Ok(Some(file.data));
         }
+        // Fallback to filesystem assets/ in case new files were placed on disk
+        let disk_paths = [
+            std::path::Path::new("assets").join(clean),
+            std::path::Path::new("/home/nazmul/Desktop/markup/assets").join(clean),
+            std::path::Path::new(clean).to_path_buf(),
+            std::path::Path::new(path).to_path_buf(),
+        ];
+        for disk_path in disk_paths {
+            if let Ok(bytes) = std::fs::read(&disk_path) {
+                return Ok(Some(std::borrow::Cow::Owned(bytes)));
+            }
+        }
         gpui_component_assets::Assets.load(path)
     }
 
