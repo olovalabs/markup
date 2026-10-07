@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -92,6 +93,8 @@ struct AppState {
     active_project_idx: usize,
     next_id: usize,
     palette: ColorPalette,
+    /// O(1) session lookup by id: session id -> (project idx, session idx).
+    session_index: HashMap<usize, (usize, usize)>,
     /// Session that currently owns keyboard focus, tracked every render frame
     /// and consumed by the status poller (Active state, sticky-state clearing).
     focused_session_id: Option<usize>,
@@ -1138,9 +1141,12 @@ fn main() -> Result<()> {
                         let initial_session = Session {
                             id: 1,
                             title: SharedString::from("terminal 1"),
+                            display_title: SharedString::from("terminal 1"),
                             terminal: initial_terminal,
                             status: SessionStatus::Idle,
                             pid,
+                            screen_scratch: Vec::new(),
+                            poll_cache: None,
                             ack_screen: None,
                             agent_active: false,
                             done_since: None,
