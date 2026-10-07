@@ -56,14 +56,14 @@ impl TerminalNotifier {
         }
     }
 
-    /// Write raw bytes into the PTY, flushing immediately.
+    /// Write raw bytes into the PTY.
     ///
     /// Terminal replies are latency sensitive (the application is usually
-    /// blocked reading stdin), so we never buffer them.
+    /// blocked reading stdin), so we never buffer them. The writer itself is
+    /// unbuffered, so no explicit flush is needed.
     pub fn write(&self, bytes: &[u8]) {
         let mut writer = self.writer.lock();
         let _ = writer.write_all(bytes);
-        let _ = writer.flush();
     }
 
     pub fn write_str(&self, text: &str) {

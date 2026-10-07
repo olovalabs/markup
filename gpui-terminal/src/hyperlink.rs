@@ -177,10 +177,15 @@ pub fn visible_regex_matches<T>(term: &Term<T>, regex: &mut RegexSearch) -> Vec<
 }
 
 /// The regex match containing `point`, if any.
+///
+/// Only the hovered (wrapped) line is searched: this runs on every mouse move,
+/// and scanning the whole viewport for every motion event stalls frames.
+/// A link under the cursor always covers the cursor's own line, so searching
+/// just that line finds exactly the same match.
 pub fn regex_match_at<T>(term: &Term<T>, point: Point, regex: &mut RegexSearch) -> Option<Match> {
-    visible_regex_matches(term, regex)
-        .into_iter()
-        .find(|m| m.contains(&point))
+    let start = term.line_search_left(point);
+    let end = term.line_search_right(point);
+    RegexIter::new(start, end, Direction::Right, term, regex).find(|m| m.contains(&point))
 }
 
 /// Text covered by a grid range.

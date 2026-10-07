@@ -35,6 +35,7 @@
 //! `above_prompt_box`, `last_non_empty_above_prompt_box`, and
 //! `after_last_horizontal_rule`.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -259,7 +260,7 @@ impl RulePack {
         names.sort();
         names.dedup();
 
-        let rules = raw
+        let mut rules = raw
             .rules
             .iter()
             .map(|rule| {
@@ -281,6 +282,11 @@ impl RulePack {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        // Highest priority first. The sort is stable, so file order still
+        // breaks priority ties — exactly the resolution `evaluate` used to
+        // compute per tick, now paid once at load so evaluation can stop at
+        // the first match.
+        rules.sort_by(|a, b| b.priority.cmp(&a.priority));
 
         Ok(RulePack {
             id: raw.id,
@@ -288,22 +294,6 @@ impl RulePack {
             names,
             rules,
         })
-    }
-
-    /// Does this pack claim the given process name?
-    pub fn claims(&self, name: &str) -> bool {
-        let key = normalize_name(name);
-        if key.is_empty() {
-            return false;
-        }
-        if self.names.contains(&key) {
-            return true;
-        }
-        // A handful of names herdr recognizes that no pack lists itself,
-        // because they are launcher variants of another name.
-        EXTRA_PROCESS_ALIASES
-            .iter()
-            .any(|(alias, canonical)| key == *alias && self.id.eq_ignore_ascii_case(canonical))
     }
 
 }
@@ -332,6 +322,10 @@ fn normalize_name(name: &str) -> String {
 #[derive(Debug)]
 pub struct RuleSet {
     packs: Vec<RulePack>,
+    /// Every name any pack answers to (ids, aliases, file stems, plus
+    /// [`EXTRA_PROCESS_ALIASES`]) mapped to its pack index, so process-name
+    /// lookups are one hash probe instead of a linear scan over all packs.
+    by_name: HashMap<String, usize>,
 }
 
 static EMBEDDED: LazyLock<RuleSet> = LazyLock::new(RuleSet::load_embedded);
@@ -363,22 +357,40 @@ impl RuleSet {
             }
         }
         packs.sort_by(|a, b| a.id.cmp(&b.id));
-        RuleSet { packs }
+        let mut by_name = HashMap::new();
+        for (index, pack) in packs.iter().enumerate() {
+            for name in &pack.names {
+                by_name.insert(name.clone(), index);
+            }
+        }
+        // Launcher variants herdr recognizes that no pack lists itself.
+        for (alias, canonical) in EXTRA_PROCESS_ALIASES {
+            if let Some(index) = packs.iter().position(|pack| pack.id == *canonical) {
+                by_name.insert(alias.to_string(), index);
+            }
+        }
+        RuleSet { packs, by_name }
     }
 
     /// The pack that owns any of `process_names`, first match in order.
     pub fn pack_for<'a>(&'a self, process_names: &[String]) -> Option<&'a RulePack> {
-        process_names
-            .iter()
-            .find_map(|name| self.packs.iter().find(|pack| pack.claims(name)))
+        process_names.iter().find_map(|name| {
+            let key = normalize_name(name);
+            self.by_name.get(&key).map(|&index| &self.packs[index])
+        })
     }
 
     /// Canonical agent id for a process name, if a pack claims it.
     pub fn identify(&self, name: &str) -> Option<&str> {
-        self.packs
-            .iter()
-            .find(|pack| pack.claims(name))
-            .map(|pack| pack.id.as_str())
+        let key = normalize_name(name);
+        self.by_name.get(&key).map(|&index| self.packs[index].id.as_str())
+    }
+
+    /// Canonical agent id for an already-normalized name (lowercase basename,
+    /// no path prefix): a bare hash lookup with no allocation, for hot paths
+    /// that normalized the name themselves.
+    pub fn identify_normalized(&self, key: &str) -> Option<&str> {
+        self.by_name.get(key).map(|&index| self.packs[index].id.as_str())
     }
 }
 
@@ -389,35 +401,66 @@ pub fn identify(name: &str) -> Option<&'static str> {
     embedded().identify(name)
 }
 
+/// Canonical agent id for an already-normalized name (see
+/// [`RuleSet::identify_normalized`]).
+pub fn identify_normalized(key: &str) -> Option<&'static str> {
+    embedded().identify_normalized(key)
+}
+
 /// Evaluate one pack against the screen.
+///
+/// Rules arrive pre-sorted by descending priority (file order breaking ties),
+/// so the first match wins and evaluation stops there. The screen is
+/// lowercased once up front and each distinct region spec is sliced once —
+/// packs reuse a handful of specs across all their rules, so this replaces up
+/// to one full-screen allocation *per rule* per tick with a small constant.
 pub fn evaluate(pack: &RulePack, input: DetectionInput<'_>) -> Option<RuleMatch> {
-    let mut best: Option<&CompiledRule> = None;
+    // Slicing the lowered screen yields the same lines as lowering the sliced
+    // region: lowercasing never adds or removes line breaks.
+    let lower_screen = input.screen.to_lowercase();
+    let lower_title = input.osc_title.to_lowercase();
+    let lower_progress = input.osc_progress.to_lowercase();
+    let lowered = DetectionInput {
+        screen: &lower_screen,
+        osc_title: &lower_title,
+        osc_progress: &lower_progress,
+    };
+    // (region spec, region text, lowered region text), one entry per distinct
+    // spec actually used. A tiny linear cache beats a HashMap here: packs use
+    // only a few specs and this whole vec usually stays in one cache line.
+    let mut regions: Vec<(&str, &str, &str)> = Vec::with_capacity(4);
 
     for rule in &pack.rules {
-        let region_text = region(input, &rule.region);
-        let lower_text = region_text.to_lowercase();
-        if !gate_matches(&rule.gate, region_text, &lower_text) {
+        let (region_text, lower_text) = match regions
+            .iter()
+            .find(|(spec, _, _)| *spec == rule.region)
+        {
+            Some((_, text, lower)) => (*text, *lower),
+            None => {
+                let text = region(input, &rule.region);
+                let lower = region(lowered, &rule.region);
+                regions.push((rule.region.as_str(), text, lower));
+                (text, lower)
+            }
+        };
+        if !gate_matches(&rule.gate, region_text, lower_text) {
             continue;
         }
-        // Highest priority wins; the earlier rule keeps a tie.
-        match best {
-            Some(previous) if previous.priority >= rule.priority => {}
-            _ => best = Some(rule),
-        }
+        return Some(RuleMatch {
+            pack: pack.id.clone(),
+            pack_version: pack.version.clone(),
+            rule: rule.id.clone(),
+            state: rule.state,
+            priority: rule.priority,
+            region: rule.region.clone(),
+            visible_idle: rule.visible_idle,
+            visible_blocker: rule.visible_blocker,
+            visible_working: rule.visible_working,
+            skip_state_update: rule.skip_state_update,
+        });
     }
 
-    best.map(|rule| RuleMatch {
-        pack: pack.id.clone(),
-        pack_version: pack.version.clone(),
-        rule: rule.id.clone(),
-        state: rule.state,
-        priority: rule.priority,
-        region: rule.region.clone(),
-        visible_idle: rule.visible_idle,
-        visible_blocker: rule.visible_blocker,
-        visible_working: rule.visible_working,
-        skip_state_update: rule.skip_state_update,
-    })
+    None
 }
 
 fn compile_gate(gate: &RawGate, depth: usize) -> Result<CompiledGate, String> {

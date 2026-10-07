@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -47,9 +48,20 @@ impl std::io::Write for SharedWriter {
 pub struct Session {
     pub id: usize,
     pub title: SharedString,
+    /// Title as shown in the sidebar (truncated to 160 chars), cached so the
+    /// render pass does not re-scan and re-allocate it for every session of
+    /// every frame.
+    pub display_title: SharedString,
     pub terminal: Entity<TerminalView>,
     pub status: SessionStatus,
     pub pid: Option<u32>,
+    /// Reused scrape buffer: the poller reads the screen into this instead of
+    /// allocating a fresh `Vec<String>` every 500 ms per session.
+    pub screen_scratch: Vec<String>,
+    /// (screen fingerprint, focused, exited, foreground fingerprint) from the
+    /// last poll tick. When it matches, nothing observable changed and the
+    /// whole rule-pack evaluation + logo resolution is skipped.
+    pub poll_cache: Option<(u64, bool, bool, u64)>,
     /// Screen fingerprint at the moment the user last looked at a finished or
     /// failed terminal. While the screen still matches, the sticky Done/Error
     /// badge stays acknowledged (Idle); any new output invalidates it and lets
@@ -69,7 +81,8 @@ pub struct Session {
 const DONE_LINGER: std::time::Duration = std::time::Duration::from_secs(30);
 pub struct Project {
     pub id: usize,
-    pub name: String,
+    /// Shared (cheap to clone) because the render pass copies it every frame.
+    pub name: SharedString,
     pub path: PathBuf,
     pub sessions: Vec<Session>,
     pub active_session_idx: usize,
@@ -80,6 +93,8 @@ struct AppState {
     active_project_idx: usize,
     next_id: usize,
     palette: ColorPalette,
+    /// O(1) session lookup by id: session id -> (project idx, session idx).
+    session_index: HashMap<usize, (usize, usize)>,
     /// Session that currently owns keyboard focus, tracked every render frame
     /// and consumed by the status poller (Active state, sticky-state clearing).
     focused_session_id: Option<usize>,
@@ -199,32 +214,30 @@ impl AppState {
         if trimmed.is_empty() {
             return;
         }
-        for project in &mut self.projects {
-            for session in &mut project.sessions {
-                if session.id == session_id {
-                    let next = SharedString::from(trimmed.to_string());
-                    let mut updated = false;
-                    if session.title != next {
-                        session.title = next;
-                        updated = true;
-                    }
-                    let title_logo = logos::resolve_session_logo(
-                        &[],
-                        Some(trimmed),
-                        session.status,
-                        &session.logo,
-                    );
-                    if title_logo != logos::default_logo() && session.logo != title_logo {
-                        session.logo = title_logo;
-                        updated = true;
-                    }
-                    if updated {
-                        cx.notify();
-                    }
-                    return;
-                }
-            }
+        let Some(&(p_idx, s_idx)) = self.session_index.get(&session_id) else {
+            return;
+        };
+        let Some(session) = self
+            .projects
+            .get_mut(p_idx)
+            .and_then(|p| p.sessions.get_mut(s_idx))
+        else {
+            return;
+        };
+        // Unchanged titles are common (TUIs re-emit them constantly); the logo
+        // depends only on title/status/logo, so there is nothing to redo.
+        if session.title.as_str() == trimmed {
+            return;
         }
+        let next = SharedString::from(trimmed.to_string());
+        session.title = next.clone();
+        session.display_title = truncate_title(&next);
+        let title_logo =
+            logos::resolve_session_logo(&[], Some(trimmed), session.status, &session.logo);
+        if title_logo != logos::default_logo() && session.logo != title_logo {
+            session.logo = title_logo;
+        }
+        cx.notify();
     }
 
     /// Periodic detection tick, herdr-style: screen scrape + OSC title +
@@ -251,15 +264,43 @@ impl AppState {
                 // Reused for both the debug dump and the agent lifecycle below.
                 let foreground = status::foreground_process_names(session.pid);
 
+                // Scrape into the session's reused buffer. `bottom_lines` takes
+                // the last N *rows*, clamped to the visible screen. Ask for the
+                // whole screen: a fresh shell prints its prompt on row 0, well
+                // above a 12-row window at the bottom. The rules skip blank
+                // rows themselves.
+                session
+                    .terminal
+                    .read(cx)
+                    .bottom_lines_into(usize::MAX, &mut session.screen_scratch);
+
+                // Idle fast path: when the screen, focus, exit state, and
+                // foreground group all match last tick, the status, ack, and
+                // logo cannot have changed — skip the rule-pack evaluation
+                // entirely. Done is excluded: it expires on a timer even when
+                // nothing else changes.
+                let poll_key = {
+                    let terminal = session.terminal.read(cx);
+                    let fp = screen_fingerprint(
+                        &session.screen_scratch,
+                        terminal.title().unwrap_or(""),
+                    );
+                    (
+                        fp,
+                        focused,
+                        terminal.has_exited(),
+                        screen_fingerprint(&foreground, ""),
+                    )
+                };
+                if session.poll_cache == Some(poll_key) && session.status != SessionStatus::Done {
+                    continue;
+                }
+
                 let (next, ack, screen_fp) = {
                     let terminal = session.terminal.read(cx);
-                    // `bottom_lines` takes the last N *rows*, clamped to the
-                    // visible screen. Ask for the whole screen: a fresh shell
-                    // prints its prompt on row 0, well above a 12-row window
-                    // at the bottom. The rules skip blank rows themselves.
-                    let bottom_lines = terminal.bottom_lines(usize::MAX);
+                    let bottom_lines = &session.screen_scratch;
                     let title = terminal.title().unwrap_or("");
-                    let screen_fp = screen_fingerprint(&bottom_lines, title);
+                    let screen_fp = screen_fingerprint(bottom_lines, title);
 
                     // Looking at a finished/failed terminal acknowledges it:
                     // while the screen is unchanged the sticky badge stays
@@ -274,9 +315,21 @@ impl AppState {
                     };
                     let acknowledged = ack == Some(screen_fp);
 
+                    // The agent rule match behind this tick's verdict, for the
+                    // debug dump. The live path below captures it for free;
+                    // the exited path only needs it for the dump itself.
+                    let mut debug_match = None;
+
                     // Exit of the PTY child wins: the real exit code decides
                     // Done (0) vs Error (non-zero / signal), herdr-style.
                     let next = if terminal.has_exited() {
+                        if debug {
+                            debug_match = status::explain(&StatusInput {
+                                lines: bottom_lines,
+                                title: Some(title),
+                                foreground: &foreground,
+                            });
+                        }
                         if acknowledged {
                             SessionStatus::Idle
                         } else {
@@ -287,11 +340,20 @@ impl AppState {
                         }
                     } else {
                         let input = StatusInput {
-                            lines: &bottom_lines,
+                            lines: bottom_lines,
                             title: Some(title),
                             foreground: &foreground,
                         };
-                        let detected = status::evaluate(&input, session.status, focused);
+                        // Debug builds capture the match for the dump below;
+                        // release builds use the plain verdict (same work).
+                        let (detected, rule_match) = if debug {
+                            status::evaluate_with_match(&input, session.status, focused)
+                        } else {
+                            (status::evaluate(&input, session.status, focused), None)
+                        };
+                        // Stash the match for the debug dump below so the pack
+                        // is not evaluated a second time to explain the badge.
+                        debug_match = rule_match;
                         if acknowledged && matches!(detected, SessionStatus::Done | SessionStatus::Error) {
                             if focused {
                                 SessionStatus::Active
@@ -304,12 +366,9 @@ impl AppState {
                     };
 
                     if debug {
-                        let rule = status::explain(&StatusInput {
-                            lines: &bottom_lines,
-                            title: Some(title),
-                            foreground: &foreground,
-                        })
-                        .map_or_else(
+                        let rule = debug_match
+                            .as_ref()
+                            .map_or_else(
                             || "(no rule)".to_string(),
                             |m| {
                                 format!(
@@ -418,6 +477,8 @@ impl AppState {
                     session.logo = next_logo;
                     changed = true;
                 }
+
+                session.poll_cache = Some(poll_key);
             }
         }
         if changed {
@@ -446,21 +507,32 @@ impl AppState {
                 .active_project()
                 .map(|p| p.sessions.len())
                 .unwrap_or(0);
+            let title = SharedString::from(format!("terminal {}", session_count + 1));
             let session = Session {
                 id: next_id,
-                title: SharedString::from(format!("terminal {}", session_count + 1)),
+                title: title.clone(),
+                display_title: truncate_title(&title),
                 terminal,
                 status: SessionStatus::Idle,
                 pid,
+                screen_scratch: Vec::new(),
+                poll_cache: None,
                 ack_screen: None,
                 agent_active: false,
                 done_since: None,
                 logo: logos::default_logo(),
             };
 
-            if let Some(project) = self.active_project_mut() {
+            let p_idx = self.active_project_idx;
+            let pushed = if let Some(project) = self.active_project_mut() {
                 project.sessions.push(session);
                 project.active_session_idx = project.sessions.len() - 1;
+                Some(project.active_session_idx)
+            } else {
+                None
+            };
+            if let Some(s_idx) = pushed {
+                self.session_index.insert(next_id, (p_idx, s_idx));
                 cx.notify();
             }
         }
@@ -488,9 +560,12 @@ impl AppState {
                 let session = Session {
                     id: next_id,
                     title: SharedString::from("terminal 1"),
+                    display_title: SharedString::from("terminal 1"),
                     terminal,
                     status: SessionStatus::Idle,
                     pid,
+                    screen_scratch: Vec::new(),
+                    poll_cache: None,
                     ack_screen: None,
                     agent_active: false,
                     done_since: None,
@@ -498,7 +573,7 @@ impl AppState {
                 };
                 let project = Project {
                     id: next_id,
-                    name,
+                    name: SharedString::from(name),
                     path: folder,
                     sessions: vec![session],
                     active_session_idx: 0,
@@ -506,6 +581,8 @@ impl AppState {
 
                 self.projects.push(project);
                 self.active_project_idx = self.projects.len() - 1;
+                let p_idx = self.active_project_idx;
+                self.session_index.insert(next_id, (p_idx, 0));
                 cx.notify();
             }
         }
@@ -555,7 +632,7 @@ impl Render for AppState {
         let active_project_name = self
             .active_project()
             .map(|p| p.name.clone())
-            .unwrap_or_else(|| "No Project".to_string());
+            .unwrap_or_else(|| SharedString::from("No Project"));
 
         let active_session_view = self.active_session().map(|s| s.terminal.clone());
 
@@ -762,12 +839,6 @@ impl Render for AppState {
                                             .children(project.sessions.iter().enumerate().map(|(s_idx, session)| {
                                                 let is_active_session = is_active_project && s_idx == project.active_session_idx;
                                                 let (_, text_color, badge_bg) = session.status.colors();
-                                                let display_title = if session.title.chars().count() > 160 {
-                                                    let truncated: String = session.title.chars().take(160).collect();
-                                                    format!("{truncated}...")
-                                                } else {
-                                                    session.title.to_string()
-                                                };
                                                 div()
                                                     .id(("session-item", session.id))
                                                     .ml_3()
@@ -816,7 +887,7 @@ impl Render for AppState {
                                                                     } else {
                                                                         rgba(0x8b949eff)
                                                                     })
-                                                                    .child(display_title),
+                                                                    .child(session.display_title.clone()),
                                                             ),
                                                     )
                                                     .child(
@@ -864,6 +935,17 @@ impl Render for AppState {
 
 /// How many non-empty screen lines `T3_STATUS_DEBUG` prints per terminal.
 const DEBUG_SCREEN_LINES: usize = 14;
+
+/// Sidebar form of a session title: full text up to 160 chars, then an ellipsis.
+/// Uses `char_indices().nth(160)` so short titles cost one pass that stops at
+/// the end — unlike `chars().count()`, which always scans the whole string —
+/// and is cached on the session so rendering never recomputes it.
+fn truncate_title(title: &SharedString) -> SharedString {
+    match title.as_str().char_indices().nth(160) {
+        Some((idx, _)) => SharedString::from(format!("{}...", &title.as_str()[..idx])),
+        None => title.clone(),
+    }
+}
 
 /// Cheap, stable fingerprint of what is on screen, used to tell whether the
 /// user has already looked at a finished/failed terminal.
@@ -1059,9 +1141,12 @@ fn main() -> Result<()> {
                         let initial_session = Session {
                             id: 1,
                             title: SharedString::from("terminal 1"),
+                            display_title: SharedString::from("terminal 1"),
                             terminal: initial_terminal,
                             status: SessionStatus::Idle,
                             pid,
+                            screen_scratch: Vec::new(),
+                            poll_cache: None,
                             ack_screen: None,
                             agent_active: false,
                             done_since: None,
@@ -1070,7 +1155,7 @@ fn main() -> Result<()> {
 
                         let initial_project = Project {
                             id: 1,
-                            name: current_name,
+                            name: SharedString::from(current_name),
                             path: current_dir_clone,
                             sessions: vec![initial_session],
                             active_session_idx: 0,
@@ -1080,6 +1165,7 @@ fn main() -> Result<()> {
                             projects: vec![initial_project],
                             active_project_idx: 0,
                             next_id: 2,
+                            session_index: HashMap::from([(1, (0, 0))]),
                             palette: palette_clone,
                             focused_session_id: None,
                         }

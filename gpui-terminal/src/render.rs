@@ -85,6 +85,10 @@ pub struct BatchedTextRun {
 
     pub text: String,
 
+    /// Number of `char`s in `text`, tracked while batching so the paint loop
+    /// does not recount it (an O(n) scan) for every run of every frame.
+    pub char_count: usize,
+
     pub cell_count: usize,
 
     pub start_col: usize,
@@ -107,7 +111,7 @@ pub struct BatchedTextRun {
     pub wavy_underline: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BackgroundRect {
 
     pub start_col: usize,
@@ -502,14 +506,18 @@ impl TerminalRenderer {
                     bg_rect.end_col = col + 1;
                 } else {
 
-                    backgrounds.push(bg_rect.clone());
-                    current_bg = Some(BackgroundRect::new(col, col + 1, row, bg_color));
+                    let finished = std::mem::replace(
+                        bg_rect,
+                        BackgroundRect::new(col, col + 1, row, bg_color),
+                    );
+                    backgrounds.push(finished);
                 }
             } else {
 
                 current_bg = Some(BackgroundRect::new(col, col + 1, row, bg_color));
             }
 
+            let cell_char_count = cell_text.chars().count();
             if let Some(ref mut run) = current_run {
                 if run.fg_color == fg_color
                     && run.bg_color == bg_color
@@ -521,28 +529,34 @@ impl TerminalRenderer {
                 {
 
                     run.text.push_str(&cell_text);
+                    run.char_count += cell_char_count;
                     run.cell_count += cell_width_units;
                 } else {
 
-                    text_runs.push(run.clone());
-                    current_run = Some(BatchedTextRun {
-                        text: cell_text,
-                        cell_count: cell_width_units,
-                        start_col: col,
-                        row,
-                        fg_color,
-                        bg_color,
-                        bold,
-                        italic,
-                        underline,
-                        strikethrough,
-                        wavy_underline: false,
-                    });
+                    let finished = std::mem::replace(
+                        run,
+                        BatchedTextRun {
+                            text: cell_text,
+                            char_count: cell_char_count,
+                            cell_count: cell_width_units,
+                            start_col: col,
+                            row,
+                            fg_color,
+                            bg_color,
+                            bold,
+                            italic,
+                            underline,
+                            strikethrough,
+                            wavy_underline: false,
+                        },
+                    );
+                    text_runs.push(finished);
                 }
             } else {
 
                 current_run = Some(BatchedTextRun {
                     text: cell_text,
+                    char_count: cell_char_count,
                     cell_count: cell_width_units,
                     start_col: col,
                     row,
@@ -687,17 +701,37 @@ impl TerminalRenderer {
             color,
         };
 
-        let mut row_backgrounds: Vec<BackgroundRect> = Vec::new();
-        let mut batched_text_runs: Vec<BatchedTextRun> = Vec::new();
-        let mut block_rects: Vec<BlockElementRect> = Vec::new();
+        // Pre-sized: these are rebuilt every frame, so growing them from zero
+        // would reallocate several times per repaint on every terminal.
+        let mut row_backgrounds: Vec<BackgroundRect> = Vec::with_capacity(num_lines * 2);
+        let mut batched_text_runs: Vec<BatchedTextRun> = Vec::with_capacity(num_lines * 2);
+        let mut block_rects: Vec<BlockElementRect> = Vec::with_capacity(num_lines);
         let mut selection_rects: Vec<BlockElementRect> = Vec::new();
         let mut match_rects: Vec<BlockElementRect> = Vec::new();
         let mut decoration_rects: Vec<BlockElementRect> = Vec::new();
+        // Scratch buffer holding the search matches that touch the current
+        // row (see below); reused across rows instead of reallocated.
+        let mut row_matches: Vec<&Match> = Vec::new();
 
         let underline_thickness = ((f32::from(self.font_size) * 0.07).round()).max(1.0);
 
         for line_idx in 0..num_lines {
             let buffer_line = (line_idx as i32) - (display_offset as i32);
+
+            // Narrow the search matches to the ones touching this row, once
+            // per row. The per-cell test below then scans a handful of matches
+            // instead of all of them (up to 5,000 across the scrollback) for
+            // every cell — identical results, since a match can only contain
+            // cells on rows between its start and end lines.
+            row_matches.clear();
+            if !ctx.search_matches.is_empty() {
+                row_matches.extend(
+                    ctx.search_matches
+                        .iter()
+                        .filter(|m| m.start().line.0 <= buffer_line && buffer_line <= m.end().line.0),
+                );
+            }
+
             let mut current_bg: Option<BackgroundRect> = None;
             let mut current_run: Option<BatchedTextRun> = None;
 
@@ -752,14 +786,10 @@ impl TerminalRenderer {
                     ));
                 });
 
-                let match_state = if ctx.search_matches.is_empty() {
-                    None
-                } else {
-                    ctx.search_matches
-                        .iter()
-                        .find(|m| m.contains(&point))
-                        .map(|m| ctx.active_match.map(|active| active == m).unwrap_or(false))
-                };
+                let match_state = row_matches
+                    .iter()
+                    .find(|m| m.contains(&point))
+                    .map(|m| ctx.active_match.is_some_and(|active| active == *m));
                 match match_state {
                     Some(is_active) => {
                         let extend = match match_run {
@@ -823,9 +853,11 @@ impl TerminalRenderer {
                         if bg.color == bg_color && bg.end_col == col_idx {
                             bg.end_col = col_idx + 1;
                         } else {
-                            row_backgrounds.push(bg.clone());
-                            current_bg =
-                                Some(BackgroundRect::new(col_idx, col_idx + 1, line_idx, bg_color));
+                            let finished = std::mem::replace(
+                                bg,
+                                BackgroundRect::new(col_idx, col_idx + 1, line_idx, bg_color),
+                            );
+                            row_backgrounds.push(finished);
                         }
                     } else {
                         current_bg =
@@ -961,12 +993,6 @@ impl TerminalRenderer {
                     continue;
                 }
 
-                let mut cell_text = ch.to_string();
-                if let Some(zerowidth) = cell.zerowidth() {
-                    for &zc in zerowidth {
-                        cell_text.push(zc);
-                    }
-                }
                 let is_wide = cell.flags.contains(Flags::WIDE_CHAR);
                 let has_zerowidth = cell.zerowidth().is_some();
 
@@ -974,8 +1000,22 @@ impl TerminalRenderer {
                     if let Some(run) = current_run.take() {
                         batched_text_runs.push(run);
                     }
+                    // Wide and zero-width-joiner cells are never merged, so
+                    // their one-off String is only built on this rare path —
+                    // the common single-char path below pushes `ch` directly
+                    // into the running buffer instead of allocating per cell.
+                    let mut cell_text = String::with_capacity(ch.len_utf8() + 8);
+                    cell_text.push(ch);
+                    let mut char_count = 1;
+                    if let Some(zerowidth) = cell.zerowidth() {
+                        for &zc in zerowidth {
+                            cell_text.push(zc);
+                            char_count += 1;
+                        }
+                    }
                     batched_text_runs.push(BatchedTextRun {
                         text: cell_text,
+                        char_count,
                         cell_count: cell_span,
                         start_col: col_idx,
                         row: line_idx,
@@ -1002,15 +1042,21 @@ impl TerminalRenderer {
 
                 if mergeable {
                     if let Some(ref mut run) = current_run {
-                        run.text.push_str(&cell_text);
+                        run.text.push(ch);
+                        run.char_count += 1;
                         run.cell_count += cell_span;
                     }
                 } else {
                     if let Some(run) = current_run.take() {
                         batched_text_runs.push(run);
                     }
+                    // Wide chars took the branch above, so this cell is exactly
+                    // one char in one column.
+                    let mut text = String::with_capacity(16);
+                    text.push(ch);
                     current_run = Some(BatchedTextRun {
-                        text: cell_text,
+                        text,
+                        char_count: 1,
                         cell_count: cell_span,
                         start_col: col_idx,
                         row: line_idx,
@@ -1150,7 +1196,7 @@ impl TerminalRenderer {
                 },
             };
 
-            let force_width = if run.cell_count > 1 || run.text.chars().count() != run.cell_count {
+            let force_width = if run.cell_count > 1 || run.char_count != run.cell_count {
                 None
             } else {
                 Some(self.cell_width)

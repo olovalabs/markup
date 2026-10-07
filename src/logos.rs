@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+#[cfg(debug_assertions)]
 use std::path::Path;
 use std::sync::LazyLock;
 use gpui::SharedString;
@@ -41,13 +42,11 @@ impl LogoRegistry {
             }
         }
 
-        // 2. Scan disk directory (assets/logos) if present, picking up newly added files
-        let disk_dirs = [
-            Path::new("assets/logos"),
-            Path::new("/home/nazmul/Desktop/markup/assets/logos"),
-        ];
-        for dir in disk_dirs {
-            if let Ok(entries) = std::fs::read_dir(dir) {
+        // 2. Debug-only: scan the working-tree directory so newly added files
+        // show up without a rebuild. Release builds use the embedded assets.
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(entries) = std::fs::read_dir(Path::new("assets/logos")) {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if p.is_file() {
@@ -78,21 +77,35 @@ impl LogoRegistry {
     }
 
     /// Finds a logo asset path for a command or agent name.
+    ///
+    /// The hot path uses [`Self::find_logo_normalized`] directly; this
+    /// normalizing wrapper is exercised by the tests below.
+    #[allow(dead_code)]
     pub fn find_logo(&self, name: &str) -> Option<&str> {
         let key = normalize_cmd_name(name);
         if key.is_empty() {
             return None;
         }
+        self.find_logo_normalized(&key)
+    }
+
+    /// Like [`Self::find_logo`], but takes an already-normalized key
+    /// (lowercase basename, see [`normalize_cmd_name`]) so hot paths that
+    /// normalized the name themselves do not allocate per probe.
+    pub fn find_logo_normalized(&self, key: &str) -> Option<&str> {
+        if key.is_empty() {
+            return None;
+        }
 
         // 1. Exact match on stem (e.g. "claude", "openclaw", "omp", "freebuff", "agy", "herdr", "cursor")
-        if let Some(path) = self.stems.get(&key) {
+        if let Some(path) = self.stems.get(key) {
             return Some(path.as_str());
         }
 
         // 2. Match via agent detection manifests / aliases
         // (e.g. "antigravity" -> "agy", "claude-code" -> "claude", "cursor-agent" -> "cursor",
         //       "kilo-code" -> "kilo", "grok-build" -> "grok", "open-code" -> "opencode")
-        if let Some(agent_id) = agent_rules::identify(&key) {
+        if let Some(agent_id) = agent_rules::identify_normalized(key) {
             if let Some(path) = self.stems.get(agent_id) {
                 return Some(path.as_str());
             }
@@ -104,7 +117,7 @@ impl LogoRegistry {
                 if let Some(path) = self.stems.get(stripped) {
                     return Some(path.as_str());
                 }
-                if let Some(agent_id) = agent_rules::identify(stripped) {
+                if let Some(agent_id) = agent_rules::identify_normalized(stripped) {
                     if let Some(path) = self.stems.get(agent_id) {
                         return Some(path.as_str());
                     }
@@ -137,6 +150,16 @@ fn normalize_cmd_name(name: &str) -> String {
     without_ext.to_ascii_lowercase()
 }
 
+/// Shells, wrappers, and interpreters that never identify a session on their own.
+/// Compared against normalized (lowercase, extension-stripped) names.
+const GENERIC_NAMES: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "sudo", "su", "env", "login", "node", "python", "python3",
+];
+
+fn is_generic_name(normalized: &str) -> bool {
+    GENERIC_NAMES.contains(&normalized)
+}
+
 /// Resolves the logo asset path for a session given its current foreground processes,
 /// title, and status.
 pub fn resolve_session_logo(
@@ -147,21 +170,23 @@ pub fn resolve_session_logo(
 ) -> SharedString {
     let reg = registry();
 
-    // 1. Check foreground process names
-    const GENERIC_NAMES: &[&str] = &[
-        "sh", "bash", "zsh", "fish", "sudo", "su", "env", "login", "node", "python", "python3",
-    ];
+    // Each foreground name is normalized once; the generic-shell check and the
+    // logo lookups then share that form instead of allocating per probe.
+    let mut lowered: Vec<String> = Vec::with_capacity(foreground.len());
+    for name in foreground {
+        lowered.push(normalize_cmd_name(name));
+    }
 
     // Priority 1: non-generic process candidates
-    for name in foreground.iter().filter(|n| !GENERIC_NAMES.contains(&n.to_ascii_lowercase().as_str())) {
-        if let Some(path) = reg.find_logo(name) {
+    for key in lowered.iter().filter(|key| !is_generic_name(key)) {
+        if let Some(path) = reg.find_logo_normalized(key) {
             return SharedString::from(path.to_string());
         }
     }
 
     // Priority 2: all foreground process candidates
-    for name in foreground {
-        if let Some(path) = reg.find_logo(name) {
+    for key in &lowered {
+        if let Some(path) = reg.find_logo_normalized(key) {
             return SharedString::from(path.to_string());
         }
     }
@@ -171,10 +196,15 @@ pub fn resolve_session_logo(
         let clean = title.trim();
         // Check tokens in title
         for word in clean.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_') {
-            if !word.is_empty() && !GENERIC_NAMES.contains(&word.to_ascii_lowercase().as_str()) {
-                if let Some(path) = reg.find_logo(word) {
-                    return SharedString::from(path.to_string());
-                }
+            if word.is_empty() {
+                continue;
+            }
+            let key = normalize_cmd_name(word);
+            if key.is_empty() || is_generic_name(&key) {
+                continue;
+            }
+            if let Some(path) = reg.find_logo_normalized(&key) {
+                return SharedString::from(path.to_string());
             }
         }
     }

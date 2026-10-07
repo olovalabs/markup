@@ -184,7 +184,20 @@ pub struct TerminalView {
     /// Events a background drain (`drain_background_events`) could not fully
     /// process and is saving for the next foreground render.
     deferred_events: Vec<TerminalEvent>,
+    /// Scratch buffer reused by `process_events` / `drain_background_events`
+    /// so event draining does not allocate a fresh `Vec` per call.
+    event_scratch: Vec<TerminalEvent>,
+    /// Last time search matches were recomputed; rescans are throttled while
+    /// output is streaming (see `SEARCH_REFRESH_MIN_INTERVAL`).
+    search_last_refresh: Option<std::time::Instant>,
+    /// A throttled rescan is owed once the throttle interval has elapsed.
+    search_refresh_pending: bool,
 }
+
+/// Minimum gap between full-scrollback search rescans while output streams in.
+/// Without this, every PTY batch re-scans up to 10k scrollback lines on the UI
+/// thread; with it, matches lag at most this long behind a burst.
+const SEARCH_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(150);
 
 impl TerminalView {
     pub fn new<W, R>(
@@ -240,7 +253,10 @@ impl TerminalView {
             Arc::clone(&palette_handle),
         ));
 
-        let (bytes_tx, bytes_rx) = flume::unbounded::<Vec<u8>>();
+        // Bounded so a firehose process (`cat` a huge file) applies backpressure
+        // to the reader thread — and through it to the PTY — instead of
+        // queueing an unbounded number of byte chunks in memory.
+        let (bytes_tx, bytes_rx) = flume::bounded::<Vec<u8>>(256);
 
         thread::spawn(move || {
             Self::read_stdout_blocking(stdout_reader, bytes_tx);
@@ -253,13 +269,28 @@ impl TerminalView {
                         // Coalesce everything that already arrived so a firehose
                         // of output costs one parse + one repaint, not hundreds.
                         while let Ok(more) = bytes_rx.try_recv() {
+                            bytes.reserve(more.len());
                             bytes.extend(more);
                         }
 
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
                             view.state.process_bytes(&bytes);
                             if view.search.is_active() {
-                                view.search.refresh(&view.state);
+                                // A full-scrollback rescan per batch would stall
+                                // the UI thread under streaming output; throttle
+                                // it and let `render` run the owed trailing pass.
+                                let now = std::time::Instant::now();
+                                let due = view
+                                    .search_last_refresh
+                                    .map(|t| now - t >= SEARCH_REFRESH_MIN_INTERVAL)
+                                    .unwrap_or(true);
+                                if due {
+                                    view.search.refresh(&view.state);
+                                    view.search_last_refresh = Some(now);
+                                    view.search_refresh_pending = false;
+                                } else {
+                                    view.search_refresh_pending = true;
+                                }
                             }
                             cx.notify();
                         });
@@ -315,6 +346,9 @@ impl TerminalView {
             exit_status: None,
             exited: false,
             deferred_events: Vec::new(),
+            event_scratch: Vec::new(),
+            search_last_refresh: None,
+            search_refresh_pending: false,
         }
     }
 
@@ -425,9 +459,10 @@ impl TerminalView {
         if bytes.is_empty() {
             return;
         }
+        // No `flush()`: the PTY writer is unbuffered, so flushing would only be
+        // a wasted syscall per keystroke, paste chunk, and mouse report.
         let mut writer = self.stdin_writer.lock();
         let _ = writer.write_all(bytes);
-        let _ = writer.flush();
     }
 
     /// Send text to the shell as if the user had typed it.
@@ -1258,11 +1293,22 @@ impl TerminalView {
         self.blink_task = Some(cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor().timer(interval).await;
+                // The cursor may have gone steady (or the view unfocused)
+                // since the task started; stop then instead of repainting
+                // twice a second for nothing. `restart_blink` relaunches us
+                // when blinking is wanted again.
+                let mut keep_going = false;
                 let alive = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
-                    view.cursor_visible = !view.cursor_visible;
-                    cx.notify();
+                    if view.was_focused && view.config.cursor_blink && view.state.cursor_blinking() {
+                        view.cursor_visible = !view.cursor_visible;
+                        cx.notify();
+                        keep_going = true;
+                    } else {
+                        view.cursor_visible = true;
+                        view.blink_task = None;
+                    }
                 });
-                if alive.is_err() {
+                if alive.is_err() || !keep_going {
                     break;
                 }
             }
@@ -1284,8 +1330,10 @@ impl TerminalView {
 
     fn process_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Drain into a buffer first so the borrow on `self.event_rx` ends before
-        // we start calling `&mut self` methods.
-        let mut events = Vec::new();
+        // we start calling `&mut self` methods. The buffer is a reused scratch
+        // field (its capacity survives across frames) rather than a fresh Vec.
+        let mut events = std::mem::take(&mut self.event_scratch);
+        events.clear();
         while let Ok(event) = self.event_rx.try_recv() {
             events.push(event);
         }
@@ -1293,7 +1341,9 @@ impl TerminalView {
             events.extend(self.deferred_events.drain(..));
         }
 
-        for event in events {
+        // `drain` (not `into_iter`): the events are moved out one by one while
+        // the buffer keeps its allocation for the trip back to the scratch field.
+        for event in events.drain(..) {
             match event {
                 TerminalEvent::Wakeup | TerminalEvent::MouseCursorDirty => {}
 
@@ -1305,11 +1355,11 @@ impl TerminalView {
                 }
 
                 TerminalEvent::Title(title) => {
-                    self.title = Some(title.clone());
                     if let Some(callback) = self.title_callback.take() {
                         callback(window, cx, &title);
                         self.title_callback = Some(callback);
                     }
+                    self.title = Some(title);
                 }
 
                 TerminalEvent::ResetTitle => {
@@ -1321,11 +1371,11 @@ impl TerminalView {
                 }
 
                 TerminalEvent::ClipboardStore(_, text) => {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                     if let Some(callback) = self.clipboard_store_callback.take() {
                         callback(window, cx, &text);
                         self.clipboard_store_callback = Some(callback);
                     }
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
 
                 TerminalEvent::ClipboardLoad(_, formatter) => {
@@ -1361,6 +1411,9 @@ impl TerminalView {
                 }
             }
         }
+
+        // Hand the buffer back so its capacity is reused next frame.
+        self.event_scratch = events;
     }
 
     /// Consume pending PTY events for a *background* terminal.
@@ -1373,12 +1426,15 @@ impl TerminalView {
     /// callback, clipboard interactions) are buffered in `deferred_events` and
     /// replayed by the next foreground `process_events`.
     pub fn drain_background_events(&mut self, cx: &mut Context<Self>) {
-        let mut events = Vec::new();
+        let mut events = std::mem::take(&mut self.event_scratch);
+        events.clear();
         while let Ok(event) = self.event_rx.try_recv() {
             events.push(event);
         }
 
-        for event in events {
+        // `drain` (not `into_iter`): the events are moved out one by one while
+        // the buffer keeps its allocation for the trip back to the scratch field.
+        for event in events.drain(..) {
             match event {
                 TerminalEvent::Title(title) => {
                     self.title = Some(title);
@@ -1410,6 +1466,8 @@ impl TerminalView {
                 | TerminalEvent::ClipboardLoad(..) => {}
             }
         }
+
+        self.event_scratch = events;
     }
 
     // -----------------------------------------------------------------------
@@ -1441,6 +1499,12 @@ impl TerminalView {
     /// Read bottom N lines of visible terminal text
     pub fn bottom_lines(&self, n: usize) -> Vec<String> {
         self.state.bottom_lines(n)
+    }
+
+    /// Like [`Self::bottom_lines`], but scrapes into a caller-provided buffer
+    /// so repeated polling reuses the allocation.
+    pub fn bottom_lines_into(&self, n: usize, out: &mut Vec<String>) {
+        self.state.bottom_lines_into(n, out)
     }
     /// `true` once the child process is gone.
     pub fn has_exited(&self) -> bool {
@@ -1505,6 +1569,22 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_events(window, cx);
+
+        // Trailing pass for a search rescan the reader task throttled: once the
+        // throttle interval has elapsed, refresh so matches never lag a burst
+        // by more than `SEARCH_REFRESH_MIN_INTERVAL`.
+        if self.search_refresh_pending && self.search.is_active() {
+            let now = std::time::Instant::now();
+            let due = self
+                .search_last_refresh
+                .map(|t| now - t >= SEARCH_REFRESH_MIN_INTERVAL)
+                .unwrap_or(true);
+            if due {
+                self.search.refresh(&self.state);
+                self.search_last_refresh = Some(now);
+                self.search_refresh_pending = false;
+            }
+        }
 
         if !self.cell_metrics_valid {
             self.renderer.measure_cell(window);
