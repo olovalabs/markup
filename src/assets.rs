@@ -6,6 +6,11 @@ pub const MONO_FONT: &str = "Lilex";
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
+// Unreferenced by the app (verified: no `file_icons/`, `logo/`, `ezicode`,
+// or `olova` path is ever loaded); excluding them keeps ~3 MB out of the
+// binary and out of every asset enumeration.
+#[exclude = "file_icons/*"]
+#[exclude = "logo/*"]
 pub struct AppAssets;
 
 pub struct CombinedAssets;
@@ -22,16 +27,20 @@ impl gpui::AssetSource for CombinedAssets {
         if let Some(file) = AppAssets::get(path) {
             return Ok(Some(file.data));
         }
-        // Fallback to filesystem assets/ in case new files were placed on disk
-        let disk_paths = [
-            std::path::Path::new("assets").join(clean),
-            std::path::Path::new("/home/nazmul/Desktop/markup/assets").join(clean),
-            std::path::Path::new(clean).to_path_buf(),
-            std::path::Path::new(path).to_path_buf(),
-        ];
-        for disk_path in disk_paths {
-            if let Ok(bytes) = std::fs::read(&disk_path) {
-                return Ok(Some(std::borrow::Cow::Owned(bytes)));
+        // Debug-only fallback to the working tree, so newly placed files work
+        // without a rebuild. Release builds go straight to the component
+        // assets instead of probing the filesystem on every miss.
+        #[cfg(debug_assertions)]
+        {
+            let disk_paths = [
+                std::path::Path::new("assets").join(clean),
+                std::path::Path::new(clean).to_path_buf(),
+                std::path::Path::new(path).to_path_buf(),
+            ];
+            for disk_path in disk_paths {
+                if let Ok(bytes) = std::fs::read(&disk_path) {
+                    return Ok(Some(std::borrow::Cow::Owned(bytes)));
+                }
             }
         }
         gpui_component_assets::Assets.load(path)

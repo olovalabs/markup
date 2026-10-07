@@ -30,9 +30,25 @@
 //! [`foreground_process_names`] returns nothing and detection rests on the
 //! screen and OSC rules alone.
 
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::path::Path;
+#[cfg(unix)]
+use std::sync::LazyLock;
 
 use crate::agent_rules::{self, DetectionInput, RuleState};
+
+/// Foreground-group cache: shell pid -> (tpgid, process names).
+///
+/// The poller runs every 500 ms per session, but the foreground group only
+/// changes when a command starts or ends. The `stat` read still happens each
+/// tick (one small read, and it is the change detector), while the heavier
+/// `comm` / `cmdline` / `children` reads are skipped while the group is
+/// unchanged. Entries are keyed by shell pid; pids are few (one per session)
+/// and a changed group simply overwrites its entry.
+#[cfg(unix)]
+static FG_CACHE: LazyLock<parking_lot::Mutex<HashMap<u32, (i64, Vec<String>)>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// The status a terminal session can report. Exactly one is active at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +166,16 @@ pub fn foreground_process_names(pid: Option<u32>) -> Vec<String> {
         return Vec::new();
     }
 
+    // Fast path: same foreground group as last tick means the same names —
+    // skip the `comm` / `cmdline` / `children` reads. (A wrapper that swaps
+    // its child without changing groups is re-read on the next command; the
+    // worst case is a briefly stale pack selection, never a stuck badge.)
+    if let Some((cached_tpgid, names)) = FG_CACHE.lock().get(&pid) {
+        if *cached_tpgid == tpgid {
+            return names.clone();
+        }
+    }
+
     let dir = Path::new("/proc").join(tpgid.to_string());
     let mut names = Vec::with_capacity(3);
 
@@ -207,6 +233,7 @@ pub fn foreground_process_names(pid: Option<u32>) -> Vec<String> {
         }
     }
 
+    FG_CACHE.lock().insert(pid, (tpgid, names.clone()));
     names
 }
 
@@ -275,26 +302,64 @@ pub fn evaluate(input: &StatusInput<'_>, prev: SessionStatus, focused: bool) -> 
     }
 }
 
+/// Like [`evaluate`], but also returns the agent rule match behind the verdict
+/// (if any), so callers that log the explanation do not evaluate twice.
+pub fn evaluate_with_match(
+    input: &StatusInput<'_>,
+    prev: SessionStatus,
+    focused: bool,
+) -> (SessionStatus, Option<agent_rules::RuleMatch>) {
+    // Sticky states are cleared on focus, otherwise they persist.
+    if matches!(prev, SessionStatus::Done | SessionStatus::Error) {
+        return (if focused { SessionStatus::Idle } else { prev }, None);
+    }
+
+    let (detected, matched) = detect_full(input, prev);
+
+    // Priority resolution with focus folded in as the lowest rung.
+    let focus_status = if focused { SessionStatus::Active } else { SessionStatus::Idle };
+    let status = if detected.rank() > focus_status.rank() {
+        detected
+    } else {
+        focus_status
+    };
+    (status, matched)
+}
+
 /// Pure detection (no stickiness): agent packs, then the plain-shell fallback.
 fn detect(input: &StatusInput<'_>, prev: SessionStatus) -> SessionStatus {
-    let screen = input.lines.join("\n");
+    detect_full(input, prev).0
+}
 
+/// Like [`detect`], but also returns the rule match that produced the verdict
+/// (when an agent pack matched), so debug logging does not have to evaluate
+/// the pack a second time to explain the badge.
+fn detect_full(
+    input: &StatusInput<'_>,
+    prev: SessionStatus,
+) -> (SessionStatus, Option<agent_rules::RuleMatch>) {
     let Some(pack) = agent_rules::embedded().pack_for(input.foreground) else {
         // No agent CLI is driving this terminal, so the only signals available
-        // are generic ones.
-        if FallbackRules::error(input) {
-            return SessionStatus::Error;
+        // are generic ones. The fallback works on the recent lines only and
+        // lowercases them once, shared by both rules.
+        let recent = FallbackRules::recent_lower(input, FallbackRules::WINDOW);
+        if FallbackRules::error_lower(&recent) {
+            return (SessionStatus::Error, None);
         }
-        if FallbackRules::plain_shell_blocked(input) {
-            return SessionStatus::Blocked;
+        if FallbackRules::blocked_lower(&recent) {
+            return (SessionStatus::Blocked, None);
         }
-        return if input.foreground.is_empty() {
-            SessionStatus::Idle
-        } else {
-            SessionStatus::Working
-        };
+        return (
+            if input.foreground.is_empty() {
+                SessionStatus::Idle
+            } else {
+                SessionStatus::Working
+            },
+            None,
+        );
     };
 
+    let screen = input.lines.join("\n");
     let matched = agent_rules::evaluate(
         pack,
         DetectionInput {
@@ -307,7 +372,7 @@ fn detect(input: &StatusInput<'_>, prev: SessionStatus) -> SessionStatus {
         },
     );
 
-    match matched {
+    let status = match &matched {
         // A known agent with no matching rule is at rest, per upstream's
         // known-agent fallback.
         None => SessionStatus::Idle,
@@ -322,7 +387,8 @@ fn detect(input: &StatusInput<'_>, prev: SessionStatus) -> SessionStatus {
             // running, so report that rather than claiming the pane is idle.
             RuleState::Unknown => SessionStatus::Working,
         },
-    }
+    };
+    (status, matched)
 }
 
 /// Generic rules for terminals with no agent pack: a plain shell.
@@ -332,13 +398,16 @@ impl FallbackRules {
     /// Lines considered "recent" for the fallback rules.
     const WINDOW: usize = 12;
 
-    /// The newest `n` non-empty lines of the visible screen.
-    fn recent<'a>(input: &'a StatusInput<'a>, n: usize) -> Vec<&'a str> {
-        let mut lines: Vec<&str> = input
+    /// The newest `n` non-empty lines of the visible screen, trimmed and
+    /// lowercased once so both fallback rules share the normalized form
+    /// instead of each joining and lowercasing separately.
+    fn recent_lower(input: &StatusInput<'_>, n: usize) -> Vec<String> {
+        let mut lines: Vec<String> = input
             .lines
             .iter()
             .map(String::as_str)
             .filter(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_lowercase())
             .collect();
         let excess = lines.len().saturating_sub(n);
         lines.split_off(excess)
@@ -348,30 +417,35 @@ impl FallbackRules {
     ///
     /// Deliberately narrow: agents have their own packs, and vague wording here
     /// only produces false positives on ordinary output.
-    fn plain_shell_blocked(input: &StatusInput) -> bool {
-        let text = Self::recent(input, Self::WINDOW).join("\n").to_lowercase();
-        text.contains("[y/n]")
-            || text.contains("(y/n)")
-            || text.contains("yes (y)")
-            || text.contains("password:")
+    ///
+    /// Takes [`Self::recent_lower`] output. Per-line search is equivalent to
+    /// the old joined-text search here: none of the needles contains a newline,
+    /// so no match can span the join boundary.
+    fn blocked_lower(recent: &[String]) -> bool {
+        recent.iter().any(|line| {
+            line.contains("[y/n]")
+                || line.contains("(y/n)")
+                || line.contains("yes (y)")
+                || line.contains("password:")
+        })
     }
 
     /// Strong failure markers on the most recent output lines.
     ///
     /// Scans a small window rather than just the last line, because a shell
     /// redraws its prompt *below* the failed command's output.
-    fn error(input: &StatusInput) -> bool {
-        Self::recent(input, 4).iter().any(|line| {
-            let l = line.trim().to_lowercase();
-            l.contains("command not found")
-                || l.contains("permission denied")
-                || l.contains("panicked at")
-                || l.contains("segmentation fault")
-                || l.contains("traceback (most recent call last)")
-                || l.starts_with("error:")
-                || l.starts_with("error ")
-                || l.starts_with("fatal:")
-                || l.starts_with("panic:")
+    fn error_lower(recent: &[String]) -> bool {
+        let start = recent.len().saturating_sub(4);
+        recent[start..].iter().any(|line| {
+            line.contains("command not found")
+                || line.contains("permission denied")
+                || line.contains("panicked at")
+                || line.contains("segmentation fault")
+                || line.contains("traceback (most recent call last)")
+                || line.starts_with("error:")
+                || line.starts_with("error ")
+                || line.starts_with("fatal:")
+                || line.starts_with("panic:")
         })
     }
 }

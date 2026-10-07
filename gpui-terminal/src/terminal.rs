@@ -145,6 +145,11 @@ impl TerminalState {
     /// across two PTY reads is ignored rather than answered piecemeal (agent
     /// CLIs send their capability probes in a single write).
     fn answer_xtgettcap(&mut self, bytes: &[u8]) {
+        // Fast path: every query starts with ESC, which plain output never
+        // contains — one short scan instead of two substring searches per read.
+        if !bytes.contains(&0x1b) {
+            return;
+        }
         const DCS_PLUS_Q: &[u8] = b"\x1bP+q";
         const ST: &[u8] = b"\x1b\\";
 
@@ -418,18 +423,32 @@ impl TerminalState {
 
     /// Retrieve the bottom N lines from the visible viewport.
     pub fn bottom_lines(&self, n: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        self.bottom_lines_into(n, &mut lines);
+        lines
+    }
+
+    /// Like [`Self::bottom_lines`], but reuses the caller's buffer across
+    /// ticks so a status poller scraping every session at 2 Hz does not
+    /// reallocate the outer `Vec` each time. Each line is still freshly
+    /// extracted (and trimmed in place: one allocation per line, not two).
+    pub fn bottom_lines_into(&self, n: usize, out: &mut Vec<String>) {
         let term = self.term.lock();
         let screen_lines = self.rows;
         let last_col = term.last_column();
         let count = n.min(screen_lines);
         let start_row = screen_lines.saturating_sub(count);
-        let mut lines = Vec::with_capacity(count);
+        out.clear();
+        out.reserve(count);
         for row in start_row..screen_lines {
             let line = Line(row as i32);
             let start = Point::new(line, Column(0));
             let end = Point::new(line, last_col);
-            lines.push(term.bounds_to_string(start, end).trim_end().to_string());
-        }                lines
+            let mut text = term.bounds_to_string(start, end);
+            let trimmed_len = text.trim_end().len();
+            text.truncate(trimmed_len);
+            out.push(text);
+        }
     }
 }
 
