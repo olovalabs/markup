@@ -1492,6 +1492,18 @@ impl TerminalView {
     }
 
     /// Title reported by the application through `OSC 0 / 2`.
+    /// The application's latest `OSC 9;4` progress report, e.g. `4;1;-1`
+    /// (working) or `4;0` (cleared). `None` when the program does not use the
+    /// protocol or the last report has gone stale (see
+    /// [`TerminalState::progress`]).
+    ///
+    /// Agent CLIs report their turn state here; the rule packs read it through
+    /// their `osc_progress` region, which is the most accurate "this agent is
+    /// busy right now" signal a terminal can get.
+    pub fn progress(&self) -> Option<&str> {
+        self.state.progress()
+    }
+
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }

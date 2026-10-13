@@ -1,16 +1,28 @@
-use std::collections::HashMap;
+//! T3 Code — a GPUI terminal workspace for AI agent CLIs.
+//!
+//! The window is two panes: the workspace sidebar (projects → terminals, each
+//! with a live status badge) and the active terminal. The sidebar is the part
+//! that has to answer "which of my agents needs me?" at a glance, so the
+//! status detection in `src/status.rs` feeds it a single, exact verdict per
+//! terminal and everything visual here is derived from that verdict.
+
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    px, size, App, AppContext, Application, Bounds, Context, CursorStyle, Edges, Entity,
-    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
-    SharedString, Styled, Window, WindowBounds, WindowDecorations,
-    WindowOptions, div, rgba, svg,
+    div, px, rgba, size, svg, AnyElement, App, AppContext, Application, Bounds, Context,
+    CursorStyle, Div, Edges, ElementId, Entity, InteractiveElement as _, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Stateful, Styled, Window,
+    WindowBounds, WindowDecorations, WindowOptions,
 };
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement as _;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Root, TitleBar};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use parking_lot::Mutex;
@@ -23,7 +35,37 @@ mod logos;
 mod status;
 
 use assets::{load_embedded_fonts, sync_component_fonts, CombinedAssets, MONO_FONT};
-use status::{SessionStatus, StatusInput};
+use status::{ExitInfo, SessionStatus, StatusInput};
+
+/// Every colour the chrome uses, in one place: the palette is GitHub Dark, and
+/// keeping the hex values out of the layout code makes the sidebar reviewable.
+mod ui {
+    /// Window background, behind everything.
+    pub const BG_WINDOW: u32 = 0x0f1115ff;
+    /// Sidebar background — a shade darker than the window, so the pane edge
+    /// reads as a real edge without a heavy border.
+    pub const BG_SIDEBAR: u32 = 0x090b0fff;
+    /// Terminal background.
+    pub const BG_TERMINAL: u32 = 0x010409ff;
+    /// Pane border.
+    pub const BORDER: u32 = 0x1e2229ff;
+    /// Divider inside a pane (header/footer rules).
+    pub const BORDER_SOFT: u32 = 0x16191fff;
+    /// Row background for the selected session.
+    pub const SELECTED: u32 = 0x1c2129ff;
+    /// Row background on hover.
+    pub const HOVER: u32 = 0x171c23ff;
+    /// Slightly stronger hover, for icon buttons.
+    pub const HOVER_STRONG: u32 = 0x21262dff;
+    /// Background of an active project header.
+    pub const SURFACE: u32 = 0x12161cff;
+    pub const TEXT_BRIGHT: u32 = 0xf0f6fcff;
+    pub const TEXT: u32 = 0xb9c1cbff;
+    pub const TEXT_MUTED: u32 = 0x8b949eff;
+    pub const TEXT_FAINT: u32 = 0x6e7681ff;
+    pub const TEXT_DIM: u32 = 0x545d68ff;
+    pub const ACCENT: u32 = 0x58a6ffff;
+}
 
 struct SharedWriter {
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
@@ -45,6 +87,16 @@ impl std::io::Write for SharedWriter {
         self.writer.lock().flush()
     }
 }
+
+/// Everything a spawn hands back to the session it belongs to.
+struct SpawnedTerminal {
+    view: Entity<TerminalView>,
+    pid: Option<u32>,
+    /// Filled in by the waiter thread when the shell really exits; the status
+    /// poller reads it to tell `exited` from `error` from `killed`.
+    exit: Arc<Mutex<Option<ExitInfo>>>,
+}
+
 pub struct Session {
     pub id: usize,
     pub title: SharedString,
@@ -54,31 +106,70 @@ pub struct Session {
     pub display_title: SharedString,
     pub terminal: Entity<TerminalView>,
     pub status: SessionStatus,
+    /// When `status` last changed, so the sidebar can say "working · 2m".
+    pub status_since: Instant,
+    /// The elapsed-time label that was last rendered. The poller keeps it in
+    /// sync with what the sidebar would draw, so a clock that is not on screen
+    /// never causes a repaint.
+    pub elapsed_label: SharedString,
+    /// Plain-language evidence for the current status, shown in its tooltip.
+    pub status_note: SharedString,
+    /// Real exit status of the shell, recorded by the waiter thread.
+    pub shell_exit: Arc<Mutex<Option<ExitInfo>>>,
     pub pid: Option<u32>,
     /// Reused scrape buffer: the poller reads the screen into this instead of
     /// allocating a fresh `Vec<String>` every 500 ms per session.
     pub screen_scratch: Vec<String>,
     /// (screen fingerprint, focused, exited, foreground fingerprint) from the
-    /// last poll tick. When it matches, nothing observable changed and the
-    /// whole rule-pack evaluation + logo resolution is skipped.
+    /// last poll tick. When it matches and the badge has no running timer, the
+    /// whole rule-pack evaluation is skipped.
     pub poll_cache: Option<(u64, bool, bool, u64)>,
     /// Screen fingerprint at the moment the user last looked at a finished or
-    /// failed terminal. While the screen still matches, the sticky Done/Error
-    /// badge stays acknowledged (Idle); any new output invalidates it and lets
-    /// a fresh Done/Error be raised.
+    /// failed terminal. While the screen still matches, the sticky badge stays
+    /// acknowledged (Idle); any new output invalidates it and lets a fresh
+    /// Done/Error/Killed be raised.
     pub ack_screen: Option<u64>,
     /// A recognized agent CLI was the foreground process on the previous tick.
     /// Its disappearance means the agent finished (Done), like herdr.
     pub agent_active: bool,
-    /// When the terminal first showed an unacknowledged Done, for the short
-    /// auto-clear timeout in the spec.
-    pub done_since: Option<std::time::Instant>,
+    /// Last time the screen, title, or progress report changed — the stall
+    /// watchdog's clock.
+    pub last_output_at: Instant,
+    /// Screen fingerprint from the previous tick, used to detect new output.
+    pub last_screen_fp: u64,
+    /// When the terminal first showed an unacknowledged Done.
+    pub done_since: Option<Instant>,
     /// Path of the AI agent / command logo shown in the sidebar.
     pub logo: SharedString,
 }
 
-/// How long an unacknowledged Done badge lingers before it falls back to Idle.
-const DONE_LINGER: std::time::Duration = std::time::Duration::from_secs(30);
+impl Session {
+    /// A freshly spawned session: idle, with no detection history yet.
+    fn new(id: usize, title: SharedString, spawned: SpawnedTerminal) -> Self {
+        let now = Instant::now();
+        Self {
+            id,
+            display_title: truncate_title(&title),
+            title,
+            terminal: spawned.view,
+            status: SessionStatus::Idle,
+            status_since: now,
+            elapsed_label: SharedString::from("now"),
+            status_note: SharedString::from("new terminal"),
+            shell_exit: spawned.exit,
+            pid: spawned.pid,
+            screen_scratch: Vec::new(),
+            poll_cache: None,
+            ack_screen: None,
+            agent_active: false,
+            last_output_at: now,
+            last_screen_fp: 0,
+            done_since: None,
+            logo: logos::default_logo(),
+        }
+    }
+}
+
 pub struct Project {
     pub id: usize,
     /// Shared (cheap to clone) because the render pass copies it every frame.
@@ -86,6 +177,24 @@ pub struct Project {
     pub path: PathBuf,
     pub sessions: Vec<Session>,
     pub active_session_idx: usize,
+}
+
+impl Project {
+    /// The loudest status in the project, for the project row's dot.
+    fn rollup(&self) -> Option<SessionStatus> {
+        self.sessions
+            .iter()
+            .map(|session| session.status)
+            .max_by_key(|status| status.rank())
+    }
+
+    /// How many of its terminals want the user (blocked, done, failed, stuck).
+    fn attention_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|session| session.status.needs_attention())
+            .count()
+    }
 }
 
 struct AppState {
@@ -98,6 +207,8 @@ struct AppState {
     /// Session that currently owns keyboard focus, tracked every render frame
     /// and consumed by the status poller (Active state, sticky-state clearing).
     focused_session_id: Option<usize>,
+    /// Ids of projects whose terminal lists are folded away.
+    collapsed_projects: HashSet<usize>,
 }
 
 impl AppState {
@@ -120,7 +231,7 @@ impl AppState {
         window_title_target: gpui::WeakEntity<Self>,
         session_id: usize,
         cx: &mut Context<Self>,
-    ) -> Result<(Entity<TerminalView>, Option<u32>)> {
+    ) -> Result<SpawnedTerminal> {
         let (shell_cmd, _) = detect_shell();
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -148,6 +259,29 @@ impl AppState {
             .spawn_command(cmd)
             .map_err(|e| anyhow::anyhow!("Spawn shell error: {e}"))?;
         let pid = child.process_id();
+
+        // The shell's *real* exit status is the only trustworthy
+        // done/failed/killed signal a terminal has, and only the process handle
+        // can report it. `wait` blocks, so it runs on its own thread and the
+        // result is published into a slot the poller reads.
+        let exit: Arc<Mutex<Option<ExitInfo>>> = Arc::new(Mutex::new(None));
+        {
+            let mut child = child;
+            let exit_slot = Arc::clone(&exit);
+            std::thread::spawn(move || {
+                if let Ok(status) = child.wait() {
+                    // portable-pty keeps the signal name inside its `Display`
+                    // form ("Terminated by SIGKILL", "Exited with code 1",
+                    // "Success"); the numeric code alone cannot distinguish a
+                    // signal death from an ordinary exit code.
+                    let text = status.to_string();
+                    let signal = text
+                        .strip_prefix("Terminated by ")
+                        .map(|signal| signal.trim().to_string());
+                    *exit_slot.lock() = Some(ExitInfo::new(status.exit_code() as i32, signal));
+                }
+            });
+        }
 
         let writer = pair.master.take_writer().map_err(|e| anyhow::anyhow!("{e}"))?;
         let reader = pair
@@ -204,9 +338,15 @@ impl AppState {
                     });
                 })
             // Exit status is intentionally not set here: the status poller
-            // derives Done/Error from the real exit code (see poll_sessions_status).
+            // derives exited/error/killed from the real exit code recorded by
+            // the waiter thread above.
         });
-        Ok((terminal, pid))
+
+        Ok(SpawnedTerminal {
+            view: terminal,
+            pid,
+            exit,
+        })
     }
 
     fn update_session_title(&mut self, session_id: usize, title: &str, cx: &mut Context<Self>) {
@@ -240,17 +380,35 @@ impl AppState {
         cx.notify();
     }
 
-    /// Periodic detection tick, herdr-style: screen scrape + OSC title +
-    /// foreground process tree, with sticky Done/Error and focus resolution.
+    /// Rebuilds the id → (project, session) index. Cheap (a handful of
+    /// entries) and far less error-prone than patching it in place when
+    /// sessions and projects are removed.
+    fn reindex_sessions(&mut self) {
+        self.session_index.clear();
+        for (p_idx, project) in self.projects.iter().enumerate() {
+            for (s_idx, session) in project.sessions.iter().enumerate() {
+                self.session_index.insert(session.id, (p_idx, s_idx));
+            }
+        }
+    }
+
+    /// Periodic detection tick, herdr-style: screen scrape + OSC title + OSC
+    /// progress + foreground process tree, with sticky terminal states, a stall
+    /// watchdog and focus resolution.
     pub fn poll_sessions_status(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
         let focused_id = self.focused_session_id;
         // `T3_STATUS_DEBUG=1` dumps every detection pass: the facts that went in
         // and the badge that came out. Without this the poller is invisible.
         let debug = status::debug_enabled();
+        let now = Instant::now();
+
         for project in &mut self.projects {
             for session in &mut project.sessions {
                 let focused = focused_id == Some(session.id);
+                // The badge this tick started with; both the transition rules
+                // and the debug dump need it after `session.status` is updated.
+                let prev_status = session.status;
 
                 // Background terminals never render, so their PTY events
                 // (title updates, child exit) must be drained here or the
@@ -264,154 +422,111 @@ impl AppState {
                 // Reused for both the debug dump and the agent lifecycle below.
                 let foreground = status::foreground_process_names(session.pid);
 
-                // Scrape into the session's reused buffer. `bottom_lines` takes
-                // the last N *rows*, clamped to the visible screen. Ask for the
-                // whole screen: a fresh shell prints its prompt on row 0, well
-                // above a 12-row window at the bottom. The rules skip blank
-                // rows themselves.
+                // Scrape into the session's reused buffer. `bottom_lines_into`
+                // takes the last N *rows*, clamped to the visible screen. Ask
+                // for the whole screen: a fresh shell prints its prompt on row
+                // 0, well above a 12-row window at the bottom. The rules skip
+                // blank rows themselves.
                 session
                     .terminal
                     .read(cx)
                     .bottom_lines_into(usize::MAX, &mut session.screen_scratch);
 
-                // Idle fast path: when the screen, focus, exit state, and
-                // foreground group all match last tick, the status, ack, and
-                // logo cannot have changed — skip the rule-pack evaluation
-                // entirely. Done is excluded: it expires on a timer even when
-                // nothing else changes.
-                let poll_key = {
+                // Title, OSC 9;4 progress and exit state, read through one
+                // borrow of the terminal entity.
+                let (title, progress, exited, exit_status) = {
                     let terminal = session.terminal.read(cx);
-                    let fp = screen_fingerprint(
-                        &session.screen_scratch,
-                        terminal.title().unwrap_or(""),
-                    );
                     (
-                        fp,
-                        focused,
+                        terminal.title().unwrap_or("").to_string(),
+                        terminal.progress().map(str::to_string),
                         terminal.has_exited(),
-                        screen_fingerprint(&foreground, ""),
+                        terminal.exit_status(),
                     )
                 };
-                if session.poll_cache == Some(poll_key) && session.status != SessionStatus::Done {
+
+                // Everything an agent can change without starting or finishing
+                // a turn: the grid, the title, and its progress report.
+                let screen_fp =
+                    screen_fingerprint(&session.screen_scratch, &title, progress.as_deref());
+                let fg_fp = screen_fingerprint(&foreground, "", None);
+
+                // Any of those changing counts as output, which is what the
+                // stall watchdog measures silence against.
+                if screen_fp != session.last_screen_fp {
+                    session.last_screen_fp = screen_fp;
+                    session.last_output_at = now;
+                }
+
+                let poll_key = (screen_fp, focused, exited, fg_fp);
+                let idle_like = matches!(
+                    session.status,
+                    SessionStatus::Active | SessionStatus::Idle
+                );
+                // Fast path: nothing changed and the badge has no timer running,
+                // so the verdict cannot differ from last tick's.
+                if idle_like && session.poll_cache == Some(poll_key) {
                     continue;
                 }
 
-                let (next, ack, screen_fp) = {
-                    let terminal = session.terminal.read(cx);
-                    let bottom_lines = &session.screen_scratch;
-                    let title = terminal.title().unwrap_or("");
-                    let screen_fp = screen_fingerprint(bottom_lines, title);
+                let agent_now = foreground.iter().any(|name| status::is_agent_process(name));
+                let shell_exit = session.shell_exit.lock().clone();
 
-                    // Looking at a finished/failed terminal acknowledges it:
-                    // while the screen is unchanged the sticky badge stays
-                    // cleared; new output re-arms it.
-                    let ack = if focused
-                        && (terminal.has_exited()
-                            || matches!(session.status, SessionStatus::Done | SessionStatus::Error))
-                    {
-                        Some(screen_fp)
-                    } else {
-                        session.ack_screen
-                    };
-                    let acknowledged = ack == Some(screen_fp);
-
-                    // The agent rule match behind this tick's verdict, for the
-                    // debug dump. The live path below captures it for free;
-                    // the exited path only needs it for the dump itself.
-                    let mut debug_match = None;
-
-                    // Exit of the PTY child wins: the real exit code decides
-                    // Done (0) vs Error (non-zero / signal), herdr-style.
-                    let next = if terminal.has_exited() {
-                        if debug {
-                            debug_match = status::explain(&StatusInput {
-                                lines: bottom_lines,
-                                title: Some(title),
-                                foreground: &foreground,
-                            });
-                        }
-                        if acknowledged {
-                            SessionStatus::Idle
-                        } else {
-                            match terminal.exit_status() {
-                                Some(0) | None => SessionStatus::Done,
-                                Some(_) => SessionStatus::Error,
-                            }
-                        }
-                    } else {
-                        let input = StatusInput {
-                            lines: bottom_lines,
-                            title: Some(title),
-                            foreground: &foreground,
-                        };
-                        // Debug builds capture the match for the dump below;
-                        // release builds use the plain verdict (same work).
-                        let (detected, rule_match) = if debug {
-                            status::evaluate_with_match(&input, session.status, focused)
-                        } else {
-                            (status::evaluate(&input, session.status, focused), None)
-                        };
-                        // Stash the match for the debug dump below so the pack
-                        // is not evaluated a second time to explain the badge.
-                        debug_match = rule_match;
-                        if acknowledged && matches!(detected, SessionStatus::Done | SessionStatus::Error) {
-                            if focused {
-                                SessionStatus::Active
-                            } else {
-                                SessionStatus::Idle
-                            }
-                        } else {
-                            detected
-                        }
-                    };
-
-                    if debug {
-                        let rule = debug_match
-                            .as_ref()
-                            .map_or_else(
-                            || "(no rule)".to_string(),
-                            |m| {
-                                format!(
-                                    "{}/{} v{} state={} priority={} region={} \
-                                     visible(working/blocker/idle)={}/{}/{} skip_update={}",
-                                    m.pack,
-                                    m.rule,
-                                    m.pack_version.as_deref().unwrap_or("?"),
-                                    m.state.label(),
-                                    m.priority,
-                                    m.region,
-                                    m.visible_working,
-                                    m.visible_blocker,
-                                    m.visible_idle,
-                                    m.skip_state_update,
-                                )
-                            },
-                        );
-                        eprintln!(
-                            "[status] session={} focused={focused} exited={} exit={:?} \
-                             pid={:?} fg={foreground:?} pack={:?} title={title:?} \
-                             prev={} next={} rule={rule}",
-                            session.id,
-                            terminal.has_exited(),
-                            terminal.exit_status(),
-                            session.pid,
-                            status::pack_for(&foreground),
-                            session.status.label(),
-                            next.label(),
-                        );
-                        let screen: Vec<&str> = bottom_lines
-                            .iter()
-                            .map(String::as_str)
-                            .filter(|line| !line.trim().is_empty())
-                            .collect();
-                        let from = screen.len().saturating_sub(DEBUG_SCREEN_LINES);
-                        for line in &screen[from..] {
-                            eprintln!("[status]   | {line}");
-                        }
-                    }
-
-                    (next, ack, screen_fp)
+                // Looking at a finished/failed terminal acknowledges it: while
+                // the screen is unchanged the sticky badge stays cleared; new
+                // output re-arms it.
+                let ack = if focused && (exited || session.status.is_final()) {
+                    Some(screen_fp)
+                } else {
+                    session.ack_screen
                 };
+                let acknowledged = ack == Some(screen_fp);
+
+                // The agent rule match behind this tick's verdict, for the
+                // tooltip and the debug dump.
+                let mut rule = None;
+                let mut reason = None;
+
+                let mut next = if exited {
+                    // The PTY child is gone, so the terminal is closed: say so
+                    // and keep saying it. There is no prompt to return to, so
+                    // there is nothing for the user to "acknowledge" away — the
+                    // badge is the shell's real exit status, which is also the
+                    // only thing left to know about this terminal.
+                    match &shell_exit {
+                        Some(info) => SessionStatus::from_exit(info),
+                        // The PTY closed before the waiter thread could record
+                        // a status; it ended either way.
+                        None => SessionStatus::Exited,
+                    }
+                } else {
+                    let input = StatusInput {
+                        lines: &session.screen_scratch,
+                        title: Some(&title),
+                        progress: progress.as_deref(),
+                        foreground: &foreground,
+                    };
+                    let verdict = status::verdict(&input, session.status, focused);
+                    rule = verdict.rule;
+                    reason = verdict.reason;
+                    if acknowledged && verdict.status.is_final() {
+                        if focused {
+                            SessionStatus::Active
+                        } else {
+                            SessionStatus::Idle
+                        }
+                    } else {
+                        verdict.status
+                    }
+                };
+
+                // Stall watchdog: a recognized agent that has printed nothing
+                // at all for a minute is not "working", it is stuck.
+                if next == SessionStatus::Working
+                    && agent_now
+                    && now.saturating_duration_since(session.last_output_at) >= status::STALL_AFTER
+                {
+                    next = SessionStatus::Stalled;
+                }
 
                 // Agent lifecycle. Two ways a task counts as finished, because
                 // an agent CLI keeps running after it answers:
@@ -425,20 +540,16 @@ impl AppState {
                 // agent finished and you have not looked at it yet". Reporting
                 // it only while unfocused is deliberate — a badge is for the
                 // tab you are *not* on.
-                let agent_now = foreground.iter().any(|name| status::is_agent_process(name));
                 let agent_exited = session.agent_active && !agent_now;
                 session.agent_active = agent_now;
 
                 let turn_finished = matches!(
                     session.status,
-                    SessionStatus::Working | SessionStatus::Blocked
+                    SessionStatus::Working | SessionStatus::Stalled | SessionStatus::Blocked
                 ) && next == SessionStatus::Idle;
 
                 let just_finished = agent_exited || turn_finished;
-                let next = if just_finished
-                    && next == SessionStatus::Idle
-                    && ack != Some(screen_fp)
-                    && !focused
+                let next = if just_finished && next == SessionStatus::Idle && !acknowledged && !focused
                 {
                     SessionStatus::Done
                 } else {
@@ -448,8 +559,8 @@ impl AppState {
                 // Spec: Done also drops back to Idle after a short timeout even
                 // if the user never focuses the terminal.
                 let next = if next == SessionStatus::Done {
-                    let since = *session.done_since.get_or_insert_with(std::time::Instant::now);
-                    if since.elapsed() >= DONE_LINGER {
+                    let since = *session.done_since.get_or_insert(now);
+                    if now.saturating_duration_since(since) >= status::DONE_LINGER {
                         session.done_since = None;
                         SessionStatus::Idle
                     } else {
@@ -460,16 +571,51 @@ impl AppState {
                     next
                 };
 
+                // The evidence the sidebar tooltip shows, most specific first.
+                let note: SharedString = if next == SessionStatus::Stalled {
+                    SharedString::from(format!(
+                        "no output for {}",
+                        format_elapsed(now.saturating_duration_since(session.last_output_at))
+                    ))
+                } else if next == SessionStatus::Done {
+                    SharedString::from("turn finished")
+                } else if let Some(rule) = &rule {
+                    SharedString::from(format!("{} · {}", rule.pack, rule.rule))
+                } else if let Some(info) = &shell_exit {
+                    SharedString::from(info.note())
+                } else if let Some(reason) = reason {
+                    SharedString::from(reason)
+                } else {
+                    SharedString::from("")
+                };
+
                 session.ack_screen = ack;
                 if session.status != next {
                     session.status = next;
+                    session.status_since = now;
                     changed = true;
                 }
 
-                let term_title = session.terminal.read(cx).title();
+                // Keep the rendered elapsed label in sync. Comparing the
+                // formatted string means the window repaints when a timer on
+                // screen would change, and never otherwise.
+                let elapsed =
+                    format_elapsed(now.saturating_duration_since(session.status_since));
+                if session.elapsed_label != elapsed {
+                    session.elapsed_label = elapsed;
+                    changed = true;
+                }
+                if session.status_note != note {
+                    session.status_note = note;
+                    changed = true;
+                }
+
+                // `map(str::to_string)`: the title borrows the terminal, and
+                // the logo resolution below needs the session mutably again.
+                let term_title = session.terminal.read(cx).title().map(str::to_string);
                 let next_logo = logos::resolve_session_logo(
                     &foreground,
-                    term_title,
+                    term_title.as_deref(),
                     session.status,
                     &session.logo,
                 );
@@ -479,12 +625,65 @@ impl AppState {
                 }
 
                 session.poll_cache = Some(poll_key);
+
+                if debug {
+                    let rule_text = rule
+                        .as_ref()
+                        .map_or_else(
+                            || match reason {
+                                Some(reason) => format!("(fallback: {reason})"),
+                                None => "(no rule)".to_string(),
+                            },
+                            |matched| {
+                                format!(
+                                    "{}/{} v{} state={} priority={} region={} \
+                                     visible(working/blocker/idle)={}/{}/{} skip_update={}",
+                                    matched.pack,
+                                    matched.rule,
+                                    matched.pack_version.as_deref().unwrap_or("?"),
+                                    matched.state.label(),
+                                    matched.priority,
+                                    matched.region,
+                                    matched.visible_working,
+                                    matched.visible_blocker,
+                                    matched.visible_idle,
+                                    matched.skip_state_update,
+                                )
+                            },
+                        );
+                    eprintln!(
+                        "[status] session={} focused={focused} exited={} exit={:?} shell_exit={:?} \
+                         pid={:?} fg={foreground:?} pack={:?} progress={progress:?} title={title:?} \
+                         silence={:?} prev={} next={} note={:?} rule={rule_text}",
+                        session.id,
+                        exited,
+                        exit_status,
+                        shell_exit.as_ref().map(ExitInfo::note),
+                        session.pid,
+                        status::pack_for(&foreground),
+                        now.saturating_duration_since(session.last_output_at),
+                        prev_status.label(),
+                        session.status.label(),
+                        session.status_note.as_ref(),
+                    );
+                    let screen: Vec<&str> = session
+                        .screen_scratch
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|line| !line.trim().is_empty())
+                        .collect();
+                    let from = screen.len().saturating_sub(DEBUG_SCREEN_LINES);
+                    for line in &screen[from..] {
+                        eprintln!("[status]   | {line}");
+                    }
+                }
             }
         }
         if changed {
             cx.notify();
         }
     }
+
     fn create_new_session_for_active_project(
         &mut self,
         window: &mut Window,
@@ -495,33 +694,16 @@ impl AppState {
         self.next_id += 1;
 
         let dir = self.active_project().map(|p| p.path.clone());
-        if let Ok((terminal, pid)) = Self::spawn_terminal_view(
-            dir.as_ref(),
-            self.palette.clone(),
-            self_weak,
-            next_id,
-            cx,
-        ) {
-            terminal.read(cx).focus_handle().focus(window);
+        if let Ok(spawned) =
+            Self::spawn_terminal_view(dir.as_ref(), self.palette.clone(), self_weak, next_id, cx)
+        {
+            spawned.view.read(cx).focus_handle().focus(window);
             let session_count = self
                 .active_project()
                 .map(|p| p.sessions.len())
                 .unwrap_or(0);
             let title = SharedString::from(format!("terminal {}", session_count + 1));
-            let session = Session {
-                id: next_id,
-                title: title.clone(),
-                display_title: truncate_title(&title),
-                terminal,
-                status: SessionStatus::Idle,
-                pid,
-                screen_scratch: Vec::new(),
-                poll_cache: None,
-                ack_screen: None,
-                agent_active: false,
-                done_since: None,
-                logo: logos::default_logo(),
-            };
+            let session = Session::new(next_id, title, spawned);
 
             let p_idx = self.active_project_idx;
             let pushed = if let Some(project) = self.active_project_mut() {
@@ -549,28 +731,15 @@ impl AppState {
             let next_id = self.next_id;
             self.next_id += 1;
 
-            if let Ok((terminal, pid)) = Self::spawn_terminal_view(
+            if let Ok(spawned) = Self::spawn_terminal_view(
                 Some(&folder),
                 self.palette.clone(),
                 self_weak,
                 next_id,
                 cx,
             ) {
-                terminal.read(cx).focus_handle().focus(window);
-                let session = Session {
-                    id: next_id,
-                    title: SharedString::from("terminal 1"),
-                    display_title: SharedString::from("terminal 1"),
-                    terminal,
-                    status: SessionStatus::Idle,
-                    pid,
-                    screen_scratch: Vec::new(),
-                    poll_cache: None,
-                    ack_screen: None,
-                    agent_active: false,
-                    done_since: None,
-                    logo: logos::default_logo(),
-                };
+                spawned.view.read(cx).focus_handle().focus(window);
+                let session = Session::new(next_id, SharedString::from("terminal 1"), spawned);
                 let project = Project {
                     id: next_id,
                     name: SharedString::from(name),
@@ -586,6 +755,148 @@ impl AppState {
                 cx.notify();
             }
         }
+    }
+
+    /// Switch projects and put the keyboard back into that project's terminal.
+    fn activate_project(&mut self, p_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if p_idx >= self.projects.len() {
+            return;
+        }
+        self.active_project_idx = p_idx;
+        // Clicking a folded project opens it as well as selecting it: the click
+        // is the user asking to see what is inside.
+        let id = self.projects[p_idx].id;
+        self.collapsed_projects.remove(&id);
+        if let Some(session) = self.active_session() {
+            session.terminal.read(cx).focus_handle().focus(window);
+        }
+        cx.notify();
+    }
+
+    fn toggle_project_collapsed(&mut self, p_idx: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.get(p_idx) else {
+            return;
+        };
+        if !self.collapsed_projects.remove(&project.id) {
+            self.collapsed_projects.insert(project.id);
+        }
+        cx.notify();
+    }
+
+    fn activate_session(
+        &mut self,
+        p_idx: usize,
+        s_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_project_idx = p_idx;
+        if let Some(project) = self.projects.get_mut(p_idx) {
+            if s_idx < project.sessions.len() {
+                project.active_session_idx = s_idx;
+            }
+        }
+        if let Some(session) = self.active_session() {
+            session.terminal.read(cx).focus_handle().focus(window);
+        }
+        cx.notify();
+    }
+
+    /// Close one terminal. A project's *last* terminal closes the project; the
+    /// window always keeps at least one project.
+    fn close_session(
+        &mut self,
+        p_idx: usize,
+        s_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A project's last terminal *is* the project: closing it removes the
+        // workspace entry, so that falls through to `remove_project`.
+        let is_last_terminal = self
+            .projects
+            .get(p_idx)
+            .is_none_or(|project| project.sessions.len() <= 1);
+        if is_last_terminal {
+            self.remove_project(p_idx, window, cx);
+            return;
+        }
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+
+        let closing = project.sessions.remove(s_idx);
+        hangup_process_group(closing.pid);
+        let was_focused = self.focused_session_id == Some(closing.id);
+        drop(closing);
+
+        if project.active_session_idx >= project.sessions.len() {
+            project.active_session_idx = project.sessions.len() - 1;
+        } else if s_idx < project.active_session_idx {
+            project.active_session_idx -= 1;
+        }
+
+        self.reindex_sessions();
+        if was_focused {
+            if let Some(session) = self.active_session() {
+                session.terminal.read(cx).focus_handle().focus(window);
+            }
+        }
+        cx.notify();
+    }
+
+    fn remove_project(&mut self, p_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Never leave the window without a workspace to show.
+        if self.projects.len() <= 1 || p_idx >= self.projects.len() {
+            return;
+        }
+        let removed = self.projects.remove(p_idx);
+        self.collapsed_projects.remove(&removed.id);
+        for session in &removed.sessions {
+            hangup_process_group(session.pid);
+        }
+        drop(removed);
+
+        if self.active_project_idx >= self.projects.len() {
+            self.active_project_idx = self.projects.len() - 1;
+        } else if p_idx < self.active_project_idx {
+            self.active_project_idx -= 1;
+        }
+
+        self.reindex_sessions();
+        if let Some(session) = self.active_session() {
+            session.terminal.read(cx).focus_handle().focus(window);
+        }
+        cx.notify();
+    }
+
+    /// Per-status terminal counts across every project, loudest first — the
+    /// sidebar footer's summary line.
+    fn status_summary(&self) -> Vec<(SessionStatus, usize)> {
+        let loudest_first = [
+            SessionStatus::Blocked,
+            SessionStatus::Error,
+            SessionStatus::Killed,
+            SessionStatus::Stalled,
+            SessionStatus::Done,
+            SessionStatus::Working,
+            SessionStatus::Waiting,
+        ];
+        let sessions = || {
+            self.projects
+                .iter()
+                .flat_map(|project| project.sessions.iter())
+        };
+        loudest_first
+            .iter()
+            .map(|&status| {
+                (
+                    status,
+                    sessions().filter(|session| session.status == status).count(),
+                )
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect()
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -613,14 +924,520 @@ impl AppState {
             cx.stop_propagation();
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Sidebar rendering
+    //
+    // These return concrete element types (`Div`, `Stateful<Div>`) rather than
+    // `impl IntoElement`: the sidebar mixes rows of different shapes, and a
+    // concrete type keeps them collectable into one list.
+    // -----------------------------------------------------------------------
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgba(ui::BG_SIDEBAR))
+            .border_r_1()
+            .border_color(rgba(ui::BORDER))
+            .child(self.render_sidebar_header(cx))
+            .child(
+                div()
+                    .id("sidebar-scroll")
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_2()
+                    .py_2()
+                    .overflow_y_scrollbar()
+                    .children(self.sidebar_rows(cx)),
+            )
+            .child(self.render_sidebar_footer())
+    }
+
+    fn render_sidebar_header(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(rgba(ui::BORDER_SOFT))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(rgba(ui::ACCENT)))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgba(ui::TEXT_BRIGHT))
+                            .child("T3 Code"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgba(ui::TEXT_DIM))
+                            .child(format!(
+                                "{} workspace{}",
+                                self.projects.len(),
+                                if self.projects.len() == 1 { "" } else { "s" }
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(icon_button(
+                        "sidebar-new-terminal",
+                        "ui_icons/add.svg",
+                        "New terminal in the active project",
+                        13.0,
+                        cx.listener(|this, _, window, cx| {
+                            let p_idx = this.active_project_idx;
+                            this.activate_project(p_idx, window, cx);
+                            this.create_new_session_for_active_project(window, cx);
+                        }),
+                    ))
+                    .child(icon_button(
+                        "sidebar-add-project",
+                        "ui_icons/folder-opened.svg",
+                        "Open a folder as a new project",
+                        13.0,
+                        cx.listener(|this, _, window, cx| {
+                            this.select_folder_and_add_project(window, cx)
+                        }),
+                    )),
+            )
+    }
+
+    /// All sidebar rows, in order: project header followed by its terminals.
+    fn sidebar_rows(&self, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let mut rows = Vec::with_capacity(self.projects.len() * 2);
+        for p_idx in 0..self.projects.len() {
+            rows.push(self.project_row(p_idx, cx));
+            let collapsed = self.collapsed_projects.contains(&self.projects[p_idx].id);
+            if collapsed {
+                continue;
+            }
+            for s_idx in 0..self.projects[p_idx].sessions.len() {
+                rows.push(self.session_row(p_idx, s_idx, cx));
+            }
+        }
+        rows
+    }
+
+    /// A project header: fold arrow, folder, name, rollup dot, terminal count,
+    /// and a hover-revealed "new terminal" button.
+    fn project_row(&self, p_idx: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+        let project = &self.projects[p_idx];
+        let is_active = p_idx == self.active_project_idx;
+        let collapsed = self.collapsed_projects.contains(&project.id);
+        let attention = project.attention_count();
+        // Only show a dot when the project has something to say: a quiet
+        // project should not look busy.
+        let rollup = project.rollup().filter(|_| attention > 0);
+        let sessions = project.sessions.len();
+
+        div()
+            .id(("project", project.id))
+            .group("project")
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(if is_active {
+                rgba(ui::SURFACE)
+            } else {
+                rgba(0x00000000)
+            })
+            .hover(|s| s.bg(rgba(ui::HOVER)))
+            .cursor(CursorStyle::PointingHand)
+            .flex()
+            .items_center()
+            .gap_2()
+            // Fold arrow. Its own hitbox and its own click handler, so folding
+            // never changes which project is active.
+            .child(
+                div()
+                    .id(("project-fold", project.id))
+                    .size(px(14.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .hover(|s| s.bg(rgba(ui::HOVER_STRONG)))
+                    .child(
+                        svg()
+                            .path(if collapsed {
+                                "ui_icons/chevron-right.svg"
+                            } else {
+                                "ui_icons/chevron-down.svg"
+                            })
+                            .size(px(10.0))
+                            .text_color(rgba(ui::TEXT_MUTED)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_project_collapsed(p_idx, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            )
+            .child(
+                svg()
+                    .path(if is_active {
+                        "ui_icons/folder-opened.svg"
+                    } else {
+                        "ui_icons/folder.svg"
+                    })
+                    .size(px(13.0))
+                    .text_color(rgba(if is_active { ui::ACCENT } else { ui::TEXT_MUTED })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgba(if is_active { ui::TEXT_BRIGHT } else { ui::TEXT }))
+                    .child(project.name.clone()),
+            )
+            .when_some(rollup, |el, status| {
+                el.child(div().flex_shrink_0().child(status_dot(status, 6.0)))
+            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(rgba(if attention > 0 {
+                        ui::TEXT_MUTED
+                    } else {
+                        ui::TEXT_DIM
+                    }))
+                    .child(format!("{sessions}")),
+            )
+            .child(
+                div()
+                    .id(("project-new-terminal", project.id))
+                    .size(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .invisible()
+                    .group_hover("project", |s| s.visible())
+                    .hover(|s| s.bg(rgba(ui::HOVER_STRONG)))
+                    .cursor(CursorStyle::PointingHand)
+                    .tooltip(|window, cx| {
+                        Tooltip::new("New terminal in this project").build(window, cx)
+                    })
+                    .child(
+                        svg()
+                            .path("ui_icons/add.svg")
+                            .size(px(11.0))
+                            .text_color(rgba(ui::TEXT_MUTED)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.activate_project(p_idx, window, cx);
+                            this.create_new_session_for_active_project(window, cx);
+                        }),
+                    ),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.activate_project(p_idx, window, cx);
+                }),
+            )
+    }
+
+    /// One terminal row: status rail, agent logo, title, and — once the status
+    /// is worth reading — the status itself with how long it has been like
+    /// that.
+    fn session_row(&self, p_idx: usize, s_idx: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+        let project = &self.projects[p_idx];
+        let session = &project.sessions[s_idx];
+        let is_active = p_idx == self.active_project_idx && s_idx == project.active_session_idx;
+        let (dot_color, status_color, _) = session.status.colors();
+        // Idle/active rows stay one line tall; anything the user may need to
+        // act on gets a second line with the reason and the clock.
+        let show_detail = session.status.needs_attention() || session.status.is_busy();
+        let tooltip: SharedString = if session.status_note.is_empty() {
+            SharedString::from(session.status.description().to_string())
+        } else {
+            SharedString::from(format!(
+                "{} {}",
+                session.status.description(),
+                session.status_note
+            ))
+        };
+
+        div()
+            .id(("session", session.id))
+            .group("session")
+            .relative()
+            // Indented under the project it belongs to: the rail sits in the
+            // gutter, the logo lines up with the project's icon.
+            .pl_5()
+            .pr_2()
+            .py_1()
+            .rounded_md()
+            .cursor(CursorStyle::PointingHand)
+            .bg(if is_active {
+                rgba(ui::SELECTED)
+            } else {
+                rgba(0x00000000)
+            })
+            .hover(|s| s.bg(rgba(ui::HOVER)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            // The rail: a 2 px bar in the status colour. Scanning a column of
+            // rails is faster than reading a column of words.
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_1()
+                    .bottom_1()
+                    .w(px(2.0))
+                    .rounded_full()
+                    .when(is_active, |el| el.bg(rgba(ui::ACCENT)))
+                    .when(!is_active && session.status.needs_attention(), |el| {
+                        el.bg(rgba(dot_color))
+                    }),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .size(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(gpui::img(session.logo.clone()).size(px(15.0)).rounded(px(2.0))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(rgba(if is_active { ui::TEXT_BRIGHT } else { ui::TEXT }))
+                            .child(session.display_title.clone()),
+                    )
+                    .when(show_detail, |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgba(status_color))
+                                        .child(session.status.label()),
+                                )
+                                .child(div().text_xs().text_color(rgba(ui::TEXT_DIM)).child("·"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgba(ui::TEXT_FAINT))
+                                        .child(session.elapsed_label.clone()),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(status_dot(session.status, 6.0))
+                    .child(
+                        div()
+                            .id(("session-close", session.id))
+                            .size(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .invisible()
+                            .group_hover("session", |s| s.visible())
+                            .hover(|s| s.bg(rgba(ui::HOVER_STRONG)))
+                            .cursor(CursorStyle::PointingHand)
+                            .tooltip(|window, cx| {
+                                Tooltip::new("Close terminal").build(window, cx)
+                            })
+                            .child(
+                                svg()
+                                    .path("ui_icons/panel_close.svg")
+                                    .size(px(9.0))
+                                    .text_color(rgba(ui::TEXT_MUTED)),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.close_session(p_idx, s_idx, window, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    ),
+            )
+            .when(session.status.needs_attention(), |el| {
+                el.bg(rgba(if is_active { ui::SELECTED } else { ui::HOVER }))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.activate_session(p_idx, s_idx, window, cx);
+                }),
+            )
+    }
+
+    /// The footer: a live summary of every terminal in the workspace, so the
+    /// window can be read without expanding anything.
+    fn render_sidebar_footer(&self) -> Div {
+        let summary = self.status_summary();
+        let total: usize = self.projects.iter().map(|p| p.sessions.len()).sum();
+        let quiet = total == 0 || summary.is_empty();
+
+        div()
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .border_t_1()
+            .border_color(rgba(ui::BORDER_SOFT))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .when(quiet, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgba(ui::TEXT_DIM))
+                                .child(format!("{total} idle")),
+                        )
+                    })
+                    .children(summary.into_iter().map(|(status, count)| {
+                        let (dot_color, text_color, badge_bg) = status.colors();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(rgba(badge_bg))
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(format!(
+                                    "{count} {} — {}",
+                                    status.label(),
+                                    status.description()
+                                ))
+                                .build(window, cx)
+                            })
+                            .child(div().size(px(5.0)).rounded_full().bg(rgba(dot_color)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgba(text_color))
+                                    .child(format!("{count} {}", status.label())),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgba(ui::TEXT_DIM))
+                    .child(format!(
+                        "{} project{} · {} terminal{}",
+                        self.projects.len(),
+                        if self.projects.len() == 1 { "" } else { "s" },
+                        total,
+                        if total == 1 { "" } else { "s" },
+                    )),
+            )
+    }
+
+    fn render_titlebar(
+        &self,
+        active_project_name: &SharedString,
+        active_title: &SharedString,
+        titlebar_logo: Option<SharedString>,
+        titlebar_status: Option<(SessionStatus, SharedString, SharedString)>,
+    ) -> AnyElement {
+        TitleBar::new()
+            .child(
+            div()
+                .w_full()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_size(px(12.5))
+                .children(titlebar_logo.map(|logo| {
+                    div()
+                        .size(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .flex_shrink_0()
+                        .child(gpui::img(logo).size(px(14.0)).rounded(px(2.0)))
+                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgba(ui::TEXT_MUTED))
+                        .child(active_project_name.clone()),
+                )
+                .child(div().text_xs().text_color(rgba(ui::TEXT_DIM)).child("›"))
+                .child(
+                    div()
+                        .max_w(px(420.0))
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgba(ui::TEXT))
+                        .child(active_title.clone()),
+                )
+                .children(titlebar_status.map(|(status, elapsed, note)| {
+                    status_chip(status, &elapsed, &note)
+                })),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for AppState {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Track which session owns keyboard focus each frame; the poller uses
-        // this for Active-state resolution and for clearing sticky Done/Error.
+        // this for Active-state resolution and for clearing sticky badges.
         self.focused_session_id = self.active_session().and_then(|s| {
-            let focused = s.terminal.read(cx).focus_handle().is_focused(_window);
+            let focused = s.terminal.read(cx).focus_handle().is_focused(window);
             focused.then_some(s.id)
         });
 
@@ -636,298 +1453,49 @@ impl Render for AppState {
 
         let active_session_view = self.active_session().map(|s| s.terminal.clone());
 
-        // Focused terminal's status and logo, mirrored in the title bar.
-        let titlebar_status = self.active_session().map(|s| s.status);
-        let titlebar_logo = self.active_session().map(|s| s.logo.clone());
+        // Focused terminal's badge and logo, mirrored in the title bar, plus
+        // the evidence and clock the sidebar row shows.
+        let titlebar = self.active_session().map(|s| {
+            (
+                s.status,
+                s.elapsed_label.clone(),
+                s.status_note.clone(),
+                s.logo.clone(),
+            )
+        });
 
         div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgba(0x0f1115ff))
-            .text_color(rgba(0xe6edf3ff))
+            .bg(rgba(ui::BG_WINDOW))
+            .text_color(rgba(ui::TEXT))
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(
-                TitleBar::new().child(
-                    div()
-                        .w_full()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .text_size(px(12.5))
-                        .text_color(rgba(0x8b949eff))
-                        .children(titlebar_logo.map(|logo| {
-                            div()
-                                .w(px(16.0))
-                                .h(px(16.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .flex_shrink_0()
-                                .child(
-                                    gpui::img(logo)
-                                        .size(px(14.0))
-                                        .rounded(px(2.0))
-                                )
-                        }))
-                        .child(format!("{active_project_name} — {active_title}"))
-                        .children(titlebar_status.map(|status| {
-                            let (dot_color, text_color, badge_bg) = status.colors();
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded_sm()
-                                .bg(rgba(badge_bg))
-                                .text_color(rgba(text_color))
-                                .child(
-                                    div()
-                                        .w(px(6.0))
-                                        .h(px(6.0))
-                                        .rounded_full()
-                                        .bg(rgba(dot_color)),
-                                )
-                                .child(status.label())
-                        })),
-                ),
-            )
+            .child(self.render_titlebar(
+                &active_project_name,
+                &active_title,
+                titlebar.as_ref().map(|(_, _, _, logo)| logo.clone()),
+                titlebar.as_ref().map(|(status, elapsed, note, _)| {
+                    (*status, elapsed.clone(), note.clone())
+                }),
+            ))
             .child(
                 h_resizable("workspace-resizable-layout")
                     .child(
                         resizable_panel()
-                            .size(px(260.0))
-                            .size_range(px(180.0)..px(600.0))
-                            .child(
-                                div()
-                                    .size_full()
-                                    .flex()
-                                    .flex_col()
-                                    .bg(rgba(0x090a0dff))
-                                    .border_r_1()
-                                    .border_color(rgba(0x1e2229ff))
-                            // Sidebar Header
-                            .child(
-                                div()
-                                    .p_3()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .border_b_1()
-                                    .border_color(rgba(0x1e2229ff))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(gpui::FontWeight::BOLD)
-                                                    .text_color(rgba(0x58a6ffff))
-                                                    .child("T3 Code"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("open-folder-btn")
-                                                    .p_1p5()
-                                                    .rounded_md()
-                                                    .bg(rgba(0x1f242cff))
-                                                    .hover(|s| s.bg(rgba(0x2d333bff)))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(
-                                                        svg()
-                                                            .path("ui_icons/project-add.svg")
-                                                            .size(px(18.0))
-                                                            .text_color(rgba(0xc9d1d9ff))
-                                                            .hover(|s| s.text_color(rgba(0xffffffff)))
-                                                    )
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(|this, _, window, cx| {
-                                                            this.select_folder_and_add_project(window, cx);
-                                                        }),
-                                                    ),
-                                            ),
-                                    ),
-                            )
-                            // Projects & Sessions List
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .overflow_y_scrollbar()
-                                    .p_2()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .children(self.projects.iter().enumerate().map(|(p_idx, project)| {
-                                        let is_active_project = p_idx == self.active_project_idx;
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .id(("project-header", project.id))
-                                                    .px_2()
-                                                    .py_1()
-                                                    .rounded_md()
-                                                    .bg(if is_active_project {
-                                                        rgba(0x161b22ff)
-                                                    } else {
-                                                        rgba(0x00000000)
-                                                    })
-                                                    .hover(|s| s.bg(rgba(0x161b2299)))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                            .text_color(if is_active_project {
-                                                                rgba(0x58a6ffff)
-                                                            } else {
-                                                                rgba(0x8b949eff)
-                                                            })
-                                                            .child(project.name.clone()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id(("add-session-btn", project.id))
-                                                            .p_1()
-                                                            .rounded_md()
-                                                            .hover(|s| s.bg(rgba(0x21262dff)))
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .child(
-                                                                svg()
-                                                                    .path("ui_icons/session-create.svg")
-                                                                    .size(px(18.0))
-                                                                    .text_color(rgba(0x8b949eff))
-                                                                    .hover(|s| s.text_color(rgba(0xffffffff)))
-                                                            )
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener(move |this, _, window, cx| {
-                                                                    this.active_project_idx = p_idx;
-                                                                    this.create_new_session_for_active_project(window, cx);
-                                                                }),
-                                                            ),
-                                                    )
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, window, cx| {
-                                                            this.active_project_idx = p_idx;
-                                                            if let Some(session) = this.active_session() {
-                                                                session.terminal.read(cx).focus_handle().focus(window);
-                                                            }
-                                                            cx.notify();
-                                                        }),
-                                                    ),
-                                            )
-                                            // Sessions list for this project
-                                            .children(project.sessions.iter().enumerate().map(|(s_idx, session)| {
-                                                let is_active_session = is_active_project && s_idx == project.active_session_idx;
-                                                let (_, text_color, badge_bg) = session.status.colors();
-                                                div()
-                                                    .id(("session-item", session.id))
-                                                    .ml_3()
-                                                    .px_2()
-                                                    .py_1()
-                                                    .rounded_md()
-                                                    .bg(if is_active_session {
-                                                        rgba(0x21262dff)
-                                                    } else {
-                                                        rgba(0x00000000)
-                                                    })
-                                                    .hover(|s| s.bg(rgba(0x161b22ff)))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .gap_2()
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap_2()
-                                                            .min_w_0()
-                                                            .flex_1()
-                                                            .child(
-                                                                // AI Agent / Command logo
-                                                                div()
-                                                                    .w(px(16.0))
-                                                                    .h(px(16.0))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .flex_shrink_0()
-                                                                    .child(
-                                                                        gpui::img(session.logo.clone())
-                                                                            .size(px(15.0))
-                                                                            .rounded(px(2.0))
-                                                                    )
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .text_xs()
-                                                                    .truncate()
-                                                                    .text_color(if is_active_session {
-                                                                        rgba(0xf0f6fcff)
-                                                                    } else {
-                                                                        rgba(0x8b949eff)
-                                                                    })
-                                                                    .child(session.display_title.clone()),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .flex_shrink_0()
-                                                            .text_xs()
-                                                            .px_1p5()
-                                                            .py_0p5()
-                                                            .rounded_sm()
-                                                            .bg(rgba(badge_bg))
-                                                            .text_color(rgba(text_color))
-                                                            .child(session.status.label()),
-                                                    )
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, window, cx| {
-                                                            this.active_project_idx = p_idx;
-                                                            if let Some(p) = this.projects.get_mut(p_idx) {
-                                                                p.active_session_idx = s_idx;
-                                                            }
-                                                            if let Some(session) = this.active_session() {
-                                                                session.terminal.read(cx).focus_handle().focus(window);
-                                                            }
-                                                            cx.notify();
-                                                        }),
-                                                    )
-                                            }))
-                                    })),
-                            ),
-                            )
+                            .size(px(272.0))
+                            .size_range(px(208.0)..px(640.0))
+                            .child(self.render_sidebar(cx)),
                     )
                     .child(
                         resizable_panel().child(
                             div()
                                 .flex_1()
                                 .size_full()
-                                .bg(rgba(0x010409ff))
+                                .bg(rgba(ui::BG_TERMINAL))
                                 .overflow_hidden()
                                 .children(active_session_view),
-                        )
+                        ),
                     ),
             )
     }
@@ -935,6 +1503,137 @@ impl Render for AppState {
 
 /// How many non-empty screen lines `T3_STATUS_DEBUG` prints per terminal.
 const DEBUG_SCREEN_LINES: usize = 14;
+
+/// Sidebar/terminal titlebar button: a square hit target with a hover
+/// background and a tooltip, so every icon in the chrome is self-explaining.
+fn icon_button(
+    id: impl Into<ElementId>,
+    icon: &'static str,
+    tooltip: &'static str,
+    icon_size: f32,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(icon_size + 9.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .cursor(CursorStyle::PointingHand)
+        .hover(|s| s.bg(rgba(ui::HOVER_STRONG)))
+        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(icon_size))
+                .text_color(rgba(ui::TEXT_MUTED)),
+        )
+        .on_mouse_down(MouseButton::Left, listener)
+}
+
+/// The status dot: filled when something is happening, hollow when the
+/// terminal is quiet, ringed by its own badge tint when it wants attention.
+fn status_dot(status: SessionStatus, diameter: f32) -> Div {
+    let (dot_color, _, badge_bg) = status.colors();
+    let hollow = matches!(
+        status,
+        SessionStatus::Idle | SessionStatus::Exited | SessionStatus::Waiting
+    );
+    div()
+        .flex_shrink_0()
+        .size(px(diameter + 7.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .when(status.needs_attention(), |el| el.bg(rgba(badge_bg)))
+        .child(
+            div()
+                .size(px(diameter))
+                .rounded_full()
+                .when(hollow, |el| {
+                    el.border_1().border_color(rgba(dot_color))
+                })
+                .when(!hollow, |el| el.bg(rgba(dot_color))),
+        )
+}
+
+/// A status pill: dot, label, and the elapsed clock — the same thing the
+/// sidebar row shows, in one line, for the title bar.
+fn status_chip(status: SessionStatus, elapsed: &SharedString, note: &SharedString) -> Div {
+    let (dot_color, text_color, badge_bg) = status.colors();
+    let tooltip: SharedString = if note.is_empty() {
+        SharedString::from(status.description().to_string())
+    } else {
+        SharedString::from(format!("{} {}", status.description(), note))
+    };
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_1p5()
+        .py_0p5()
+        .rounded_full()
+        .bg(rgba(badge_bg))
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .child(div().size(px(6.0)).rounded_full().bg(rgba(dot_color)))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgba(text_color))
+                .child(status.label()),
+        )
+        .when(!elapsed.is_empty(), |el| {
+            el.child(div().text_xs().text_color(rgba(ui::TEXT_DIM)).child("·"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgba(text_color))
+                        .child(elapsed.clone()),
+                )
+        })
+}
+
+/// Coarse elapsed-time label: `now`, `42s`, `3m`, `2h`, `4d`.
+///
+/// Coarse on purpose — the string is what decides whether a frame is needed, so
+/// a sidebar clock does not repaint the window every tick.
+fn format_elapsed(elapsed: Duration) -> SharedString {
+    let seconds = elapsed.as_secs();
+    let label = if seconds < 5 {
+        "now".to_string()
+    } else if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    };
+    SharedString::from(label)
+}
+
+/// Ask a terminal's shell to go away, together with everything it started.
+///
+/// The PTY master makes the shell a session leader (`portable-pty` calls
+/// `setsid`), so signalling the *group* (`-pid`) reaches the foreground job as
+/// well: closing a terminal must not leave a build running behind it.
+#[cfg(unix)]
+fn hangup_process_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // Safety: a negative pid targets the process group; a stale pid simply
+        // fails with ESRCH, which there is nothing to do about.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGHUP);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn hangup_process_group(_pid: Option<u32>) {}
 
 /// Sidebar form of a session title: full text up to 160 chars, then an ellipsis.
 /// Uses `char_indices().nth(160)` so short titles cost one pass that stops at
@@ -948,12 +1647,14 @@ fn truncate_title(title: &SharedString) -> SharedString {
 }
 
 /// Cheap, stable fingerprint of what is on screen, used to tell whether the
-/// user has already looked at a finished/failed terminal.
-fn screen_fingerprint(lines: &[String], title: &str) -> u64 {
+/// user has already looked at a finished/failed terminal, and whether an agent
+/// has gone silent.
+fn screen_fingerprint(lines: &[String], title: &str, progress: Option<&str>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     lines.hash(&mut hasher);
     title.hash(&mut hasher);
+    progress.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1127,7 +1828,7 @@ fn main() -> Result<()> {
                     let current_dir_clone = current_dir.clone();
                     let app_state = cx.new(|cx| {
                         let self_weak = cx.entity().downgrade();
-                        let (initial_terminal, pid) = AppState::spawn_terminal_view(
+                        let spawned = AppState::spawn_terminal_view(
                             Some(&current_dir_clone),
                             palette_clone.clone(),
                             self_weak,
@@ -1136,22 +1837,9 @@ fn main() -> Result<()> {
                         )
                         .expect("Failed to spawn initial terminal");
 
-                        initial_terminal.read(cx).focus_handle().focus(window);
-
-                        let initial_session = Session {
-                            id: 1,
-                            title: SharedString::from("terminal 1"),
-                            display_title: SharedString::from("terminal 1"),
-                            terminal: initial_terminal,
-                            status: SessionStatus::Idle,
-                            pid,
-                            screen_scratch: Vec::new(),
-                            poll_cache: None,
-                            ack_screen: None,
-                            agent_active: false,
-                            done_since: None,
-                            logo: logos::default_logo(),
-                        };
+                        spawned.view.read(cx).focus_handle().focus(window);
+                        let initial_session =
+                            Session::new(1, SharedString::from("terminal 1"), spawned);
 
                         let initial_project = Project {
                             id: 1,
@@ -1168,13 +1856,16 @@ fn main() -> Result<()> {
                             session_index: HashMap::from([(1, (0, 0))]),
                             palette: palette_clone,
                             focused_session_id: None,
+                            collapsed_projects: HashSet::new(),
                         }
                     });
 
                     let app_state_weak = app_state.downgrade();
                     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
                         loop {
-                            cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                            cx.background_executor()
+                                .timer(Duration::from_millis(500))
+                                .await;
                             let res = app_state_weak.update(cx, |state, cx| {
                                 state.poll_sessions_status(cx);
                             });

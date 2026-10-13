@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>T3 Code — sidebar design preview</title>
+<style>
+  /* Palette mirrors `mod ui` in src/main.rs; status colours mirror
+     SessionStatus::colors() in src/status.rs. This file is a static preview of
+     the layout the app draws — it is not part of the app. */
+  :root {
+    --bg-window:#0f1115; --bg-sidebar:#090b0f; --bg-terminal:#010409;
+    --border:#1e2229; --border-soft:#16191f;
+    --selected:#1c2129; --hover:#171c23; --hover-strong:#21262d; --surface:#12161c;
+    --text-bright:#f0f6fc; --text:#b9c1cb; --text-muted:#8b949e; --text-faint:#6e7681;
+    --text-dim:#545d68; --accent:#58a6ff;
+    --st-active:#58a6ff;  --st-active-bg:#1f6feb33;
+    --st-idle:#8b949e;    --st-idle-bg:#21262d88;
+    --st-working:#d29922; --st-working-bg:#9e6a0344;
+    --st-stalled:#a371f7; --st-stalled-bg:#6e40c933;
+    --st-waiting:#39c5cf; --st-waiting-bg:#1b7c8333;
+    --st-blocked:#db6d28; --st-blocked-bg:#bd561444;
+    --st-done:#3fb950;    --st-done-bg:#23863644;
+    --st-error:#f85149;   --st-error-bg:#da363344;
+    --st-killed:#db61a2;  --st-killed-bg:#a41c4e33;
+    --st-exited:#6e7681;  --st-exited-bg:#21262d66;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px; background: #05070a; color: var(--text);
+    font: 13px/1.45 "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  }
+  h1 { font-size: 15px; font-weight: 600; color: var(--text-bright); margin: 0 0 4px; }
+  p.hint { margin: 0 0 20px; color: var(--text-dim); font-size: 12px; }
+  h2 { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase;
+       letter-spacing: .06em; margin: 28px 0 10px; }
+
+  /* ---- window frame: title bar + h_resizable panes ---- */
+  .window {
+    width: 1200px; height: 620px; display: flex; flex-direction: column;
+    background: var(--bg-window); border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden;
+  }
+  .titlebar {
+    height: 34px; flex: 0 0 34px; display: flex; align-items: center; justify-content: center;
+    gap: 8px; font-size: 12px; color: var(--text-muted); position: relative;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .titlebar .logo { width: 14px; height: 14px; border-radius: 2px; background: linear-gradient(135deg,#d97757,#8b3d2a); }
+  .titlebar .sep { color: var(--text-dim); }
+  .titlebar .title { color: var(--text); max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .titlebar .traffic { position: absolute; left: 12px; display: flex; gap: 6px; }
+  .titlebar .traffic i { width: 11px; height: 11px; border-radius: 50%; display: block; }
+
+  .panes { flex: 1; display: flex; min-height: 0; }
+  .sidebar {
+    width: 272px; flex: 0 0 272px; background: var(--bg-sidebar);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0;
+  }
+  .gutter { width: 5px; background: var(--border-soft); }
+  .terminal { flex: 1; background: var(--bg-terminal); padding: 10px 12px; min-width: 0;
+              font: 12.5px/1.5 "Lilex", ui-monospace, "JetBrains Mono", monospace; color: #c9d1d9; overflow: hidden; }
+
+  /* ---- sidebar header ---- */
+  .sb-head {
+    flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px; border-bottom: 1px solid var(--border-soft);
+  }
+  .sb-head .brand { display: flex; align-items: center; gap: 8px; }
+  .sb-head .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+  .sb-head .name { font-size: 13px; font-weight: 700; color: var(--text-bright); }
+  .sb-head .count { font-size: 11px; color: var(--text-dim); }
+  .sb-head .actions { display: flex; gap: 4px; }
+  .iconbtn {
+    width: 22px; height: 22px; border-radius: 6px; display: flex; align-items: center;
+    justify-content: center; color: var(--text-muted); background: transparent;
+  }
+  .iconbtn.hover, .row:hover .iconbtn.reveal { background: var(--hover-strong); color: var(--text); }
+  .iconbtn svg { width: 13px; height: 13px; fill: currentColor; }
+
+  /* ---- rows ---- */
+  .sb-rows { flex: 1; min-height: 0; padding: 8px; display: flex; flex-direction: column; gap: 4px; overflow: hidden; }
+  .row { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 6px; }
+  .row:hover { background: var(--hover); }
+  .proj { color: var(--text); }
+  .proj.active { background: var(--surface); }
+  .proj .chev { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; }
+  .proj .chev svg { width: 10px; height: 10px; fill: var(--text-muted); }
+  .proj .folder { width: 13px; height: 13px; }
+  .proj .folder svg { width: 13px; height: 13px; fill: var(--text-muted); }
+  .proj.active .folder svg { fill: var(--accent); }
+  .proj .pname { flex: 1; min-width: 0; font-size: 12px; font-weight: 600; overflow: hidden;
+                 text-overflow: ellipsis; white-space: nowrap; }
+  .proj.active .pname { color: var(--text-bright); }
+  .proj .n { font-size: 11px; color: var(--text-dim); }
+  .proj.attention .n { color: var(--text-muted); }
+  .proj .reveal { width: 16px; height: 16px; opacity: 0; }
+  .proj .reveal svg { width: 11px; height: 11px; }
+
+  .sess { position: relative; padding: 4px 8px 4px 20px; cursor: default; }
+  .sess .rail {
+    position: absolute; left: 0; top: 4px; bottom: 4px; width: 2px; border-radius: 999px;
+  }
+  .sess.active { background: var(--selected); }
+  .sess.attention { background: var(--hover); }
+  .sess .logo { width: 16px; height: 16px; flex: 0 0 16px; display: flex; align-items: center; justify-content: center; }
+  .sess .logo i { width: 15px; height: 15px; border-radius: 2px; display: block; }
+  .sess .body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .sess .t { font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess.active .t { color: var(--text-bright); }
+  .sess .detail { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+  .sess .detail .d { color: var(--text-dim); }
+  .sess .detail .e { color: var(--text-faint); }
+  .sess .meta { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; }
+  .sess .close { width: 16px; height: 16px; opacity: 0; }
+  .sess .close svg { width: 9px; height: 9px; fill: var(--text-muted); }
+
+  /* status dot: filled = active/busy/final, hollow = quiet */
+  .sdot { display: flex; align-items: center; justify-content: center; border-radius: 50%; }
+  .sdot i { display: block; border-radius: 50%; }
+  .sdot.ringed { padding: 3px; }
+  .sdot.hollow i { border: 1px solid currentColor; }
+
+  /* ---- footer ---- */
+  .sb-foot {
+    flex: 0 0 auto; padding: 8px 12px; display: flex; flex-direction: column; gap: 4px;
+    border-top: 1px solid var(--border-soft);
+  }
+  .chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  .chip { display: flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+  .chip .cdot { width: 5px; height: 5px; border-radius: 50%; }
+  .counts { font-size: 11px; color: var(--text-dim); }
+
+  /* ---- legend ---- */
+  .legend { width: 1200px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 28px; }
+  .legend .item { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px;
+                  border: 1px solid var(--border-soft); background: #0b0e12; }
+  .legend .pill { font-size: 11px; padding: 1px 6px; border-radius: 4px; min-width: 62px; text-align: center; }
+  .legend .desc { color: var(--text-muted); font-size: 12px; }
+  .legend .sticky { margin-left: auto; font-size: 10px; color: var(--text-dim); }
+</style>
+</head>
+<body>
+  <h1>T3 Code — sidebar &amp; status badges</h1>
+  <p class="hint">Static mock of the layout in <code>src/main.rs</code>, using the exact palette (<code>mod ui</code>) and
+     status colours (<code>SessionStatus::colors()</code>). Row order, hover affordances, tooltips and the
+     footer summary all come from the Rust render code; the terminal pane is illustrative.</p>
+
+  <div class="window">
+    <div class="titlebar">
+      <div class="traffic">
+        <i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i>
+      </div>
+      <span class="logo"></span>
+      <span>markup</span>
+      <span class="sep">›</span>
+      <span class="title">claude — refactor status detection</span>
+      <span class="chip" style="color:var(--st-working);background:var(--st-working-bg)">
+        <span class="cdot" style="background:var(--st-working)"></span>working
+        <span class="d" style="color:var(--text-dim)">·</span><span style="color:var(--st-working)">2m</span>
+      </span>
+    </div>
+
+    <div class="panes">
+      <div class="sidebar">
+        <div class="sb-head">
+          <div class="brand">
+            <span class="dot"></span>
+            <span class="name">T3 Code</span>
+            <span class="count">3 workspaces</span>
+          </div>
+          <div class="actions">
+            <div class="iconbtn hover" title="New terminal in the active project">
+              <svg viewBox="0 0 16 16"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"/></svg>
+            </div>
+            <div class="iconbtn" title="Open a folder as a new project">
+              <svg viewBox="0 0 16 16"><path d="M1 4.5C1 3.12 2.12 2 3.5 2h2.09c.4 0 .78.16 1.06.44L7.71 3.5H12.5C13.88 3.5 15 4.62 15 6v5.5c0 1.38-1.12 2.5-2.5 2.5h-9A2.5 2.5 0 0 1 1 11.5v-7Z"/></svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="sb-rows">
+          <!-- project: active, expanded -->
+          <div class="row proj active attention">
+            <div class="chev"><svg viewBox="0 0 16 16"><path d="M3.15 5.85 7.65 10.35a.5.5 0 0 0 .7 0l4.5-4.5a.5.5 0 0 0-.7-.7L8 9.29 3.85 5.15a.5.5 0 0 0-.7.7Z"/></svg></div>
+            <div class="folder"><svg viewBox="0 0 16 16"><path d="M1 4.5C1 3.12 2.12 2 3.5 2h2.09c.4 0 .78.16 1.06.44L7.71 3.5H12.5C13.88 3.5 15 4.62 15 6v5.5c0 1.38-1.12 2.5-2.5 2.5h-9A2.5 2.5 0 0 1 1 11.5v-7Z"/></svg></div>
+            <div class="pname">markup</div>
+            <div class="sdot ringed hollow" style="color:var(--st-done);background:var(--st-done-bg)"><i style="width:6px;height:6px"></i></div>
+            <div class="n">3</div>
+            <div class="iconbtn reveal"><svg viewBox="0 0 16 16"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"/></svg></div>
+          </div>
+
+          <div class="row sess active">
+            <div class="rail" style="background:var(--accent)"></div>
+            <div class="logo"><i style="background:linear-gradient(135deg,#d97757,#8b3d2a)"></i></div>
+            <div class="body">
+              <div class="t">claude — refactor status detection</div>
+              <div class="detail"><span style="color:var(--st-working)">working</span><span class="d">·</span><span class="e">2m</span></div>
+            </div>
+            <div class="meta">
+              <div class="sdot" style="color:var(--st-working)"><i style="width:6px;height:6px;background:currentColor"></i></div>
+              <div class="iconbtn close"><svg viewBox="0 0 16 16"><path d="M8.7 8 12.35 4.35a.5.5 0 0 0-.7-.7L8 7.29 4.35 3.65a.5.5 0 0 0-.7.7L7.29 8 3.65 11.65a.5.5 0 0 0 .7.7L8 8.71l3.65 3.64a.5.5 0 0 0 .7-.7L8.7 8Z"/></svg></div>
+            </div>
+          </div>
+
+          <div class="row sess attention">
+            <div class="rail" style="background:var(--st-blocked)"></div>
+            <div class="logo"><i style="background:linear-gradient(135deg,#10a37f,#0b6f57)"></i></div>
+            <div class="body">
+              <div class="t">codex — fix flaky pty test</div>
+              <div class="detail"><span style="color:var(--st-blocked)">blocked</span><span class="d">·</span><span class="e">11s</span></div>
+            </div>
+            <div class="meta">
+              <div class="sdot ringed" style="color:var(--st-blocked);background:var(--st-blocked-bg)"><i style="width:6px;height:6px;background:currentColor"></i></div>
+              <div class="iconbtn reveal"><svg viewBox="0 0 16 16"><path d="M8.7 8 12.35 4.35a.5.5 0 0 0-.7-.7L8 7.29 4.35 3.65a.5.5 0 0 0-.7.7L7.29 8 3.65 11.65a.5.5 0 0 0 .7.7L8 8.71l3.65 3.64a.5.5 0 0 0 .7-.7L8.7 8Z"/></svg></div>
+            </div>
+          </div>
+
+          <div class="row sess">
+            <div class="logo"><i style="background:#2d333b"></i></div>
+            <div class="body"><div class="t">bash</div></div>
+            <div class="meta">
+              <div class="sdot hollow" style="color:var(--st-idle)"><i style="width:6px;height:6px"></i></div>
+              <div class="iconbtn reveal"><svg viewBox="0 0 16 16"><path d="M8.7 8 12.35 4.35a.5.5 0 0 0-.7-.7L8 7.29 4.35 3.65a.5.5 0 0 0-.7.7L7.29 8 3.65 11.65a.5.5 0 0 0 .7.7L8 8.71l3.65 3.64a.5.5 0 0 0 .7-.7L8.7 8Z"/></svg></div>
+            </div>
+          </div>
+
+          <!-- project: expanded -->
+          <div class="row proj">
+            <div class="chev"><svg viewBox="0 0 16 16"><path d="M3.15 5.85 7.65 10.35a.5.5 0 0 0 .7 0l4.5-4.5a.5.5 0 0 0-.7-.7L8 9.29 3.85 5.15a.5.5 0 0 0-.7.7Z"/></svg></div>
+            <div class="folder"><svg viewBox="0 0 16 16"><path d="M1 4.5C1 3.12 2.12 2 3.5 2h2.09c.4 0 .78.16 1.06.44L7.71 3.5H12.5C13.88 3.5 15 4.62 15 6v5.5c0 1.38-1.12 2.5-2.5 2.5h-9A2.5 2.5 0 0 1 1 11.5v-7Z"/></svg></div>
+            <div class="pname">infra</div>
+            <div class="sdot ringed" style="color:var(--st-error);background:var(--st-error-bg)"><i style="width:6px;height:6px;background:currentColor"></i></div>
+            <div class="n">2</div>
+            <div class="iconbtn reveal"><svg viewBox="0 0 16 16"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"/></svg></div>
+          </div>
+
+          <div class="row sess attention">
+            <div class="rail" style="background:var(--st-error)"></div>
+            <div class="logo"><i style="background:#2d333b"></i></div>
+            <div class="body">
+              <div class="t">deploy — ./deploy.sh production</div>
+              <div class="detail"><span style="color:var(--st-error)">error</span><span class="d">·</span><span class="e">4m</span></div>
+            </div>
+            <div class="meta">
+              <div class="sdot ringed" style="color:var(--st-error);background:var(--st-error-bg)"><i style="width:6px;height:6px;background:currentColor"></i></div>
+              <div class="iconbtn reveal"><svg viewBox="0 0 16 16"><path d="M8.7 8 12.35 4.35a.5.5 0 0 0-.7-.7L8 7.29 4.35 3.65a.5.5 0 0 0-.7.7L7.29 8 3.65 11.65a.5.5 0 0 0 .7.7L8 8.71l3.65 3.64a.5.5 0 0 0 .7-.7L8.7 8Z"/></svg></div>
+            </div>
+          </div>
+
+          <div class="row sess">
+            <div class="logo"><i style="background:#2d333b"></i></div>
+            <div class="body">
+              <div class="t">vim notes.md</div>
+              <div class="detail"><span style="color:var(--st-waiting)">waiting</span><span class="d">·</span><span class="e">12m</span></div>
+            </div>
+            <div class="meta">
+              <div class="sdot hollow" style="color:var(--st-waiting)"><i style="width:6px;height:6px"></i></div>
+              <div class="iconbtn reveal"><svg viewBox="0 0 16 16"><path d="M8.7 8 12.35 4.35a.5.5 0 0 0-.7-.7L8 7.29 4.35 3.65a.5.5 0 0 0-.7.7L7.29 8 3.65 11.65a.5.5 0 0 0 .7.7L8 8.71l3.65 3.64a.5.5 0 0 0 .7-.7L8.7 8Z"/></svg></div>
+            </div>
+          </div>
+
+          <!-- project: collapsed, done -->
+          <div class="row proj attention">
+            <div class="chev"><svg viewBox="0 0 16 16"><path d="M5.85 3.15 10.35 7.65a.5.5 0 0 1 0 .7l-4.5 4.5a.5.5 0 0 1-.7-.7L9.29 8 5.15 3.85a.5.5 0 0 1 .7-.7Z"/></svg></div>
+            <div class="folder"><svg viewBox="0 0 16 16"><path d="M1 4.5C1 3.12 2.12 2 3.5 2h2.09c.4 0 .78.16 1.06.44L7.71 3.5H12.5C13.88 3.5 15 4.62 15 6v5.5c0 1.38-1.12 2.5-2.5 2.5h-9A2.5 2.5 0 0 1 1 11.5v-7Z"/></svg></div>
+            <div class="pname">website</div>
+            <div class="sdot ringed" style="color:var(--st-done);background:var(--st-done-bg)"><i style="width:6px;height:6px;background:currentColor"></i></div>
+            <div class="n">1</div>
+            <div class="iconbtn reveal"><svg viewBox="0 0 16 16"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"/></svg></div>
+          </div>
+        </div>
+
+        <div class="sb-foot">
+          <div class="chips">
+            <span class="chip" style="color:var(--st-blocked);background:var(--st-blocked-bg)"><span class="cdot" style="background:var(--st-blocked)"></span>1 blocked</span>
+            <span class="chip" style="color:var(--st-error);background:var(--st-error-bg)"><span class="cdot" style="background:var(--st-error)"></span>1 error</span>
+            <span class="chip" style="color:var(--st-done);background:var(--st-done-bg)"><span class="cdot" style="background:var(--st-done)"></span>1 done</span>
+          </div>
+          <div class="counts">3 projects · 6 terminals</div>
+        </div>
+      </div>
+
+      <div class="gutter"></div>
+
+      <div class="terminal">
+        <div style="color:#8b949e">⏺ Read(src/status.rs)</div>
+        <div style="color:#8b949e">  ⎿  Read 1180 lines</div>
+        <div style="color:#8b949e">⏺ Edit(src/main.rs)</div>
+        <div style="color:#8b949e">  ⎿  Updated with 3 additions and 1 removal</div>
+        <div>&nbsp;</div>
+        <div>✻ Baking… <span style="color:#6e7681">(2m 14s · esc to interrupt)</span></div>
+        <div>&nbsp;</div>
+        <div style="color:#d0d7de">──────────────────────────────────────</div>
+        <div style="color:#d0d7de">❯ <span style="color:#6e7681">try the new sidebar layout</span></div>
+        <div style="color:#d0d7de">──────────────────────────────────────</div>
+        <div style="color:#6e7681">  ? for shortcuts</div>
+      </div>
+    </div>
+  </div>
+
+  <h2>Every state the poller can report</h2>
+  <div class="legend">
+    <div class="item"><span class="sdot" style="color:var(--st-active)"><i style="width:6px;height:6px;background:currentColor"></i></span><span class="pill" style="color:var(--st-active);background:var(--st-active-bg)">active</span><span class="desc">This is the terminal you are working in.</span></div>
+    <div class="item"><span class="sdot hollow" style="color:var(--st-idle)"><i style="width:6px;height:6px"></i></span><span class="pill" style="color:var(--st-idle);background:var(--st-idle-bg)">idle</span><span class="desc">Ready at the prompt, nothing running.</span></div>
+    <div class="item"><span class="sdot" style="color:var(--st-working)"><i style="width:6px;height:6px;background:currentColor"></i></span><span class="pill" style="color:var(--st-working);background:var(--st-working-bg)">working</span><span class="desc">A command or an AI agent is running.</span><span class="sticky">sticky after focus</span></div>
+    <div class="item"><span class="sdot" style="color:var(--st-stalled)"><i style="width:6px;height:6px;background:currentColor"></i></span><span class="pill" style="color:var(--st-stalled);background:var(--st-stalled-bg)">stalled</span><span class="desc">Still running, but nothing printed for a while.</span><span class="sticky">needs you</span></div>
+    <div class="item"><span class="sdot hollow" style="color:var(--st-waiting)"><i style="width:6px;height:6px"></i></span><span class="pill" style="color:var(--st-waiting);background:var(--st-waiting-bg)">waiting</span><span class="desc">An interactive program waits for keystrokes.</span></div>
+    <div class="item"><span class="sdot ringed" style="color:var(--st-blocked);background:var(--st-blocked-bg)"><i style="width:6px;height:6px;background:currentColor"></i></span><span class="pill" style="color:var(--st-blocked);background:var(--st-blocked-bg)">blocked</span><span class="desc">Waiting for you: an approval, a choice, input.</span><span class="sticky">needs you</span></div>
+    <div class="item"><span class="sdot ringed" style="color:var(--st-done);background:var(--st-done-bg)"><i style="width:6px;height:6px;background:currentColor"></i></span><span class="pill" style="color:var(--st-done);background:var(--st-done-bg)">done</span><span class="desc">Finished while you were looking elsewhere.</span><span class="sticky">clears on focus</span></div>
+    <div class="item"><span class="sdot ringed" style="color:var(--st-error);background:var(--st-error-bg)"><i style="width:6px;height:6px;background:currentColor"></i></span><span class="pill" style="color:var(--st-error);background:var(--st-error-bg)">error</span><span class="desc">The last command or the session failed.</span><span class="sticky">clears on focus</span></div>
+    <div class="item"><span class="sdot ringed" style="color:var(--st-killed);background:var(--st-killed-bg)"><i style="width:6px;height:6px;background:currentColor"></i></span><span class="pill" style="color:var(--st-killed);background:var(--st-killed-bg)">killed</span><span class="desc">The process was terminated by a signal.</span><span class="sticky">clears on focus</span></div>
+    <div class="item"><span class="sdot hollow" style="color:var(--st-exited)"><i style="width:6px;height:6px"></i></span><span class="pill" style="color:var(--st-exited);background:var(--st-exited-bg)">exited</span><span class="desc">The shell exited; this terminal is closed.</span><span class="sticky">stays until closed</span></div>
+  </div>
+</body>
+</html>

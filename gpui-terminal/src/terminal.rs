@@ -14,11 +14,25 @@ use alacritty_terminal::vi_mode::ViMotion;
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Upper bound on the number of highlighted matches we will collect for a
 /// single search, mirroring Zed's `MAX_SEARCH_LINES` style guard so a pathological
 /// regex over a 100k-line scrollback cannot stall a frame.
 pub const MAX_SEARCH_MATCHES: usize = 5_000;
+
+/// How long an `OSC 9;4` progress report stays valid.
+///
+/// Programs that speak the progress protocol re-send it while they work and
+/// clear it (`4;0`) when they finish, so this is only a guard: without it a
+/// program that dies mid-report would leave a stale "working" signal pinned
+/// for the status detector forever.
+pub const PROGRESS_TTL: Duration = Duration::from_secs(45);
+
+/// Longest `OSC 9;4` payload copied out of the byte stream. Real reports are a
+/// handful of bytes (`1;-1`), so anything longer is a malformed sequence and
+/// dropping it is cheaper than carrying it around.
+const MAX_PROGRESS_PAYLOAD: usize = 32;
 
 /// Dimensions handed to `Term::new` / `Term::resize`.
 ///
@@ -74,6 +88,12 @@ pub struct TerminalState {
     config: Config,
     /// Kept so protocol passthroughs (XTGETTCAP) can reply into the PTY.
     notifier: TerminalNotifierHandle,
+    /// Last `OSC 9;4` progress report and when it arrived.
+    ///
+    /// Agent CLIs announce their turn state this way and herdr's rule packs
+    /// read it through their `osc_progress` region, so it is snooped out of the
+    /// raw byte stream — alacritty's ANSI handler ignores unknown OSC strings.
+    progress: Option<(String, Instant)>,
 }
 
 impl TerminalState {
@@ -104,6 +124,7 @@ impl TerminalState {
             rows: dimensions.screen_lines(),
             config,
             notifier,
+            progress: None,
         }
     }
 
@@ -127,8 +148,23 @@ impl TerminalState {
 
     pub fn process_bytes(&mut self, bytes: &[u8]) {
         self.answer_xtgettcap(bytes);
+        self.capture_progress(bytes);
         let mut term = self.term.lock();
         self.parser.advance(&mut *term, bytes);
+    }
+
+    /// The most recent `OSC 9;4` progress report, still within
+    /// [`PROGRESS_TTL`], as the payload that follows `OSC 9;`: for
+    /// `ESC ] 9 ; 4 ; 1 ; 50 ST` this is `4;1;50`.
+    ///
+    /// That is exactly the shape the `osc_progress` region of the agent rule
+    /// packs matches against (`4;0` cleared/idle, `4;1` in progress, `4;3`
+    /// indeterminate — which several CLIs use to mean "waiting on a human").
+    pub fn progress(&self) -> Option<&str> {
+        match &self.progress {
+            Some((payload, at)) if at.elapsed() < PROGRESS_TTL => Some(payload.as_str()),
+            _ => None,
+        }
     }
 
     /// Answer XTGETTCAP queries (`DCS + q <hex-encoded caps> ST`).
@@ -181,6 +217,54 @@ impl TerminalState {
 
         let mut term = self.term.lock();
         term.resize(dimensions);
+    }
+
+    /// Snoop `OSC 9 ; 4 ; <state> [; <progress>]` reports out of the byte
+    /// stream.
+    ///
+    /// alacritty's ANSI handler has no arm for OSC 9, so the sequence never
+    /// reaches the grid and never reaches the embedder. Reading it here keeps
+    /// the whole feature (and its TTL) inside the emulator, where the bytes
+    /// are already in hand: the status poller only ever asks for [`Self::progress`].
+    ///
+    /// Only reports fully contained in `bytes` are captured — a sequence split
+    /// across two PTY reads is dropped rather than stitched, which is safe
+    /// because its TTL only ever *removes* a hint and the screen-based rules
+    /// still decide the badge.
+    fn capture_progress(&mut self, bytes: &[u8]) {
+        // Every report starts with ESC; plain output never contains one.
+        if !bytes.contains(&0x1b) {
+            return;
+        }
+        const OSC_9_4: &[u8] = b"\x1b]9;4;";
+        const ST: &[u8] = b"\x1b\\";
+        const BEL: u8 = 0x07;
+
+        let mut search_from = 0;
+        while let Some(rel) = find_subslice(&bytes[search_from..], OSC_9_4) {
+            let start = search_from + rel + OSC_9_4.len();
+            // Terminated by ST or BEL; whichever comes first ends the payload.
+            let end = match (
+                find_subslice(&bytes[start..], ST),
+                bytes[start..].iter().position(|&b| b == BEL),
+            ) {
+                (Some(st), Some(bel)) => Some(st.min(bel)),
+                (Some(st), None) => Some(st),
+                (None, Some(bel)) => Some(bel),
+                (None, None) => None,
+            };
+            // An unterminated report cannot be captured from this read.
+            let Some(end) = end else {
+                break;
+            };
+            if end > 0 && end <= MAX_PROGRESS_PAYLOAD {
+                let payload = String::from_utf8_lossy(&bytes[start..start + end]);
+                // Keep the leading `4;` the rule packs' `osc_progress` region
+                // expects: `4;1;-1`, `4;3`, `4;0`, …
+                self.progress = Some((format!("4;{payload}"), Instant::now()));
+            }
+            search_from = start + end;
+        }
     }
 
     /// Update the cached dimensions after the grid was resized directly through
@@ -667,5 +751,49 @@ mod tests {
         let mut terminal = state(40, 6);
         terminal.process_bytes(b"hello world\r\n");
         assert_eq!(terminal.line_text(Line(0)), "hello world");
+    }
+
+    #[test]
+    fn test_osc_9_4_progress_is_captured_not_printed() {
+        let mut terminal = state(40, 6);
+        // Indeterminate progress, ST-terminated, exactly how Claude Code and
+        // Grok announce a running turn.
+        terminal.process_bytes(b"\x1b]9;4;1;-1\x1b\\");
+
+        assert_eq!(terminal.progress(), Some("4;1;-1"));
+        // The report must never reach the grid.
+        assert_eq!(terminal.line_text(Line(0)).trim(), "");
+    }
+
+    #[test]
+    fn test_osc_9_4_progress_bel_terminated_and_cleared() {
+        let mut terminal = state(40, 6);
+        terminal.process_bytes(b"\x1b]9;4;3\x07");
+        assert_eq!(terminal.progress(), Some("4;3"));
+
+        // The clear report is a report too: it is what turns "working" off.
+        terminal.process_bytes(b"\x1b]9;4;0\x1b\\");
+        assert_eq!(terminal.progress(), Some("4;0"));
+    }
+
+    #[test]
+    fn test_osc_9_4_progress_ignores_other_reports() {
+        let mut terminal = state(40, 6);
+        // A split write cannot be stitched, and other OSC 9 payloads are not
+        // progress reports.
+        terminal.process_bytes(b"\x1b]9;4;1;");
+        assert_eq!(terminal.progress(), None);
+        terminal.process_bytes(b"\x1b]9;hello\x1b\\");
+        assert_eq!(terminal.progress(), None);
+    }
+
+    #[test]
+    fn test_progress_survives_the_screen_being_written() {
+        let mut terminal = state(40, 6);
+        terminal.process_bytes(b"\x1b]9;4;1;42\x1b\\");
+        terminal.process_bytes(b"Compiling markup v0.1.0\r\n");
+
+        assert_eq!(terminal.progress(), Some("4;1;42"));
+        assert_eq!(terminal.line_text(Line(0)), "Compiling markup v0.1.0");
     }
 }
