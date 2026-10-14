@@ -80,6 +80,78 @@ pub struct Session {
 
 /// How long an unacknowledged Done badge lingers before it falls back to Idle.
 const DONE_LINGER: std::time::Duration = std::time::Duration::from_secs(30);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaneNode {
+    Leaf(usize),
+    Split {
+        axis: gpui::Axis,
+        left: Box<PaneNode>,
+        right: Box<PaneNode>,
+    },
+}
+
+impl PaneNode {
+    pub fn contains(&self, id: usize) -> bool {
+        match self {
+            PaneNode::Leaf(leaf_id) => *leaf_id == id,
+            PaneNode::Split { left, right, .. } => left.contains(id) || right.contains(id),
+        }
+    }
+
+    pub fn split(&mut self, target_id: usize, new_id: usize, axis: gpui::Axis) -> bool {
+        match self {
+            PaneNode::Leaf(id) => {
+                if *id == target_id {
+                    *self = PaneNode::Split {
+                        axis,
+                        left: Box::new(PaneNode::Leaf(target_id)),
+                        right: Box::new(PaneNode::Leaf(new_id)),
+                    };
+                    true
+                } else {
+                    false
+                }
+            }
+            PaneNode::Split { left, right, .. } => {
+                left.split(target_id, new_id, axis) || right.split(target_id, new_id, axis)
+            }
+        }
+    }
+
+    pub fn remove(self, target_id: usize) -> Option<PaneNode> {
+        match self {
+            PaneNode::Leaf(id) => {
+                if id == target_id {
+                    None
+                } else {
+                    Some(PaneNode::Leaf(id))
+                }
+            }
+            PaneNode::Split { axis, left, right } => {
+                let left = left.remove(target_id);
+                let right = right.remove(target_id);
+                match (left, right) {
+                    (Some(l), Some(r)) => Some(PaneNode::Split {
+                        axis,
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    }),
+                    (Some(l), None) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
+
+    pub fn first_leaf(&self) -> usize {
+        match self {
+            PaneNode::Leaf(id) => *id,
+            PaneNode::Split { left, .. } => left.first_leaf(),
+        }
+    }
+}
+
 pub struct Project {
     pub id: usize,
     /// Shared (cheap to clone) because the render pass copies it every frame.
@@ -87,6 +159,8 @@ pub struct Project {
     pub path: PathBuf,
     pub sessions: Vec<Session>,
     pub active_session_idx: usize,
+    pub pane_tree: Option<PaneNode>,
+    pub maximized_session_id: Option<usize>,
 }
 
 struct AppState {
@@ -567,14 +641,26 @@ impl AppState {
 
             let p_idx = self.active_project_idx;
             let pushed = if let Some(project) = self.active_project_mut() {
+                let target_id = project.sessions.get(project.active_session_idx).map(|s| s.id);
                 project.sessions.push(session);
                 project.active_session_idx = project.sessions.len() - 1;
+                if let Some(tree) = &mut project.pane_tree {
+                    if let Some(target) = target_id {
+                        tree.split(target, next_id, gpui::Axis::Horizontal);
+                    } else {
+                        *tree = PaneNode::Leaf(next_id);
+                    }
+                } else {
+                    project.pane_tree = Some(PaneNode::Leaf(next_id));
+                }
+                project.maximized_session_id = None;
                 Some(project.active_session_idx)
             } else {
                 None
             };
             if let Some(s_idx) = pushed {
                 self.session_index.insert(next_id, (p_idx, s_idx));
+                self.focused_session_id = Some(next_id);
                 cx.notify();
             }
         }
@@ -619,13 +705,359 @@ impl AppState {
                     path: folder,
                     sessions: vec![session],
                     active_session_idx: 0,
+                    pane_tree: Some(PaneNode::Leaf(next_id)),
+                    maximized_session_id: None,
                 };
 
                 self.projects.push(project);
                 self.active_project_idx = self.projects.len() - 1;
                 let p_idx = self.active_project_idx;
                 self.session_index.insert(next_id, (p_idx, 0));
+                self.focused_session_id = Some(next_id);
                 cx.notify();
+            }
+        }
+    }
+
+    fn rebuild_session_index(&mut self) {
+        self.session_index.clear();
+        for (p_idx, project) in self.projects.iter().enumerate() {
+            for (s_idx, session) in project.sessions.iter().enumerate() {
+                self.session_index.insert(session.id, (p_idx, s_idx));
+            }
+        }
+    }
+
+    fn split_session(
+        &mut self,
+        target_session_id: usize,
+        axis: gpui::Axis,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let self_weak = cx.entity().downgrade();
+        let next_id = self.next_id;
+        self.next_id += 1;
+
+        let p_idx = self
+            .session_index
+            .get(&target_session_id)
+            .map(|(p, _)| *p)
+            .unwrap_or(self.active_project_idx);
+
+        let dir = self.projects.get(p_idx).map(|p| p.path.clone());
+        if let Ok((terminal, pid)) = Self::spawn_terminal_view(
+            dir.as_ref(),
+            self.palette.clone(),
+            self_weak,
+            next_id,
+            cx,
+        ) {
+            terminal.read(cx).focus_handle().focus(window);
+            let session_count = self
+                .projects
+                .get(p_idx)
+                .map(|p| p.sessions.len())
+                .unwrap_or(0);
+            let title = SharedString::from(format!("terminal {}", session_count + 1));
+            let session = Session {
+                id: next_id,
+                title: title.clone(),
+                display_title: truncate_title(&title),
+                terminal,
+                status: SessionStatus::Idle,
+                pid,
+                screen_scratch: Vec::new(),
+                poll_cache: None,
+                ack_screen: None,
+                agent_active: false,
+                done_since: None,
+                logo: logos::default_logo(),
+            };
+
+            if let Some(project) = self.projects.get_mut(p_idx) {
+                project.sessions.push(session);
+                project.active_session_idx = project.sessions.len() - 1;
+                if let Some(tree) = &mut project.pane_tree {
+                    tree.split(target_session_id, next_id, axis);
+                } else {
+                    project.pane_tree = Some(PaneNode::Leaf(next_id));
+                }
+                project.maximized_session_id = None;
+            }
+            self.focused_session_id = Some(next_id);
+            self.rebuild_session_index();
+            cx.notify();
+        }
+    }
+
+    fn toggle_maximize_session(&mut self, session_id: usize, cx: &mut Context<Self>) {
+        let p_idx = self
+            .session_index
+            .get(&session_id)
+            .map(|(p, _)| *p)
+            .unwrap_or(self.active_project_idx);
+
+        if let Some(project) = self.projects.get_mut(p_idx) {
+            if project.maximized_session_id == Some(session_id) {
+                project.maximized_session_id = None;
+            } else {
+                project.maximized_session_id = Some(session_id);
+            }
+            cx.notify();
+        }
+    }
+
+    fn close_session(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let p_idx = self
+            .session_index
+            .get(&session_id)
+            .map(|(p, _)| *p)
+            .unwrap_or(self.active_project_idx);
+
+        let mut needs_new_session = false;
+        if let Some(project) = self.projects.get_mut(p_idx) {
+            if project.maximized_session_id == Some(session_id) {
+                project.maximized_session_id = None;
+            }
+            project.pane_tree = project.pane_tree.take().and_then(|t| t.remove(session_id));
+            project.sessions.retain(|s| s.id != session_id);
+
+            if let Some(tree) = &project.pane_tree {
+                let next_active = tree.first_leaf();
+                if let Some(pos) = project.sessions.iter().position(|s| s.id == next_active) {
+                    project.active_session_idx = pos;
+                    project.sessions[pos].terminal.read(cx).focus_handle().focus(window);
+                    self.focused_session_id = Some(next_active);
+                }
+            } else if project.sessions.is_empty() {
+                needs_new_session = true;
+            } else {
+                let first_id = project.sessions[0].id;
+                project.pane_tree = Some(PaneNode::Leaf(first_id));
+                project.active_session_idx = 0;
+                project.sessions[0].terminal.read(cx).focus_handle().focus(window);
+                self.focused_session_id = Some(first_id);
+            }
+        }
+
+        self.rebuild_session_index();
+
+        if needs_new_session {
+            self.create_new_session_for_active_project(window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn focus_session(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.focused_session_id = Some(session_id);
+        if let Some(&(p_idx, s_idx)) = self.session_index.get(&session_id) {
+            self.active_project_idx = p_idx;
+            if let Some(p) = self.projects.get_mut(p_idx) {
+                p.active_session_idx = s_idx;
+                if let Some(session) = p.sessions.get(s_idx) {
+                    session.terminal.read(cx).focus_handle().focus(window);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_terminal_pane(
+        &self,
+        session: &Session,
+        is_maximized: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let session_id = session.id;
+        let is_focused = self.focused_session_id == Some(session_id);
+
+        div()
+            .id(("terminal-pane", session_id))
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgba(0x0c0d12ff))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if is_focused {
+                rgba(0x38394eff)
+            } else {
+                rgba(0x22232cff)
+            })
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.focus_session(session_id, window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .h(px(28.0))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(8.0))
+                    .bg(rgba(0x0c0d12ff))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgba(0x656679ff))
+                            .child(session.display_title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .id(("split-v-btn", session_id))
+                                    .size(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|s| s.bg(rgba(0x23242cff)))
+                                    .child(
+                                        svg()
+                                            .path("icons/split-vertical.svg")
+                                            .size(px(13.0))
+                                            .text_color(rgba(0x8788a5ff))
+                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.split_session(session_id, gpui::Axis::Horizontal, window, cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(("split-h-btn", session_id))
+                                    .size(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|s| s.bg(rgba(0x23242cff)))
+                                    .child(
+                                        svg()
+                                            .path("icons/split-horizontal.svg")
+                                            .size(px(13.0))
+                                            .text_color(rgba(0x8788a5ff))
+                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.split_session(session_id, gpui::Axis::Vertical, window, cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(("maximize-btn", session_id))
+                                    .size(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|s| s.bg(rgba(0x23242cff)))
+                                    .child(
+                                        svg()
+                                            .path(if is_maximized {
+                                                "icons/pane-restore.svg"
+                                            } else {
+                                                "icons/pane-maximize.svg"
+                                            })
+                                            .size(px(13.0))
+                                            .text_color(rgba(0x8788a5ff))
+                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_maximize_session(session_id, cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(("close-btn", session_id))
+                                    .size(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|s| s.bg(rgba(0x23242cff)))
+                                    .child(
+                                        svg()
+                                            .path("icons/pane-close.svg")
+                                            .size(px(13.0))
+                                            .text_color(rgba(0x8788a5ff))
+                                            .hover(|s| s.text_color(rgba(0xf87171ff))),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.close_session(session_id, window, cx);
+                                        }),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(session.terminal.clone()),
+            )
+    }
+
+    fn render_pane_node(
+        &self,
+        node: &PaneNode,
+        project: &Project,
+        is_maximized: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match node {
+            PaneNode::Leaf(session_id) => {
+                if let Some(session) = project.sessions.iter().find(|s| s.id == *session_id) {
+                    self.render_terminal_pane(session, is_maximized, cx)
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }
+            }
+            PaneNode::Split { axis, left, right } => {
+                let left_el = self.render_pane_node(left, project, is_maximized, cx);
+                let right_el = self.render_pane_node(right, project, is_maximized, cx);
+                let is_horizontal = *axis == gpui::Axis::Horizontal;
+
+                div()
+                    .flex()
+                    .size_full()
+                    .when(is_horizontal, |this| this.flex_row())
+                    .when(!is_horizontal, |this| this.flex_col())
+                    .gap(px(4.0))
+                    .child(div().flex_1().size_full().overflow_hidden().child(left_el))
+                    .child(div().flex_1().size_full().overflow_hidden().child(right_el))
+                    .into_any_element()
             }
         }
     }
@@ -661,10 +1093,25 @@ impl Render for AppState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Track which session owns keyboard focus each frame; the poller uses
         // this for Active-state resolution and for clearing sticky Done/Error.
-        self.focused_session_id = self.active_session().and_then(|s| {
-            let focused = s.terminal.read(cx).focus_handle().is_focused(_window);
-            focused.then_some(s.id)
-        });
+        if let Some(project) = self.active_project() {
+            let mut focused_id = None;
+            let mut focused_idx = None;
+            for (idx, s) in project.sessions.iter().enumerate() {
+                if s.terminal.read(cx).focus_handle().is_focused(_window) {
+                    focused_id = Some(s.id);
+                    focused_idx = Some(idx);
+                    break;
+                }
+            }
+            if let (Some(id), Some(idx)) = (focused_id, focused_idx) {
+                self.focused_session_id = Some(id);
+                if let Some(p) = self.projects.get_mut(self.active_project_idx) {
+                    p.active_session_idx = idx;
+                }
+            } else if self.focused_session_id.is_none() {
+                self.focused_session_id = self.active_session().map(|s| s.id);
+            }
+        }
 
         let active_title = self
             .active_session()
@@ -676,8 +1123,25 @@ impl Render for AppState {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| SharedString::from("No Project"));
 
-        let active_session_view = self.active_session().map(|s| s.terminal.clone());
-
+        let terminal_area = if let Some(project) = self.active_project() {
+            if let Some(max_id) = project.maximized_session_id {
+                if let Some(session) = project.sessions.iter().find(|s| s.id == max_id) {
+                    self.render_terminal_pane(session, true, cx).into_any_element()
+                } else if let Some(tree) = &project.pane_tree {
+                    self.render_pane_node(tree, project, false, cx)
+                } else {
+                    div().into_any_element()
+                }
+            } else if let Some(tree) = &project.pane_tree {
+                self.render_pane_node(tree, project, false, cx)
+            } else if let Some(session) = self.active_session() {
+                self.render_terminal_pane(session, false, cx).into_any_element()
+            } else {
+                div().into_any_element()
+            }
+        } else {
+            div().into_any_element()
+        };
         // Focused terminal's status and logo, mirrored in the title bar.
         let titlebar_status = self.active_session().map(|s| s.status);
         let titlebar_logo = self.active_session().map(|s| s.logo.clone());
@@ -857,9 +1321,10 @@ impl Render for AppState {
                 div()
                     .flex_1()
                     .size_full()
-                    .bg(rgba(0x010409ff))
+                    .bg(rgba(0x14151bff))
                     .overflow_hidden()
-                    .children(active_session_view),
+                    .p(px(6.0))
+                    .child(terminal_area),
             );
 
         let sidebar_content = div()
@@ -1150,10 +1615,21 @@ impl Render for AppState {
                                                     this.active_project_idx = p_idx;
                                                     if let Some(p) = this.projects.get_mut(p_idx) {
                                                         p.active_session_idx = s_idx;
+                                                        let s_id = p.sessions[s_idx].id;
+                                                        if !p.pane_tree.as_ref().map_or(false, |t| t.contains(s_id)) {
+                                                            if let Some(tree) = &mut p.pane_tree {
+                                                                let active_id = tree.first_leaf();
+                                                                tree.split(active_id, s_id, gpui::Axis::Horizontal);
+                                                            } else {
+                                                                p.pane_tree = Some(PaneNode::Leaf(s_id));
+                                                            }
+                                                        }
+                                                        p.maximized_session_id = None;
                                                     }
                                                     if let Some(session) = this.active_session() {
                                                         session.terminal.read(cx).focus_handle().focus(window);
                                                     }
+                                                    this.focused_session_id = this.active_session().map(|s| s.id);
                                                     cx.notify();
                                                 }),
                                             )
@@ -1412,6 +1888,8 @@ fn main() -> Result<()> {
                             path: current_dir_clone,
                             sessions: vec![initial_session],
                             active_session_idx: 0,
+                            pane_tree: Some(PaneNode::Leaf(1)),
+                            maximized_session_id: None,
                         };
 
                         AppState {
@@ -1542,6 +2020,8 @@ mod resize_tests {
                     logo: logos::default_logo(),
                 }],
                 active_session_idx: 0,
+                pane_tree: Some(PaneNode::Leaf(1)),
+                maximized_session_id: None,
             }],
             active_project_idx: 0,
             next_id: 2,
@@ -1555,7 +2035,7 @@ mod resize_tests {
     }
 
     /// Open the app the way `main` does and return a context that can draw it.
-    fn open_app(cx: &mut TestAppContext) -> (VisualTestContext, Entity<AppState>) {
+    pub(crate) fn open_app(cx: &mut TestAppContext) -> (VisualTestContext, Entity<AppState>) {
         cx.update(|cx| {
             gpui_component::init(cx);
             gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
@@ -1802,5 +2282,95 @@ mod xtgettcap_tests {
             "query text leaked into the grid: {screen:?}"
         );
         assert!(!capture.0.lock().is_empty(), "the query should have been answered");
+    }
+}
+
+#[cfg(test)]
+mod pane_tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualContext};
+    use resize_tests::open_app;
+    #[test]
+    fn pane_node_split_and_contains() {
+        let mut tree = PaneNode::Leaf(1);
+        assert!(tree.contains(1));
+        assert!(!tree.contains(2));
+        assert_eq!(tree.first_leaf(), 1);
+
+        assert!(tree.split(1, 2, gpui::Axis::Horizontal));
+        assert!(tree.contains(1));
+        assert!(tree.contains(2));
+        assert!(!tree.contains(3));
+
+        assert!(tree.split(2, 3, gpui::Axis::Vertical));
+        assert!(tree.contains(3));
+        assert_eq!(tree.first_leaf(), 1);
+    }
+
+    #[test]
+    fn pane_node_remove_collapses_tree() {
+        let mut tree = PaneNode::Leaf(1);
+        tree.split(1, 2, gpui::Axis::Horizontal);
+        tree.split(2, 3, gpui::Axis::Vertical);
+
+        // Remove 2: the vertical split (2, 3) should collapse to 3
+        let tree = tree.remove(2).expect("tree remains");
+        assert!(tree.contains(1));
+        assert!(!tree.contains(2));
+        assert!(tree.contains(3));
+
+        // Remove 3: the horizontal split (1, 3) should collapse to 1
+        let tree = tree.remove(3).expect("tree remains");
+        assert_eq!(tree, PaneNode::Leaf(1));
+
+        // Remove 1: tree becomes None
+        assert!(tree.remove(1).is_none());
+    }
+
+    #[test]
+    fn visual_split_maximize_close_flow() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame");
+
+        // Split vertical
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.split_session(1, gpui::Axis::Horizontal, window, cx);
+        });
+        cx.draw_frame().expect("frame after vertical split");
+
+        let session_count = app_state.read_with(&cx, |state, _| {
+            state.active_project().unwrap().sessions.len()
+        });
+        assert_eq!(session_count, 2);
+
+        // Toggle maximize
+        app_state.update(&mut cx, |state, cx| {
+            state.toggle_maximize_session(2, cx);
+        });
+        cx.draw_frame().expect("frame while maximized");
+
+        let is_max = app_state.read_with(&cx, |state, _| {
+            state.active_project().unwrap().maximized_session_id
+        });
+        assert_eq!(is_max, Some(2));
+
+        // Restore
+        app_state.update(&mut cx, |state, cx| {
+            state.toggle_maximize_session(2, cx);
+        });
+        cx.draw_frame().expect("frame restored");
+
+        // Close pane 2
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.close_session(2, window, cx);
+        });
+        cx.draw_frame().expect("frame after close");
+
+        let session_count_after = app_state.read_with(&cx, |state, _| {
+            state.active_project().unwrap().sessions.len()
+        });
+        assert_eq!(session_count_after, 1);
     }
 }

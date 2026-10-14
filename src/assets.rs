@@ -89,5 +89,10 @@ mod tests {
         assert!(assets.load("window-minimize.svg").unwrap().is_some());
         assert!(assets.load("window-maximize.svg").unwrap().is_some());
         assert!(assets.load("window-restore.svg").unwrap().is_some());
+        assert!(assets.load("icons/split-vertical.svg").unwrap().is_some());
+        assert!(assets.load("icons/split-horizontal.svg").unwrap().is_some());
+        assert!(assets.load("icons/pane-maximize.svg").unwrap().is_some());
+        assert!(assets.load("icons/pane-restore.svg").unwrap().is_some());
+        assert!(assets.load("icons/pane-close.svg").unwrap().is_some());
     }
 }
