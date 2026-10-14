@@ -1025,18 +1025,27 @@ impl Render for AppState {
                                     .gap(px(4.0))
                                     .children(project.sessions.iter().enumerate().map(|(s_idx, session)| {
                                         let is_active_session = is_active_project && s_idx == project.active_session_idx;
+                                        let (dot_color, text_color, badge_bg) = session.status.colors();
+                                        let display_status = match session.status {
+                                            SessionStatus::Active => "Active",
+                                            SessionStatus::Idle => "Idle",
+                                            SessionStatus::Working => "Working",
+                                            SessionStatus::Blocked => "Blocked",
+                                            SessionStatus::Error => "Error",
+                                            SessionStatus::Done => "Done",
+                                        };
                                         div()
                                             .id(("session-item", session.id))
                                             .h(px(36.0))
-                                            .px(px(12.0))
+                                            .px(px(10.0))
                                             .rounded_full()
                                             .cursor(CursorStyle::PointingHand)
                                             .flex()
                                             .items_center()
                                             .justify_between()
-                                            .gap(px(10.0))
+                                            .gap(px(8.0))
                                             .bg(if is_active_session {
-                                                 rgba(0x26272fff)
+                                                rgba(0x26272fff)
                                             } else {
                                                 rgba(0x00000000)
                                             })
@@ -1061,9 +1070,10 @@ impl Render for AppState {
                                                     .min_w_0()
                                                     .flex_1()
                                                     .child(
-                                                        // AI Agent / Command logo
+                                                        // AI Agent / Command logo with status indicator
                                                         div()
-                                                            .size(px(18.0))
+                                                            .relative()
+                                                            .size(px(20.0))
                                                             .flex()
                                                             .items_center()
                                                             .justify_center()
@@ -1071,7 +1081,22 @@ impl Render for AppState {
                                                             .child(
                                                                 gpui::img(session.logo.clone())
                                                                     .size(px(18.0))
-                                                                    .rounded(px(3.0)),
+                                                                    .rounded(px(3.5)),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .absolute()
+                                                                    .bottom(-px(1.0))
+                                                                    .right(-px(1.0))
+                                                                    .size(px(7.0))
+                                                                    .rounded_full()
+                                                                    .bg(rgba(dot_color))
+                                                                    .border_1()
+                                                                    .border_color(if is_active_session {
+                                                                        rgba(0x26272fff)
+                                                                    } else {
+                                                                        rgba(0x1b1c22ff)
+                                                                    }),
                                                             ),
                                                     )
                                                     .child(
@@ -1093,18 +1118,32 @@ impl Render for AppState {
                                                             .child(session.display_title.clone()),
                                                     ),
                                             )
-                                            .children((!matches!(session.status, SessionStatus::Idle | SessionStatus::Active)).then(|| {
-                                                let (_, text_color, badge_bg) = session.status.colors();
+                                            .child(
                                                 div()
                                                     .flex_shrink_0()
-                                                    .text_size(px(10.5))
-                                                    .px_1p5()
-                                                    .py_0p5()
-                                                    .rounded_sm()
+                                                    .h(px(19.0))
+                                                    .px(px(7.0))
+                                                    .rounded_full()
                                                     .bg(rgba(badge_bg))
-                                                    .text_color(rgba(text_color))
-                                                    .child(session.status.label())
-                                            }))
+                                                    .border_1()
+                                                    .border_color(rgba((dot_color & 0xffffff00) | 0x33))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(5.0))
+                                                    .child(
+                                                        div()
+                                                            .size(px(5.0))
+                                                            .rounded_full()
+                                                            .bg(rgba(dot_color)),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.5))
+                                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                                            .text_color(rgba(text_color))
+                                                            .child(display_status),
+                                                    ),
+                                            )
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, _, window, cx| {
