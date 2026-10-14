@@ -20,6 +20,9 @@ libc = "0.2"
 regex = "1"
 toml = "1"
 
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+
 [patch.crates-io]
 gpui = { path = "components/gpui" }
 gpui-component = { path = "components" }

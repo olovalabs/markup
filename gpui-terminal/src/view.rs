@@ -152,9 +152,12 @@ pub struct TerminalView {
     window_size: Arc<parking_lot::Mutex<PtyWindowSize>>,
     /// Shared with the event proxy so `OSC 4/10/11/12` can be answered.
     palette_handle: Arc<parking_lot::Mutex<ColorPalette>>,
-    /// Grid size computed by the last paint pass.
-    measured_grid: Arc<parking_lot::Mutex<(usize, usize)>>,
+    /// Bounds of the last paint, in window coordinates.
     last_bounds: Arc<parking_lot::Mutex<Bounds<Pixels>>>,
+    /// Grid size seen by the last render. The paint pass resizes the grid, so
+    /// comparing this against the live size is how a render notices that the
+    /// grid moved under it (search matches are stored in grid coordinates).
+    last_grid_size: (usize, usize),
 
     resize_callback: Option<Arc<ResizeCallback>>,
     key_handler: Option<Arc<KeyHandler>>,
@@ -321,8 +324,8 @@ impl TerminalView {
             drag_scroll_task: None,
             window_size,
             palette_handle,
-            measured_grid: Arc::new(parking_lot::Mutex::new((0, 0))),
             last_bounds: Arc::new(parking_lot::Mutex::new(Bounds::default())),
+            last_grid_size: (0, 0),
             resize_callback: None,
             key_handler: None,
             bell_callback: None,
@@ -1474,8 +1477,10 @@ impl TerminalView {
     // Accessors / configuration
     // -----------------------------------------------------------------------
 
+    /// Live grid size, in cells. Read from the grid rather than tracked here,
+    /// because the paint pass resizes the grid and a copy would lag it.
     pub fn dimensions(&self) -> (usize, usize) {
-        (self.state.cols(), self.state.rows())
+        self.state.dimensions()
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -1591,18 +1596,16 @@ impl Render for TerminalView {
             self.cell_metrics_valid = true;
         }
 
-        // Adopt the grid size the previous paint pass computed.
-        let (measured_cols, measured_rows) = *self.measured_grid.lock();
-        if measured_cols > 0 && (measured_cols, measured_rows) != self.dimensions() {
-            self.state.sync_dimensions(measured_cols, measured_rows);
-            self.sync_window_size();
+        // Search matches are stored in grid coordinates, so a grid resize
+        // invalidates them. The resize itself happens in the paint pass, which
+        // makes this the only place that can notice it: compare the live grid
+        // against the size the last render saw.
+        let grid_size = self.dimensions();
+        if grid_size != self.last_grid_size {
+            self.last_grid_size = grid_size;
             if self.search.is_active() {
                 self.search.refresh(&self.state);
             }
-            // The paint pass resized the grid behind our back; schedule one more
-            // frame so hit-testing and geometry agree with what is on screen.
-            // This converges immediately: next frame the sizes already match.
-            cx.notify();
         }
 
         let is_focused = self.focus_handle.is_focused(window);
@@ -1618,7 +1621,6 @@ impl Render for TerminalView {
         let resize_callback = self.resize_callback.clone();
         let padding = self.config.padding;
         let last_bounds = self.last_bounds.clone();
-        let measured_grid = self.measured_grid.clone();
         let window_size = self.window_size.clone();
 
         let selection: Option<SelectionRange> = self.state.selection_range();
@@ -1676,7 +1678,6 @@ impl Render for TerminalView {
                         let current_rows = term.screen_lines();
                         if cols != current_cols || rows != current_rows {
                             term.resize(crate::terminal::TermDimensions::new(cols, rows));
-                            *measured_grid.lock() = (cols, rows);
                             *window_size.lock() = PtyWindowSize {
                                 num_lines: rows as u16,
                                 num_cols: cols as u16,
@@ -1685,11 +1686,6 @@ impl Render for TerminalView {
                             };
                             if let Some(ref callback) = resize_callback {
                                 callback(cols, rows);
-                            }
-                        } else {
-                            let mut measured = measured_grid.lock();
-                            if *measured != (cols, rows) {
-                                *measured = (cols, rows);
                             }
                         }
 

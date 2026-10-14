@@ -66,11 +66,17 @@ impl Dimensions for TermDimensions {
     }
 }
 
+/// Owner of the live grid.
+///
+/// The grid is the **single source of truth** for the terminal's size: the
+/// paint pass resizes it directly through [`TerminalState::term_arc`], so any
+/// size kept here would be stale for part of every resize. Callers that need
+/// the size ask the grid ([`TerminalState::cols`], [`TerminalState::rows`],
+/// [`TerminalState::dimensions`]), which is what keeps them from addressing
+/// rows and columns that no longer exist.
 pub struct TerminalState {
     term: Arc<Mutex<Term<GpuiEventProxy>>>,
     parser: Processor,
-    cols: usize,
-    rows: usize,
     config: Config,
     /// Kept so protocol passthroughs (XTGETTCAP) can reply into the PTY.
     notifier: TerminalNotifierHandle,
@@ -100,8 +106,6 @@ impl TerminalState {
         Self {
             term: Arc::new(Mutex::new(term)),
             parser: Processor::new(),
-            cols: dimensions.columns(),
-            rows: dimensions.screen_lines(),
             config,
             notifier,
         }
@@ -175,20 +179,7 @@ impl TerminalState {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
-        let dimensions = TermDimensions::new(cols, rows);
-        self.cols = dimensions.columns();
-        self.rows = dimensions.screen_lines();
-
-        let mut term = self.term.lock();
-        term.resize(dimensions);
-    }
-
-    /// Update the cached dimensions after the grid was resized directly through
-    /// [`Self::term_arc`] (which is what the paint pass does, so the very first
-    /// frame is already laid out at the right size).
-    pub fn sync_dimensions(&mut self, cols: usize, rows: usize) {
-        self.cols = cols;
-        self.rows = rows;
+        self.term.lock().resize(TermDimensions::new(cols, rows));
     }
 
     /// Apply a new alacritty config (scrollback size, semantic escape chars, …)
@@ -226,12 +217,25 @@ impl TerminalState {
         f(&mut term)
     }
 
+    /// Grid width, read from the grid itself.
     pub fn cols(&self) -> usize {
-        self.cols
+        self.term.lock().columns()
     }
 
+    /// Grid height, read from the grid itself.
+    ///
+    /// Never cache this. The paint pass resizes the grid straight through
+    /// [`Self::term_arc`], so a copy of the size kept anywhere else is a frame
+    /// behind during a resize — and rows that were resized away are *scrollback*
+    /// to alacritty, which panics when asked for a line past the buffer.
     pub fn rows(&self) -> usize {
-        self.rows
+        self.term.lock().screen_lines()
+    }
+
+    /// Grid size as one atomic pair, for callers that need both halves to
+    /// describe the same grid.
+    pub fn dimensions(&self) -> (usize, usize) {
+        self.with_term(|term| (term.columns(), term.screen_lines()))
     }
 
     pub fn term_arc(&self) -> Arc<Mutex<Term<GpuiEventProxy>>> {
@@ -434,7 +438,12 @@ impl TerminalState {
     /// extracted (and trimmed in place: one allocation per line, not two).
     pub fn bottom_lines_into(&self, n: usize, out: &mut Vec<String>) {
         let term = self.term.lock();
-        let screen_lines = self.rows;
+        // The row count is read from the same grid the rows are read from, under
+        // one lock. A cached count can be larger than the grid — the paint pass
+        // shrinks it mid-frame, and this runs from the status poller between
+        // frames — and asking the grid for a row past its buffer aborts the
+        // process inside alacritty's line indexing.
+        let screen_lines = term.screen_lines();
         let last_col = term.last_column();
         let count = n.min(screen_lines);
         let start_row = screen_lines.saturating_sub(count);
@@ -546,6 +555,27 @@ mod tests {
             assert_eq!(term.grid().columns(), 120);
             assert_eq!(term.grid().screen_lines(), 30);
         });
+    }
+
+    /// The paint pass resizes the grid straight through `term_arc`, so for the
+    /// rest of that frame the grid can be smaller than the size this state last
+    /// recorded. A scrape in that window must not ask the grid for rows that no
+    /// longer exist: alacritty indexes lines that are below the visible screen
+    /// as scrollback, and a line past the end of the buffer panics.
+    #[test]
+    fn scrape_survives_a_grid_resized_behind_its_back() {
+        let terminal = state(80, 24);
+        terminal
+            .term_arc()
+            .lock()
+            .resize(TermDimensions::new(40, 10));
+
+        let lines = terminal.bottom_lines(usize::MAX);
+        assert_eq!(lines.len(), 10);
+
+        let mut into = Vec::new();
+        terminal.bottom_lines_into(usize::MAX, &mut into);
+        assert_eq!(into.len(), 10);
     }
 
     #[test]

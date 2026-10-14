@@ -1441,6 +1441,52 @@ fn main() -> Result<()> {
                     })
                     .detach();
 
+                    // TEMPORARY DIAGNOSTIC: MARKUP_RESIZE_PROBE=<rounds> drags
+                    // the window edge in small steps, the way a real resize
+                    // does, while the status poller keeps ticking.
+                    if let Some(probe) = std::env::var_os("MARKUP_RESIZE_PROBE") {
+                        let rounds: usize = probe.to_string_lossy().parse().unwrap_or(10);
+                        let handle = window.window_handle();
+                        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                            let (mut w, mut h) = (1200.0f32, 780.0f32);
+                            for _ in 0..rounds {
+                                for _ in 0..60 {
+                                    w = (w - 12.0).max(360.0);
+                                    h = (h - 8.0).max(240.0);
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(16))
+                                        .await;
+                                    if handle
+                                        .update(cx, |_, window, _| {
+                                            window.resize(size(px(w), px(h)));
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                for _ in 0..60 {
+                                    w = (w + 12.0).min(1200.0);
+                                    h = (h + 8.0).min(780.0);
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(16))
+                                        .await;
+                                    if handle
+                                        .update(cx, |_, window, _| {
+                                            window.resize(size(px(w), px(h)));
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            eprintln!("[probe] {rounds} drag rounds finished without a panic");
+                            let _ = cx.update(|cx| cx.quit());
+                        })
+                        .detach();
+                    }
+
                     cx.new(|cx| Root::new(app_state, window, cx))
                 },
             )
@@ -1450,6 +1496,210 @@ fn main() -> Result<()> {
         });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod resize_tests {
+    //! Window-resize regression tests.
+    //!
+    //! A resize is the one event that re-lays-out everything at once: the
+    //! resizable sidebar panels, the terminal grid (cols/rows recomputed from
+    //! the new bounds) and the client-drawn title bar. These tests drive the
+    //! real view through the same window options `main` uses and draw a frame
+    //! after every resize step.
+
+    use super::*;
+    use gpui::{point, size, Modifiers, TestAppContext, VisualTestContext};
+    use std::ops::Deref as _;
+
+    /// One project with one live session, built exactly like `main` does.
+    fn build_app_state(cx: &mut Context<AppState>) -> AppState {
+        let palette = ColorPalette::default();
+        let dir = std::env::current_dir().expect("current dir");
+        let weak = cx.entity().downgrade();
+        let (terminal, pid) =
+            AppState::spawn_terminal_view(Some(&dir), palette.clone(), weak, 1, cx)
+                .expect("terminal view");
+        let title = SharedString::from("terminal 1");
+
+        AppState {
+            projects: vec![Project {
+                id: 1,
+                name: SharedString::from("markup"),
+                path: dir,
+                sessions: vec![Session {
+                    id: 1,
+                    title: title.clone(),
+                    display_title: title,
+                    terminal,
+                    status: SessionStatus::Idle,
+                    pid,
+                    screen_scratch: Vec::new(),
+                    poll_cache: None,
+                    ack_screen: None,
+                    agent_active: false,
+                    done_since: None,
+                    logo: logos::default_logo(),
+                }],
+                active_session_idx: 0,
+            }],
+            active_project_idx: 0,
+            next_id: 2,
+            session_index: HashMap::from([(1, (0, 0))]),
+            palette,
+            focused_session_id: None,
+            sidebar_visible: true,
+            sidebar_width: px(330.0),
+            drag_start_pos: None,
+        }
+    }
+
+    /// Open the app the way `main` does and return a context that can draw it.
+    fn open_app(cx: &mut TestAppContext) -> (VisualTestContext, Entity<AppState>) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+            load_embedded_fonts(cx);
+            sync_component_fonts(cx);
+        });
+
+        let state = cx.new(build_app_state);
+        let handle = cx
+            .update(|cx: &mut App| {
+                let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
+                cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        titlebar: Some(TitleBar::title_bar_options()),
+                        window_decorations: Some(WindowDecorations::Client),
+                        app_id: Some("t3code-terminal".to_string()),
+                        ..Default::default()
+                    },
+                    |window, cx| cx.new(|cx| Root::new(state.clone(), window, cx)),
+                )
+            })
+            .expect("open window");
+
+        let cx = VisualTestContext::from_window(*handle.deref(), cx);
+        cx.run_until_parked();
+        (cx, state)
+    }
+
+    #[test]
+    fn window_resizes_without_panicking() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        let terminal = app_state.read_with(&cx, |state, _| {
+            state.active_session().expect("a session").terminal.clone()
+        });
+
+        let mut grid_sizes = Vec::new();
+        for window_size in [
+            size(px(1100.), px(700.)),
+            size(px(900.), px(600.)),
+            size(px(700.), px(500.)),
+            size(px(520.), px(400.)),
+            size(px(380.), px(300.)),
+            size(px(280.), px(220.)),
+            size(px(200.), px(160.)),
+            size(px(1200.), px(780.)),
+        ] {
+            cx.simulate_resize(window_size);
+            cx.run_until_parked();
+            cx.draw_frame().expect("a frame at the new size");
+
+            // The grid has to track the window, and every scrape has to come
+            // back with exactly the rows the grid has: a scrape that names rows
+            // the grid resized away is what aborted the process on a drag.
+            let (cols, rows) = terminal.read_with(&cx, |view, _| view.dimensions());
+            assert!(cols >= 2 && rows >= 1, "grid collapsed to {cols}x{rows}");
+            let scraped = terminal.read_with(&cx, |view, _| view.bottom_lines(usize::MAX));
+            assert_eq!(scraped.len(), rows, "scrape out of step with the grid");
+            grid_sizes.push((cols, rows));
+        }
+
+        // ...and the grid really did follow the window, rather than both sides
+        // agreeing on a size nobody updated.
+        let (big_cols, big_rows) = grid_sizes[0];
+        let (small_cols, small_rows) = grid_sizes[6];
+        assert!(
+            small_rows < big_rows && small_cols < big_cols,
+            "grid did not follow the window: {small_cols}x{small_rows} at 200x160, \
+             {big_cols}x{big_rows} at 1100x700"
+        );
+    }
+
+    /// The status poller runs between frames, so it can tick after the paint
+    /// pass has already shrunk the terminal grid but before the next render
+    /// syncs the cached row count. Scraping the screen in that window asks the
+    /// grid for rows that no longer exist.
+    #[test]
+    fn status_poll_between_resize_frames_does_not_panic() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        // A frame at the large size: the grid is laid out big while the cached
+        // row count still holds the size from the previous frame.
+        cx.draw_frame().expect("a frame at the opening size");
+
+        // Shrink the window and draw one frame: the render syncs the cached
+        // dims to the large grid, then the paint shrinks the grid.
+        cx.simulate_resize(size(px(560.), px(320.)));
+        cx.run_until_parked();
+        cx.draw_frame().expect("a frame at the smaller size");
+
+        // The poller's ticks are what a user sees as a crash while dragging.
+        app_state.update(&mut cx, |state, cx| state.poll_sessions_status(cx));
+        app_state.update(&mut cx, |state, cx| state.poll_sessions_status(cx));
+    }
+
+    /// The sidebar is resized by dragging its handle. That path runs its own
+    /// arithmetic over the panels' sizes, so dragging it past both the min and
+    /// the max has to stay panic-free.
+    #[test]
+    fn dragging_the_sidebar_handle_does_not_panic() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, _) = open_app(&mut cx);
+        cx.draw_frame().expect("a frame at the opening size");
+
+        let y = px(400.0);
+        let grab = point(px(327.5), y);
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        for dx in [-400.0, -50.0, 0.0, 60.0, 200.0, 400.0, -800.0, 30.0] {
+            cx.simulate_mouse_move(
+                point(px(327.5 + dx), y),
+                Some(MouseButton::Left),
+                Modifiers::none(),
+            );
+            let _ = cx.draw_frame();
+        }
+        cx.simulate_mouse_up(grab, MouseButton::Left, Modifiers::none());
+        let _ = cx.draw_frame();
+    }
+
+    #[test]
+    fn sidebar_toggle_and_resize_without_panicking() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        for visible in [false, true, false, true] {
+            app_state.update(&mut cx, |state, cx| {
+                state.sidebar_visible = visible;
+                cx.notify();
+            });
+
+            cx.simulate_resize(size(px(640.), px(480.)));
+            cx.run_until_parked();
+            cx.draw_frame().expect("a frame after toggling");
+            cx.simulate_resize(size(px(1200.), px(780.)));
+            cx.run_until_parked();
+            cx.draw_frame().expect("a frame after toggling");
+        }
+    }
 }
 
 #[cfg(test)]
