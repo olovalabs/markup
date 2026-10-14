@@ -72,3 +72,22 @@ pub fn sync_component_fonts(cx: &mut App) {
     theme.mono_font_family = MONO_FONT.into();
     theme.mono_font_size = px(13.5);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::AssetSource;
+
+    #[test]
+    fn loads_sidebar_icons() {
+        let assets = CombinedAssets;
+        assert!(assets.load("icons/panel-left.svg").unwrap().is_some());
+        assert!(assets.load("icons/eye.svg").unwrap().is_some());
+        assert!(assets.load("icons/command.svg").unwrap().is_some());
+        assert!(assets.load("icons/plus.svg").unwrap().is_some());
+        assert!(assets.load("window-close.svg").unwrap().is_some());
+        assert!(assets.load("window-minimize.svg").unwrap().is_some());
+        assert!(assets.load("window-maximize.svg").unwrap().is_some());
+        assert!(assets.load("window-restore.svg").unwrap().is_some());
+    }
+}

@@ -7,8 +7,9 @@ use gpui::{
     px, size, App, AppContext, Application, Bounds, Context, CursorStyle, Edges, Entity,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
     SharedString, Styled, Window, WindowBounds, WindowDecorations,
-    WindowOptions, div, rgba, svg,
+    WindowOptions, div, rgba, svg, MouseDownEvent, MouseMoveEvent, Pixels, Point, WindowControlArea,
 };
+use gpui::prelude::FluentBuilder as _;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Root, TitleBar};
@@ -98,9 +99,50 @@ struct AppState {
     /// Session that currently owns keyboard focus, tracked every render frame
     /// and consumed by the status poller (Active state, sticky-state clearing).
     focused_session_id: Option<usize>,
+    pub sidebar_visible: bool,
+    pub sidebar_width: Pixels,
+    drag_start_pos: Option<Point<Pixels>>,
 }
 
 impl AppState {
+    fn make_drag_area(&self, cx: &Context<Self>) -> gpui::Div {
+        div()
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, window, _| {
+                    if ev.click_count == 2 {
+                        this.drag_start_pos = None;
+                        window.zoom_window();
+                    } else {
+                        this.drag_start_pos = Some(ev.position);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.drag_start_pos = None;
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this, ev: &MouseMoveEvent, window, _| {
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        this.drag_start_pos = None;
+                        return;
+                    }
+                    if let Some(start_pos) = this.drag_start_pos {
+                        let dx = (ev.position.x - start_pos.x).to_f64();
+                        let dy = (ev.position.y - start_pos.y).to_f64();
+                        if dx * dx + dy * dy >= 64.0 {
+                            this.drag_start_pos = None;
+                            window.start_window_move();
+                        }
+                    }
+                }),
+            )
+    }
+
     fn active_project(&self) -> Option<&Project> {
         self.projects.get(self.active_project_idx)
     }
@@ -640,295 +682,467 @@ impl Render for AppState {
         let titlebar_status = self.active_session().map(|s| s.status);
         let titlebar_logo = self.active_session().map(|s| s.logo.clone());
 
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(rgba(0x0f1115ff))
-            .text_color(rgba(0xe6edf3ff))
-            .on_key_down(cx.listener(Self::on_key_down))
-            .child(
-                TitleBar::new().child(
+        let is_maximized = _window.is_maximized();
+        let is_fullscreen = _window.is_fullscreen();
+        let controls = _window.window_controls();
+
+        let default_window_controls = (!is_fullscreen).then(|| {
+            div()
+                .id("default-window-controls")
+                .flex()
+                .items_center()
+                .h_full()
+                .when(controls.minimize, |this| {
+                    this.child(
+                        div()
+                            .id("window-minimize-btn")
+                            .w(px(36.0))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(rgba(0x23242cff)))
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                cx.stop_propagation();
+                                window.minimize_window();
+                            })
+                            .child(
+                                svg()
+                                    .path("window-minimize.svg")
+                                    .size(px(14.0))
+                                    .text_color(rgba(0x8788a5ff))
+                                    .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                            ),
+                    )
+                })
+                .when(controls.maximize, |this| {
+                    this.child(
+                        div()
+                            .id("window-maximize-btn")
+                            .w(px(36.0))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(rgba(0x23242cff)))
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                cx.stop_propagation();
+                                window.zoom_window();
+                            })
+                            .child(
+                                svg()
+                                    .path(if is_maximized {
+                                        "window-restore.svg"
+                                    } else {
+                                        "window-maximize.svg"
+                                    })
+                                    .size(px(14.0))
+                                    .text_color(rgba(0x8788a5ff))
+                                    .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                            ),
+                    )
+                })
+                .child(
                     div()
-                        .w_full()
+                        .id("window-close-btn")
+                        .w(px(36.0))
                         .h_full()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .gap_2()
-                        .text_size(px(12.5))
-                        .text_color(rgba(0x8b949eff))
-                        .children(titlebar_logo.map(|logo| {
-                            div()
-                                .w(px(16.0))
-                                .h(px(16.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .flex_shrink_0()
-                                .child(
-                                    gpui::img(logo)
-                                        .size(px(14.0))
-                                        .rounded(px(2.0))
-                                )
-                        }))
-                        .child(format!("{active_project_name} — {active_title}"))
-                        .children(titlebar_status.map(|status| {
-                            let (dot_color, text_color, badge_bg) = status.colors();
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded_sm()
-                                .bg(rgba(badge_bg))
-                                .text_color(rgba(text_color))
-                                .child(
-                                    div()
-                                        .w(px(6.0))
-                                        .h(px(6.0))
-                                        .rounded_full()
-                                        .bg(rgba(dot_color)),
-                                )
-                                .child(status.label())
-                        })),
-                ),
-            )
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(rgba(0xe81123ff)))
+                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                            cx.stop_propagation();
+                            window.remove_window();
+                        })
+                        .child(
+                            svg()
+                                .path("window-close.svg")
+                                .size(px(14.0))
+                                .text_color(rgba(0x8788a5ff))
+                                .hover(|s| s.text_color(rgba(0xffffffff))),
+                        ),
+                )
+        });
+
+        let terminal_content = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgba(0x14151bff))
             .child(
-                h_resizable("workspace-resizable-layout")
+                self.make_drag_area(cx)
+                    .h(px(38.0))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pl_4()
+                    .bg(rgba(0x14151bff))
+                    .border_b_1()
+                    .border_color(rgba(0x20212aff))
                     .child(
-                        resizable_panel()
-                            .size(px(260.0))
-                            .size_range(px(180.0)..px(600.0))
-                            .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(!self.sidebar_visible, |this| {
+                                this.child(
+                                    div()
+                                        .id("terminal-sidebar-toggle-btn")
+                                        .cursor(CursorStyle::PointingHand)
+                                        .mr_2()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            svg()
+                                                .path("icons/panel-left.svg")
+                                                .size(px(16.0))
+                                                .text_color(rgba(0x8788a5ff))
+                                                .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.sidebar_visible = true;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                )
+                            })
+                            .text_size(px(12.5))
+                            .text_color(rgba(0x8788a5ff))
+                            .children(titlebar_logo.map(|logo| {
                                 div()
-                                    .size_full()
+                                    .size(px(16.0))
                                     .flex()
-                                    .flex_col()
-                                    .bg(rgba(0x090a0dff))
-                                    .border_r_1()
-                                    .border_color(rgba(0x1e2229ff))
-                            // Sidebar Header
-                            .child(
+                                    .items_center()
+                                    .justify_center()
+                                    .flex_shrink_0()
+                                    .child(
+                                        gpui::img(logo)
+                                            .size(px(14.0))
+                                            .rounded(px(2.0)),
+                                    )
+                            }))
+                            .child(format!("{active_project_name} — {active_title}"))
+                            .children(titlebar_status.map(|status| {
+                                let (dot_color, text_color, badge_bg) = status.colors();
                                 div()
-                                    .p_3()
                                     .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .border_b_1()
-                                    .border_color(rgba(0x1e2229ff))
+                                    .items_center()
+                                    .gap_1()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .bg(rgba(badge_bg))
+                                    .text_color(rgba(text_color))
                                     .child(
                                         div()
+                                            .size(px(6.0))
+                                            .rounded_full()
+                                            .bg(rgba(dot_color)),
+                                    )
+                                    .child(status.label())
+                            })),
+                    )
+                    .children(default_window_controls),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .size_full()
+                    .bg(rgba(0x010409ff))
+                    .overflow_hidden()
+                    .children(active_session_view),
+            );
+
+        let sidebar_content = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgba(0x1b1c22ff))
+            .border_r_1()
+            .border_color(rgba(0x26272fff))
+            // Top Row: sidebar toggle, spacer, eye, cmd, plus
+            .child(
+                div()
+                    .h(px(38.0))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pl(px(14.0))
+                    .pr(px(14.0))
+                    .child(
+                        div()
+                            .id("sidebar-toggle-btn")
+                            .cursor(CursorStyle::PointingHand)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                svg()
+                                    .path("icons/panel-left.svg")
+                                    .size(px(16.0))
+                                    .text_color(rgba(0x8788a5ff))
+                                    .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.sidebar_visible = !this.sidebar_visible;
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        self.make_drag_area(cx)
+                            .flex_1()
+                            .h_full(),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(14.0))
+                            .child(
+                                div()
+                                    .id("sidebar-view-btn")
+                                    .cursor(CursorStyle::PointingHand)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        svg()
+                                            .path("icons/eye.svg")
+                                            .size(px(16.0))
+                                            .text_color(rgba(0x8788a5ff))
+                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        |_, _, cx| cx.stop_propagation(),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("sidebar-command-btn")
+                                    .cursor(CursorStyle::PointingHand)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        svg()
+                                            .path("icons/command.svg")
+                                            .size(px(14.0))
+                                            .text_color(rgba(0x8788a5ff))
+                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.select_folder_and_add_project(window, cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("sidebar-add-btn")
+                                    .cursor(CursorStyle::PointingHand)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        svg()
+                                            .path("icons/plus.svg")
+                                            .size(px(16.0))
+                                            .text_color(rgba(0x8788a5ff))
+                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.create_new_session_for_active_project(window, cx);
+                                        }),
+                                    ),
+                            ),
+                    ),
+            )
+            // Projects & Sessions List
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .flex()
+                    .flex_col()
+                    .children(self.projects.iter().enumerate().map(|(p_idx, project)| {
+                        let is_active_project = p_idx == self.active_project_idx;
+                        div()
+                            .flex()
+                            .flex_col()
+                            // Project Title Header ("icy-narrows")
+                            .child(
+                                div()
+                                    .id(("project-header", project.id))
+                                    .pt(px(14.0))
+                                    .pb(px(8.0))
+                                    .px(px(16.0))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(rgba(0x656679ff))
+                                            .hover(|s| s.text_color(rgba(0x8b949eff)))
+                                            .child(project.name.clone()),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.active_project_idx = p_idx;
+                                            if let Some(session) = this.active_session() {
+                                                session.terminal.read(cx).focus_handle().focus(window);
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            // Sessions List for this project
+                            .child(
+                                div()
+                                    .px(px(6.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .children(project.sessions.iter().enumerate().map(|(s_idx, session)| {
+                                        let is_active_session = is_active_project && s_idx == project.active_session_idx;
+                                        div()
+                                            .id(("session-item", session.id))
+                                            .h(px(36.0))
+                                            .px(px(12.0))
+                                            .rounded_full()
+                                            .cursor(CursorStyle::PointingHand)
                                             .flex()
                                             .items_center()
                                             .justify_between()
+                                            .gap(px(10.0))
+                                            .bg(if is_active_session {
+                                                 rgba(0x26272fff)
+                                            } else {
+                                                rgba(0x00000000)
+                                            })
+                                            .border_1()
+                                            .border_color(if is_active_session {
+                                                rgba(0x32333eff)
+                                            } else {
+                                                rgba(0x00000000)
+                                            })
+                                            .hover(|s| {
+                                                if !is_active_session {
+                                                    s.bg(rgba(0x23242c88))
+                                                } else {
+                                                    s
+                                                }
+                                            })
                                             .child(
                                                 div()
-                                                    .text_sm()
-                                                    .font_weight(gpui::FontWeight::BOLD)
-                                                    .text_color(rgba(0x58a6ffff))
-                                                    .child("T3 Code"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("open-folder-btn")
-                                                    .p_1p5()
-                                                    .rounded_md()
-                                                    .bg(rgba(0x1f242cff))
-                                                    .hover(|s| s.bg(rgba(0x2d333bff)))
-                                                    .cursor(CursorStyle::PointingHand)
                                                     .flex()
                                                     .items_center()
-                                                    .justify_center()
+                                                    .gap(px(10.0))
+                                                    .min_w_0()
+                                                    .flex_1()
                                                     .child(
-                                                        svg()
-                                                            .path("ui_icons/project-add.svg")
+                                                        // AI Agent / Command logo
+                                                        div()
                                                             .size(px(18.0))
-                                                            .text_color(rgba(0xc9d1d9ff))
-                                                            .hover(|s| s.text_color(rgba(0xffffffff)))
-                                                    )
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(|this, _, window, cx| {
-                                                            this.select_folder_and_add_project(window, cx);
-                                                        }),
-                                                    ),
-                                            ),
-                                    ),
-                            )
-                            // Projects & Sessions List
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .overflow_y_scrollbar()
-                                    .p_2()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .children(self.projects.iter().enumerate().map(|(p_idx, project)| {
-                                        let is_active_project = p_idx == self.active_project_idx;
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .id(("project-header", project.id))
-                                                    .px_2()
-                                                    .py_1()
-                                                    .rounded_md()
-                                                    .bg(if is_active_project {
-                                                        rgba(0x161b22ff)
-                                                    } else {
-                                                        rgba(0x00000000)
-                                                    })
-                                                    .hover(|s| s.bg(rgba(0x161b2299)))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                            .text_color(if is_active_project {
-                                                                rgba(0x58a6ffff)
-                                                            } else {
-                                                                rgba(0x8b949eff)
-                                                            })
-                                                            .child(project.name.clone()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id(("add-session-btn", project.id))
-                                                            .p_1()
-                                                            .rounded_md()
-                                                            .hover(|s| s.bg(rgba(0x21262dff)))
-                                                            .cursor(CursorStyle::PointingHand)
                                                             .flex()
                                                             .items_center()
                                                             .justify_center()
+                                                            .flex_shrink_0()
                                                             .child(
-                                                                svg()
-                                                                    .path("ui_icons/session-create.svg")
+                                                                gpui::img(session.logo.clone())
                                                                     .size(px(18.0))
-                                                                    .text_color(rgba(0x8b949eff))
-                                                                    .hover(|s| s.text_color(rgba(0xffffffff)))
-                                                            )
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener(move |this, _, window, cx| {
-                                                                    this.active_project_idx = p_idx;
-                                                                    this.create_new_session_for_active_project(window, cx);
-                                                                }),
+                                                                    .rounded(px(3.0)),
                                                             ),
                                                     )
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, window, cx| {
-                                                            this.active_project_idx = p_idx;
-                                                            if let Some(session) = this.active_session() {
-                                                                session.terminal.read(cx).focus_handle().focus(window);
-                                                            }
-                                                            cx.notify();
-                                                        }),
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(13.0))
+                                                            .truncate()
+                                                            .text_color(if is_active_session {
+                                                                rgba(0xc3c1eeff)
+                                                            } else {
+                                                                rgba(0x8788a5ff)
+                                                            })
+                                                            .hover(|s| {
+                                                                if !is_active_session {
+                                                                    s.text_color(rgba(0xc3c1eeff))
+                                                                } else {
+                                                                    s
+                                                                }
+                                                            })
+                                                            .child(session.display_title.clone()),
                                                     ),
                                             )
-                                            // Sessions list for this project
-                                            .children(project.sessions.iter().enumerate().map(|(s_idx, session)| {
-                                                let is_active_session = is_active_project && s_idx == project.active_session_idx;
+                                            .children((!matches!(session.status, SessionStatus::Idle | SessionStatus::Active)).then(|| {
                                                 let (_, text_color, badge_bg) = session.status.colors();
                                                 div()
-                                                    .id(("session-item", session.id))
-                                                    .ml_3()
-                                                    .px_2()
-                                                    .py_1()
-                                                    .rounded_md()
-                                                    .bg(if is_active_session {
-                                                        rgba(0x21262dff)
-                                                    } else {
-                                                        rgba(0x00000000)
-                                                    })
-                                                    .hover(|s| s.bg(rgba(0x161b22ff)))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .gap_2()
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap_2()
-                                                            .min_w_0()
-                                                            .flex_1()
-                                                            .child(
-                                                                // AI Agent / Command logo
-                                                                div()
-                                                                    .w(px(16.0))
-                                                                    .h(px(16.0))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .flex_shrink_0()
-                                                                    .child(
-                                                                        gpui::img(session.logo.clone())
-                                                                            .size(px(15.0))
-                                                                            .rounded(px(2.0))
-                                                                    )
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .text_xs()
-                                                                    .truncate()
-                                                                    .text_color(if is_active_session {
-                                                                        rgba(0xf0f6fcff)
-                                                                    } else {
-                                                                        rgba(0x8b949eff)
-                                                                    })
-                                                                    .child(session.display_title.clone()),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .flex_shrink_0()
-                                                            .text_xs()
-                                                            .px_1p5()
-                                                            .py_0p5()
-                                                            .rounded_sm()
-                                                            .bg(rgba(badge_bg))
-                                                            .text_color(rgba(text_color))
-                                                            .child(session.status.label()),
-                                                    )
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, window, cx| {
-                                                            this.active_project_idx = p_idx;
-                                                            if let Some(p) = this.projects.get_mut(p_idx) {
-                                                                p.active_session_idx = s_idx;
-                                                            }
-                                                            if let Some(session) = this.active_session() {
-                                                                session.terminal.read(cx).focus_handle().focus(window);
-                                                            }
-                                                            cx.notify();
-                                                        }),
-                                                    )
+                                                    .flex_shrink_0()
+                                                    .text_size(px(10.5))
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .bg(rgba(badge_bg))
+                                                    .text_color(rgba(text_color))
+                                                    .child(session.status.label())
                                             }))
-                                    })),
-                            ),
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.active_project_idx = p_idx;
+                                                    if let Some(p) = this.projects.get_mut(p_idx) {
+                                                        p.active_session_idx = s_idx;
+                                                    }
+                                                    if let Some(session) = this.active_session() {
+                                                        session.terminal.read(cx).focus_handle().focus(window);
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            )
+                                    }))
                             )
-                    )
-                    .child(
-                        resizable_panel().child(
-                            div()
-                                .flex_1()
-                                .size_full()
-                                .bg(rgba(0x010409ff))
-                                .overflow_hidden()
-                                .children(active_session_view),
+                    })),
+            );
+
+        div()
+            .flex()
+            .size_full()
+            .bg(rgba(0x14151bff))
+            .text_color(rgba(0xe6edf3ff))
+            .on_key_down(cx.listener(Self::on_key_down))
+            .child(
+                if self.sidebar_visible {
+                    h_resizable("workspace-layout-panels")
+                        .child(
+                            resizable_panel()
+                                .size(self.sidebar_width)
+                                .size_range(px(200.0)..px(500.0))
+                                .child(sidebar_content),
                         )
-                    ),
+                        .child(resizable_panel().child(terminal_content))
+                        .into_any_element()
+                } else {
+                    terminal_content.into_any_element()
+                },
             )
     }
 }
@@ -1168,6 +1382,9 @@ fn main() -> Result<()> {
                             session_index: HashMap::from([(1, (0, 0))]),
                             palette: palette_clone,
                             focused_session_id: None,
+                            sidebar_visible: true,
+                            sidebar_width: px(330.0),
+                            drag_start_pos: None,
                         }
                     });
 
