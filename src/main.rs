@@ -10,7 +10,7 @@ use gpui::{
     WindowOptions, div, rgba, svg, MouseDownEvent, MouseMoveEvent, Pixels, Point, WindowControlArea,
 };
 use gpui::prelude::FluentBuilder as _;
-use gpui_component::resizable::{h_resizable, resizable_panel};
+use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Root, TitleBar};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
@@ -84,6 +84,7 @@ const DONE_LINGER: std::time::Duration = std::time::Duration::from_secs(30);
 pub enum PaneNode {
     Leaf(usize),
     Split {
+        id: usize,
         axis: gpui::Axis,
         left: Box<PaneNode>,
         right: Box<PaneNode>,
@@ -98,11 +99,12 @@ impl PaneNode {
         }
     }
 
-    pub fn split(&mut self, target_id: usize, new_id: usize, axis: gpui::Axis) -> bool {
+    pub fn split(&mut self, target_id: usize, new_id: usize, split_id: usize, axis: gpui::Axis) -> bool {
         match self {
             PaneNode::Leaf(id) => {
                 if *id == target_id {
                     *self = PaneNode::Split {
+                        id: split_id,
                         axis,
                         left: Box::new(PaneNode::Leaf(target_id)),
                         right: Box::new(PaneNode::Leaf(new_id)),
@@ -113,7 +115,7 @@ impl PaneNode {
                 }
             }
             PaneNode::Split { left, right, .. } => {
-                left.split(target_id, new_id, axis) || right.split(target_id, new_id, axis)
+                left.split(target_id, new_id, split_id, axis) || right.split(target_id, new_id, split_id, axis)
             }
         }
     }
@@ -127,11 +129,12 @@ impl PaneNode {
                     Some(PaneNode::Leaf(id))
                 }
             }
-            PaneNode::Split { axis, left, right } => {
+            PaneNode::Split { id, axis, left, right } => {
                 let left = left.remove(target_id);
                 let right = right.remove(target_id);
                 match (left, right) {
                     (Some(l), Some(r)) => Some(PaneNode::Split {
+                        id,
                         axis,
                         left: Box::new(l),
                         right: Box::new(r),
@@ -646,7 +649,8 @@ impl AppState {
                 project.active_session_idx = project.sessions.len() - 1;
                 if let Some(tree) = &mut project.pane_tree {
                     if let Some(target) = target_id {
-                        tree.split(target, next_id, gpui::Axis::Horizontal);
+                        let split_id = next_id;
+                        tree.split(target, next_id, split_id, gpui::Axis::Horizontal);
                     } else {
                         *tree = PaneNode::Leaf(next_id);
                     }
@@ -736,9 +740,10 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let self_weak = cx.entity().downgrade();
+        let split_id = self.next_id;
+        self.next_id += 1;
         let next_id = self.next_id;
         self.next_id += 1;
-
         let p_idx = self
             .session_index
             .get(&target_session_id)
@@ -779,7 +784,7 @@ impl AppState {
                 project.sessions.push(session);
                 project.active_session_idx = project.sessions.len() - 1;
                 if let Some(tree) = &mut project.pane_tree {
-                    tree.split(target_session_id, next_id, axis);
+                    tree.split(target_session_id, next_id, split_id, axis);
                 } else {
                     project.pane_tree = Some(PaneNode::Leaf(next_id));
                 }
@@ -1044,20 +1049,39 @@ impl AppState {
                     div().into_any_element()
                 }
             }
-            PaneNode::Split { axis, left, right } => {
+            PaneNode::Split { id, axis, left, right } => {
                 let left_el = self.render_pane_node(left, project, is_maximized, cx);
                 let right_el = self.render_pane_node(right, project, is_maximized, cx);
                 let is_horizontal = *axis == gpui::Axis::Horizontal;
+                let split_id = ("terminal-split", *id);
 
-                div()
-                    .flex()
-                    .size_full()
-                    .when(is_horizontal, |this| this.flex_row())
-                    .when(!is_horizontal, |this| this.flex_col())
-                    .gap(px(4.0))
-                    .child(div().flex_1().size_full().overflow_hidden().child(left_el))
-                    .child(div().flex_1().size_full().overflow_hidden().child(right_el))
-                    .into_any_element()
+                if is_horizontal {
+                    h_resizable(split_id)
+                        .child(
+                            resizable_panel()
+                                .size_range(px(100.0)..px(3000.0))
+                                .child(div().flex().flex_col().size_full().p(px(2.0)).child(div().flex_1().size_full().child(left_el))),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size_range(px(100.0)..px(3000.0))
+                                .child(div().flex().flex_col().size_full().p(px(2.0)).child(div().flex_1().size_full().child(right_el))),
+                        )
+                        .into_any_element()
+                } else {
+                    v_resizable(split_id)
+                        .child(
+                            resizable_panel()
+                                .size_range(px(70.0)..px(3000.0))
+                                .child(div().flex().flex_col().size_full().p(px(2.0)).child(div().flex_1().size_full().child(left_el))),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size_range(px(70.0)..px(3000.0))
+                                .child(div().flex().flex_col().size_full().p(px(2.0)).child(div().flex_1().size_full().child(right_el))),
+                        )
+                        .into_any_element()
+                }
             }
         }
     }
@@ -1319,12 +1343,14 @@ impl Render for AppState {
             )
             .child(
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .size_full()
                     .bg(rgba(0x14151bff))
                     .overflow_hidden()
                     .p(px(6.0))
-                    .child(terminal_area),
+                    .child(div().flex().flex_col().size_full().child(terminal_area)),
             );
 
         let sidebar_content = div()
@@ -1617,9 +1643,11 @@ impl Render for AppState {
                                                         p.active_session_idx = s_idx;
                                                         let s_id = p.sessions[s_idx].id;
                                                         if !p.pane_tree.as_ref().map_or(false, |t| t.contains(s_id)) {
+                                                            let split_id = this.next_id;
+                                                            this.next_id += 1;
                                                             if let Some(tree) = &mut p.pane_tree {
                                                                 let active_id = tree.first_leaf();
-                                                                tree.split(active_id, s_id, gpui::Axis::Horizontal);
+                                                                tree.split(active_id, s_id, split_id, gpui::Axis::Horizontal);
                                                             } else {
                                                                 p.pane_tree = Some(PaneNode::Leaf(s_id));
                                                             }
@@ -2288,7 +2316,7 @@ mod xtgettcap_tests {
 #[cfg(test)]
 mod pane_tests {
     use super::*;
-    use gpui::{TestAppContext, VisualContext};
+    use gpui::{point, Modifiers, TestAppContext, VisualContext};
     use resize_tests::open_app;
     #[test]
     fn pane_node_split_and_contains() {
@@ -2297,12 +2325,12 @@ mod pane_tests {
         assert!(!tree.contains(2));
         assert_eq!(tree.first_leaf(), 1);
 
-        assert!(tree.split(1, 2, gpui::Axis::Horizontal));
+        assert!(tree.split(1, 2, 10, gpui::Axis::Horizontal));
         assert!(tree.contains(1));
         assert!(tree.contains(2));
         assert!(!tree.contains(3));
 
-        assert!(tree.split(2, 3, gpui::Axis::Vertical));
+        assert!(tree.split(2, 3, 11, gpui::Axis::Vertical));
         assert!(tree.contains(3));
         assert_eq!(tree.first_leaf(), 1);
     }
@@ -2310,8 +2338,8 @@ mod pane_tests {
     #[test]
     fn pane_node_remove_collapses_tree() {
         let mut tree = PaneNode::Leaf(1);
-        tree.split(1, 2, gpui::Axis::Horizontal);
-        tree.split(2, 3, gpui::Axis::Vertical);
+        tree.split(1, 2, 10, gpui::Axis::Horizontal);
+        tree.split(2, 3, 11, gpui::Axis::Vertical);
 
         // Remove 2: the vertical split (2, 3) should collapse to 3
         let tree = tree.remove(2).expect("tree remains");
@@ -2345,26 +2373,30 @@ mod pane_tests {
         });
         assert_eq!(session_count, 2);
 
+        let new_session_id = app_state.read_with(&cx, |state, _| {
+            state.active_project().unwrap().sessions.last().unwrap().id
+        });
+
         // Toggle maximize
         app_state.update(&mut cx, |state, cx| {
-            state.toggle_maximize_session(2, cx);
+            state.toggle_maximize_session(new_session_id, cx);
         });
         cx.draw_frame().expect("frame while maximized");
 
         let is_max = app_state.read_with(&cx, |state, _| {
             state.active_project().unwrap().maximized_session_id
         });
-        assert_eq!(is_max, Some(2));
+        assert_eq!(is_max, Some(new_session_id));
 
         // Restore
         app_state.update(&mut cx, |state, cx| {
-            state.toggle_maximize_session(2, cx);
+            state.toggle_maximize_session(new_session_id, cx);
         });
         cx.draw_frame().expect("frame restored");
 
-        // Close pane 2
+        // Close the new pane
         cx.update_window_entity(&app_state, |state, window, cx| {
-            state.close_session(2, window, cx);
+            state.close_session(new_session_id, window, cx);
         });
         cx.draw_frame().expect("frame after close");
 
@@ -2372,5 +2404,105 @@ mod pane_tests {
             state.active_project().unwrap().sessions.len()
         });
         assert_eq!(session_count_after, 1);
+    }
+
+    #[test]
+    fn dragging_split_terminal_divider_resizes_without_panic() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame");
+
+        // Split vertical
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.split_session(1, gpui::Axis::Horizontal, window, cx);
+        });
+        cx.draw_frame().expect("frame after vertical split");
+
+        let y = px(400.0);
+        let grab = point(px(700.0), y);
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        for dx in [-150.0, -50.0, 0.0, 50.0, 150.0] {
+            cx.simulate_mouse_move(
+                point(px(700.0 + dx), y),
+                Some(MouseButton::Left),
+                Modifiers::none(),
+            );
+            let _ = cx.draw_frame();
+        }
+        cx.simulate_mouse_up(grab, MouseButton::Left, Modifiers::none());
+        let _ = cx.draw_frame();
+    }
+
+    #[test]
+    fn reproduce_nested_split_bounds() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame");
+
+        // Split 1 vertically: Left: 1, Right: new (2)
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.split_session(1, gpui::Axis::Horizontal, window, cx);
+        });
+        cx.draw_frame().expect("frame after vertical split");
+
+        // Split 1 horizontally: Top-left: 1, Bottom-left: new (3)
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.split_session(1, gpui::Axis::Vertical, window, cx);
+        });
+        cx.run_until_parked();
+        cx.draw_frame().expect("frame after horizontal split");
+
+        // Check terminal dimensions/bounds for all 3 sessions
+        let (term1, term2, term3) = app_state.read_with(&cx, |state, cx| {
+            let project = state.active_project().unwrap();
+            let t1 = project.sessions[0].terminal.read(cx).dimensions();
+            let t2 = project.sessions[1].terminal.read(cx).dimensions();
+            let t3 = project.sessions[2].terminal.read(cx).dimensions();
+            (t1, t2, t3)
+        });
+
+        // Ensure no terminal collapsed to height 0 / 1 row
+        assert!(term1.1 > 5, "term1 collapsed: {:?}", term1);
+        assert!(term2.1 > 5, "term2 collapsed: {:?}", term2);
+        assert!(term3.1 > 5, "term3 collapsed: {:?}", term3);
+    }
+
+    #[test]
+    fn horizontal_then_vertical_nested_split_does_not_collapse() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame");
+
+        // Split 1 horizontally: Top: 1, Bottom: 2
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.split_session(1, gpui::Axis::Vertical, window, cx);
+        });
+        cx.draw_frame().expect("frame after horizontal split");
+
+        let bottom_id = app_state.read_with(&cx, |state, _| {
+            state.active_project().unwrap().sessions.last().unwrap().id
+        });
+
+        // Split bottom vertically: Bottom-left: 2, Bottom-right: 3
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.split_session(bottom_id, gpui::Axis::Horizontal, window, cx);
+        });
+        cx.run_until_parked();
+        cx.draw_frame().expect("frame after vertical split");
+
+        let (term1, term2, term3) = app_state.read_with(&cx, |state, cx| {
+            let project = state.active_project().unwrap();
+            let t1 = project.sessions[0].terminal.read(cx).dimensions();
+            let t2 = project.sessions[1].terminal.read(cx).dimensions();
+            let t3 = project.sessions[2].terminal.read(cx).dimensions();
+            (t1, t2, t3)
+        });
+
+        assert!(term1.1 > 5, "term1 collapsed: {:?}", term1);
+        assert!(term2.1 > 5, "term2 collapsed: {:?}", term2);
+        assert!(term3.1 > 5, "term3 collapsed: {:?}", term3);
     }
 }

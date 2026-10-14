@@ -10,7 +10,7 @@ use gpui::{
     Styled, Window,
 };
 
-use crate::{h_flex, resizable::PANEL_MIN_SIZE, v_flex, AxisExt};
+use crate::{resizable::PANEL_MIN_SIZE, v_flex, AxisExt};
 
 use super::{resizable_panel, resize_handle, ResizableState};
 
@@ -129,7 +129,7 @@ impl RenderOnce for ResizablePanelGroup {
             window.use_keyed_state(self.id.clone(), cx, |_, _| ResizableState::default()),
         );
         let container = if self.axis.is_horizontal() {
-            h_flex()
+            div().flex().flex_row()
         } else {
             v_flex()
         };

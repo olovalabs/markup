@@ -1483,6 +1483,10 @@ impl TerminalView {
         self.state.dimensions()
     }
 
+    pub fn last_bounds(&self) -> Bounds<Pixels> {
+        *self.last_bounds.lock()
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.state.resize(cols, rows);
         self.sync_window_size();
