@@ -72,7 +72,7 @@ pub enum SessionStatus {
 
 impl SessionStatus {
     /// Render priority: Error > Blocked > Working > Done > Active > Idle.
-    fn rank(self) -> u8 {
+    pub fn rank(self) -> u8 {
         match self {
             SessionStatus::Error => 6,
             SessionStatus::Blocked => 5,

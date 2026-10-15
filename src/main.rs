@@ -46,18 +46,20 @@ impl std::io::Write for SharedWriter {
         self.writer.lock().flush()
     }
 }
-pub struct Session {
+/// One terminal inside a session's screen. A session (a sidebar tab) owns a
+/// split tree of panes; each pane is a full, independent terminal whose PTY
+/// keeps running while another session's screen is shown.
+pub struct TerminalPane {
     pub id: usize,
-    pub title: SharedString,
-    /// Title as shown in the sidebar (truncated to 160 chars), cached so the
-    /// render pass does not re-scan and re-allocate it for every session of
-    /// every frame.
-    pub display_title: SharedString,
     pub terminal: Entity<TerminalView>,
     pub status: SessionStatus,
+    pub title: String,
+    /// Title as shown in the pane header (truncated to 160 chars), cached so
+    /// the render pass does not re-scan and re-allocate it every frame.
+    pub display_title: SharedString,
     pub pid: Option<u32>,
     /// Reused scrape buffer: the poller reads the screen into this instead of
-    /// allocating a fresh `Vec<String>` every 500 ms per session.
+    /// allocating a fresh `Vec<String>` every 500 ms per pane.
     pub screen_scratch: Vec<String>,
     /// (screen fingerprint, focused, exited, foreground fingerprint) from the
     /// last poll tick. When it matches, nothing observable changed and the
@@ -74,9 +76,25 @@ pub struct Session {
     /// When the terminal first showed an unacknowledged Done, for the short
     /// auto-clear timeout in the spec.
     pub done_since: Option<std::time::Instant>,
+    pub detector: status::Detector,
+}
+
+/// One sidebar tab: an isolated screen with its own split-layout tree of
+/// panes. Switching tabs only swaps which screen is rendered — the panes of
+/// other sessions keep running in the background.
+pub struct Session {
+    pub id: usize,
+    /// OSC title of the focus pane (synced in the poller / title callback).
+    pub title: SharedString,
+    /// Title as shown in the sidebar (truncated), cached.
+    pub display_title: SharedString,
     /// Path of the AI agent / command logo shown in the sidebar.
     pub logo: SharedString,
-    pub detector: status::Detector,
+    pub pane_tree: Option<PaneNode>,
+    pub maximized_pane_id: Option<usize>,
+    pub panes: Vec<TerminalPane>,
+    /// Highest-ranked pane status, for the sidebar badge and title bar.
+    pub status: SessionStatus,
 }
 
 /// How long an unacknowledged Done badge lingers before it falls back to Idle.
@@ -163,8 +181,6 @@ pub struct Project {
     pub path: PathBuf,
     pub sessions: Vec<Session>,
     pub active_session_idx: usize,
-    pub pane_tree: Option<PaneNode>,
-    pub maximized_session_id: Option<usize>,
 }
 
 struct AppState {
@@ -174,9 +190,11 @@ struct AppState {
     palette: ColorPalette,
     /// O(1) session lookup by id: session id -> (project idx, session idx).
     session_index: HashMap<usize, (usize, usize)>,
-    /// Session that currently owns keyboard focus, tracked every render frame
+    /// O(1) pane lookup by id: pane id -> (project idx, session idx, pane idx).
+    pane_index: HashMap<usize, (usize, usize, usize)>,
+    /// Pane that currently owns keyboard focus, tracked every render frame
     /// and consumed by the status poller (Active state, sticky-state clearing).
-    focused_session_id: Option<usize>,
+    focused_pane_id: Option<usize>,
     pub sidebar_visible: bool,
     pub sidebar_width: Pixels,
     drag_start_pos: Option<Point<Pixels>>,
@@ -238,7 +256,7 @@ impl AppState {
         dir: Option<&PathBuf>,
         palette: ColorPalette,
         window_title_target: gpui::WeakEntity<Self>,
-        session_id: usize,
+        pane_id: usize,
         cx: &mut Context<Self>,
     ) -> Result<(Entity<TerminalView>, Option<u32>)> {
         let (shell_cmd, _) = detect_shell();
@@ -320,7 +338,7 @@ impl AppState {
                     window.set_window_title(title);
                     let title_str = title.to_string();
                     let _ = target.update(cx, |state, cx| {
-                        state.update_session_title(session_id, &title_str, cx);
+                        state.update_pane_title(pane_id, &title_str, cx);
                     });
                 })
             // Exit status is intentionally not set here: the status poller
@@ -329,12 +347,12 @@ impl AppState {
         Ok((terminal, pid))
     }
 
-    fn update_session_title(&mut self, session_id: usize, title: &str, cx: &mut Context<Self>) {
+    fn update_pane_title(&mut self, pane_id: usize, title: &str, cx: &mut Context<Self>) {
         let trimmed = title.trim();
         if trimmed.is_empty() {
             return;
         }
-        let Some(&(p_idx, s_idx)) = self.session_index.get(&session_id) else {
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
             return;
         };
         let Some(session) = self
@@ -344,270 +362,350 @@ impl AppState {
         else {
             return;
         };
-        // Unchanged titles are common (TUIs re-emit them constantly); the logo
-        // depends only on title/status/logo, so there is nothing to redo.
-        if session.title.as_str() == trimmed {
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+        if pane.title == trimmed {
             return;
         }
-        let next = SharedString::from(trimmed.to_string());
-        session.title = next.clone();
-        session.display_title = truncate_title(&next);
-        let title_logo =
-            logos::resolve_session_logo(&[], Some(trimmed), session.status, &session.logo);
-        if title_logo != logos::default_logo() && session.logo != title_logo {
-            session.logo = title_logo;
+        pane.title = trimmed.to_string();
+        let next_display = truncate_title(&SharedString::from(trimmed.to_string()));
+        pane.display_title = next_display.clone();
+        // Mirror the pane the user is working in onto the session's sidebar
+        // entry. Either the focused pane or the first pane of the screen
+        // (when focus has not moved yet) is the primary.
+        let is_primary = self.focused_pane_id == Some(pane_id)
+            || session
+                .pane_tree
+                .as_ref()
+                .is_some_and(|t| t.first_leaf() == pane_id);
+        if is_primary {
+            session.title = SharedString::from(trimmed.to_string());
+            session.display_title = next_display.clone();
+            let title_logo =
+                logos::resolve_session_logo(&[], Some(trimmed), session.status, &session.logo);
+            if title_logo != logos::default_logo() && session.logo != title_logo {
+                session.logo = title_logo;
+            }
         }
         cx.notify();
     }
 
     /// Periodic detection tick, herdr-style: screen scrape + OSC title +
     /// foreground process tree, with sticky Done/Error and focus resolution.
+    /// Every pane of every session is polled; the session badge is the
+    /// highest-ranked pane status and the sidebar title/logo follow the pane
+    /// the user is working in.
     pub fn poll_sessions_status(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
-        let focused_id = self.focused_session_id;
+        let focused_id = self.focused_pane_id;
         // `T3_STATUS_DEBUG=1` dumps every detection pass: the facts that went in
         // and the badge that came out. Without this the poller is invisible.
         let debug = status::debug_enabled();
         for project in &mut self.projects {
             for session in &mut project.sessions {
-                let focused = focused_id == Some(session.id);
+                let default_primary_id = session.pane_tree.as_ref().map(|t| t.first_leaf());
+                let pane_count = session.panes.len();
+                let mut primary_idx: Option<usize> = None;
+                let mut primary_focused = false;
+                let mut primary_fg: Vec<String> = Vec::new();
 
-                // Background terminals never render, so their PTY events
-                // (title updates, child exit) must be drained here or the
-                // status would go stale while the user is in another tab.
-                if !focused {
-                    session.terminal.update(cx, |term, cx| {
-                        term.drain_background_events(cx);
-                    });
-                }
+                for (pane_idx, pane) in session.panes.iter_mut().enumerate() {
+                    let focused = focused_id == Some(pane.id);
 
-                // Reused for both the debug dump and the agent lifecycle below.
-                let foreground = status::foreground_process_names(session.pid);
+                    // The pane the session badge/title follows: the focused
+                    // pane, else the first pane of the screen.
+                    let is_default_primary =
+                        Some(pane.id) == default_primary_id || pane_count == 1;
+                    if focused || (is_default_primary && !primary_focused) {
+                        primary_focused = focused;
+                        primary_idx = Some(pane_idx);
+                        primary_fg = status::foreground_process_names(pane.pid);
+                    }
 
-                // Scrape into the session's reused buffer. `bottom_lines` takes
-                // the last N *rows*, clamped to the visible screen. Ask for the
-                // whole screen: a fresh shell prints its prompt on row 0, well
-                // above a 12-row window at the bottom. The rules skip blank
-                // rows themselves.
-                session
-                    .terminal
-                    .read(cx)
-                    .bottom_lines_into(usize::MAX, &mut session.screen_scratch);
+                    // Background panes never render, so their PTY events
+                    // (title updates, child exit) must be drained here or the
+                    // status would go stale while the user is in another tab.
+                    if !focused {
+                        pane.terminal.update(cx, |term, cx| {
+                            term.drain_background_events(cx);
+                        });
+                    }
 
-                // Idle fast path: when the screen, focus, exit state, and
-                // foreground group all match last tick, the status, ack, and
-                // logo cannot have changed — skip the rule-pack evaluation
-                // entirely. Done is excluded: it expires on a timer even when
-                // nothing else changes.
-                let poll_key = {
-                    let terminal = session.terminal.read(cx);
-                    let fp = screen_fingerprint(
-                        &session.screen_scratch,
-                        terminal.title().unwrap_or(""),
-                    );
-                    (
-                        fp,
-                        focused,
-                        terminal.has_exited(),
-                        screen_fingerprint(&foreground, ""),
-                    )
-                };
-                if session.poll_cache == Some(poll_key)
-                    && session.status != SessionStatus::Done
-                    && session.status != SessionStatus::Working
-                {
-                    continue;
-                }
-
-                let (next, ack, screen_fp) = {
-                    let terminal = session.terminal.read(cx);
-                    let bottom_lines = &session.screen_scratch;
-                    let title = terminal.title().unwrap_or("");
-                    let screen_fp = screen_fingerprint(bottom_lines, title);
-                    let screen_text = bottom_lines.join("\n");
-                    let detector_state = session.detector.update(
-                        &screen_text,
-                        terminal.has_exited(),
-                        std::time::Instant::now(),
-                    );
-                    // while the screen is unchanged the sticky badge stays
-                    // cleared; new output re-arms it.
-                    let ack = if focused
-                        && (terminal.has_exited()
-                            || matches!(session.status, SessionStatus::Done | SessionStatus::Error))
-                    {
-                        Some(screen_fp)
-                    } else {
-                        session.ack_screen
+                    // Keep the pane header title in step with the OSC title
+                    // even for background panes (the callback only fires where
+                    // a window is attached).
+                    let title_changed = {
+                        let terminal = pane.terminal.read(cx);
+                        let title = terminal.title().unwrap_or("");
+                        let trimmed = title.trim();
+                        if !trimmed.is_empty() && pane.title.as_str() != trimmed {
+                            pane.title = trimmed.to_string();
+                            pane.display_title =
+                                truncate_title(&SharedString::from(trimmed.to_string()));
+                            true
+                        } else {
+                            false
+                        }
                     };
-                    let acknowledged = ack == Some(screen_fp);
+                    if title_changed {
+                        changed = true;
+                    }
 
-                    // The agent rule match behind this tick's verdict, for the
-                    // debug dump. The live path below captures it for free;
-                    // the exited path only needs it for the dump itself.
-                    let mut debug_match = None;
+                    // Reused for both the debug dump and the agent lifecycle below.
+                    let foreground = status::foreground_process_names(pane.pid);
 
-                    // Exit of the PTY child wins: the real exit code decides
-                    // Done (0) vs Error (non-zero / signal), herdr-style.
-                    let next = if terminal.has_exited() {
-                        if debug {
-                            debug_match = status::explain(&StatusInput {
+                    // Scrape into the pane's reused buffer. `bottom_lines` takes
+                    // the last N *rows*, clamped to the visible screen. Ask for the
+                    // whole screen: a fresh shell prints its prompt on row 0, well
+                    // above a 12-row window at the bottom. The rules skip blank
+                    // rows themselves.
+                    pane.terminal
+                        .read(cx)
+                        .bottom_lines_into(usize::MAX, &mut pane.screen_scratch);
+
+                    // Idle fast path: when the screen, focus, exit state, and
+                    // foreground group all match last tick, the status, ack, and
+                    // logo cannot have changed — skip the rule-pack evaluation
+                    // entirely. Done is excluded: it expires on a timer even when
+                    // nothing else changes.
+                    let poll_key = {
+                        let terminal = pane.terminal.read(cx);
+                        let fp = screen_fingerprint(
+                            &pane.screen_scratch,
+                            terminal.title().unwrap_or(""),
+                        );
+                        (
+                            fp,
+                            focused,
+                            terminal.has_exited(),
+                            screen_fingerprint(&foreground, ""),
+                        )
+                    };
+                    if pane.poll_cache == Some(poll_key)
+                        && pane.status != SessionStatus::Done
+                        && pane.status != SessionStatus::Working
+                    {
+                        continue;
+                    }
+
+                    let (next, ack, screen_fp) = {
+                        let terminal = pane.terminal.read(cx);
+                        let bottom_lines = &pane.screen_scratch;
+                        let title = terminal.title().unwrap_or("");
+                        let screen_fp = screen_fingerprint(bottom_lines, title);
+                        let screen_text = bottom_lines.join("\n");
+                        let detector_state = pane.detector.update(
+                            &screen_text,
+                            terminal.has_exited(),
+                            std::time::Instant::now(),
+                        );
+                        // while the screen is unchanged the sticky badge stays
+                        // cleared; new output re-arms it.
+                        let ack = if focused
+                            && (terminal.has_exited()
+                                || matches!(pane.status, SessionStatus::Done | SessionStatus::Error))
+                        {
+                            Some(screen_fp)
+                        } else {
+                            pane.ack_screen
+                        };
+                        let acknowledged = ack == Some(screen_fp);
+
+                        // The agent rule match behind this tick's verdict, for the
+                        // debug dump. The live path below captures it for free;
+                        // the exited path only needs it for the dump itself.
+                        let mut debug_match = None;
+
+                        // Exit of the PTY child wins: the real exit code decides
+                        // Done (0) vs Error (non-zero / signal), herdr-style.
+                        let next = if terminal.has_exited() {
+                            if debug {
+                                debug_match = status::explain(&StatusInput {
+                                    lines: bottom_lines,
+                                    title: Some(title),
+                                    foreground: &foreground,
+                                    detector_state: Some(detector_state),
+                                });
+                            }
+                            if acknowledged {
+                                SessionStatus::Idle
+                            } else {
+                                match terminal.exit_status() {
+                                    Some(0) | None => SessionStatus::Done,
+                                    Some(_) => SessionStatus::Error,
+                                }
+                            }
+                        } else {
+                            let input = StatusInput {
                                 lines: bottom_lines,
                                 title: Some(title),
                                 foreground: &foreground,
                                 detector_state: Some(detector_state),
-                            });
-                        }
-                        if acknowledged {
-                            SessionStatus::Idle
-                        } else {
-                            match terminal.exit_status() {
-                                Some(0) | None => SessionStatus::Done,
-                                Some(_) => SessionStatus::Error,
-                            }
-                        }
-                    } else {
-                        let input = StatusInput {
-                            lines: bottom_lines,
-                            title: Some(title),
-                            foreground: &foreground,
-                            detector_state: Some(detector_state),
-                        };
-                        // Debug builds capture the match for the dump below;
-                        // release builds use the plain verdict (same work).
-                        let (detected, rule_match) = if debug {
-                            status::evaluate_with_match(&input, session.status, focused)
-                        } else {
-                            (status::evaluate(&input, session.status, focused), None)
-                        };
-                        // Stash the match for the debug dump below so the pack
-                        // is not evaluated a second time to explain the badge.
-                        debug_match = rule_match;
-                        if acknowledged && matches!(detected, SessionStatus::Done | SessionStatus::Error) {
-                            if focused {
-                                SessionStatus::Active
+                            };
+                            // Debug builds capture the match for the dump below;
+                            // release builds use the plain verdict (same work).
+                            let (detected, rule_match) = if debug {
+                                status::evaluate_with_match(&input, pane.status, focused)
                             } else {
-                                SessionStatus::Idle
+                                (status::evaluate(&input, pane.status, focused), None)
+                            };
+                            // Stash the match for the debug dump below so the pack
+                            // is not evaluated a second time to explain the badge.
+                            debug_match = rule_match;
+                            if acknowledged
+                                && matches!(detected, SessionStatus::Done | SessionStatus::Error)
+                            {
+                                if focused {
+                                    SessionStatus::Active
+                                } else {
+                                    SessionStatus::Idle
+                                }
+                            } else {
+                                detected
                             }
-                        } else {
-                            detected
+                        };
+
+                        if debug {
+                            let rule = debug_match
+                                .as_ref()
+                                .map_or_else(
+                                || "(no rule)".to_string(),
+                                |m| {
+                                    format!(
+                                        "{}/{} v{} state={} priority={} region={} \
+                                         visible(working/blocker/idle)={}/{}/{} skip_update={}",
+                                        m.pack,
+                                        m.rule,
+                                        m.pack_version.as_deref().unwrap_or("?"),
+                                        m.state.label(),
+                                        m.priority,
+                                        m.region,
+                                        m.visible_working,
+                                        m.visible_blocker,
+                                        m.visible_idle,
+                                        m.skip_state_update,
+                                    )
+                                },
+                            );
+                            eprintln!(
+                                "[status] pane={} focused={focused} exited={} exit={:?} \
+                                 pid={:?} fg={foreground:?} pack={:?} title={title:?} \
+                                 prev={} next={} detector={detector_state:?} rule={rule}",
+                                pane.id,
+                                terminal.has_exited(),
+                                terminal.exit_status(),
+                                pane.pid,
+                                status::pack_for(&foreground),
+                                pane.status.label(),
+                                next.label(),
+                            );
+                            let screen: Vec<&str> = bottom_lines
+                                .iter()
+                                .map(String::as_str)
+                                .filter(|line| !line.trim().is_empty())
+                                .collect();
+                            let from = screen.len().saturating_sub(DEBUG_SCREEN_LINES);
+                            for line in &screen[from..] {
+                                eprintln!("[status]   | {line}");
+                            }
                         }
+
+                        (next, ack, screen_fp)
                     };
 
-                    if debug {
-                        let rule = debug_match
-                            .as_ref()
-                            .map_or_else(
-                            || "(no rule)".to_string(),
-                            |m| {
-                                format!(
-                                    "{}/{} v{} state={} priority={} region={} \
-                                     visible(working/blocker/idle)={}/{}/{} skip_update={}",
-                                    m.pack,
-                                    m.rule,
-                                    m.pack_version.as_deref().unwrap_or("?"),
-                                    m.state.label(),
-                                    m.priority,
-                                    m.region,
-                                    m.visible_working,
-                                    m.visible_blocker,
-                                    m.visible_idle,
-                                    m.skip_state_update,
-                                )
-                            },
-                        );
-                        eprintln!(
-                            "[status] session={} focused={focused} exited={} exit={:?} \
-                             pid={:?} fg={foreground:?} pack={:?} title={title:?} \
-                             prev={} next={} detector={detector_state:?} rule={rule}",
-                            session.id,
-                            terminal.has_exited(),
-                            terminal.exit_status(),
-                            session.pid,
-                            status::pack_for(&foreground),
-                            session.status.label(),
-                            next.label(),
-                        );
-                        let screen: Vec<&str> = bottom_lines
-                            .iter()
-                            .map(String::as_str)
-                            .filter(|line| !line.trim().is_empty())
-                            .collect();
-                        let from = screen.len().saturating_sub(DEBUG_SCREEN_LINES);
-                        for line in &screen[from..] {
-                            eprintln!("[status]   | {line}");
-                        }
-                    }
+                    // Agent lifecycle. Two ways a task counts as finished, because
+                    // an agent CLI keeps running after it answers:
+                    //
+                    //  * the CLI itself exited (agent gone), or
+                    //  * it stopped working and is back at rest (the response is
+                    //    complete) — the usual case, and the one exit codes can
+                    //    never catch, since the PTY child is the persistent shell.
+                    //
+                    // Either way the completion is reported as Done: herdr's "the
+                    // agent finished and you have not looked at it yet". Reporting
+                    // it only while unfocused is deliberate — a badge is for the
+                    // tab you are *not* on.
+                    let agent_now = foreground.iter().any(|name| status::is_agent_process(name));
+                    let agent_exited = pane.agent_active && !agent_now;
+                    pane.agent_active = agent_now;
 
-                    (next, ack, screen_fp)
-                };
+                    let turn_finished = matches!(
+                        pane.status,
+                        SessionStatus::Working | SessionStatus::Blocked
+                    ) && next == SessionStatus::Idle;
 
-                // Agent lifecycle. Two ways a task counts as finished, because
-                // an agent CLI keeps running after it answers:
-                //
-                //  * the CLI itself exited (agent gone), or
-                //  * it stopped working and is back at rest (the response is
-                //    complete) — the usual case, and the one exit codes can
-                //    never catch, since the PTY child is the persistent shell.
-                //
-                // Either way the completion is reported as Done: herdr's "the
-                // agent finished and you have not looked at it yet". Reporting
-                // it only while unfocused is deliberate — a badge is for the
-                // tab you are *not* on.
-                let agent_now = foreground.iter().any(|name| status::is_agent_process(name));
-                let agent_exited = session.agent_active && !agent_now;
-                session.agent_active = agent_now;
-
-                let turn_finished = matches!(
-                    session.status,
-                    SessionStatus::Working | SessionStatus::Blocked
-                ) && next == SessionStatus::Idle;
-
-                let just_finished = agent_exited || turn_finished;
-                let next = if just_finished
-                    && next == SessionStatus::Idle
-                    && ack != Some(screen_fp)
-                    && !focused
-                {
-                    SessionStatus::Done
-                } else {
-                    next
-                };
-
-                // Spec: Done also drops back to Idle after a short timeout even
-                // if the user never focuses the terminal.
-                let next = if next == SessionStatus::Done {
-                    let since = *session.done_since.get_or_insert_with(std::time::Instant::now);
-                    if since.elapsed() >= DONE_LINGER {
-                        session.done_since = None;
-                        SessionStatus::Idle
+                    let just_finished = agent_exited || turn_finished;
+                    let next = if just_finished
+                        && next == SessionStatus::Idle
+                        && ack != Some(screen_fp)
+                        && !focused
+                    {
+                        SessionStatus::Done
                     } else {
                         next
+                    };
+
+                    // Spec: Done also drops back to Idle after a short timeout even
+                    // if the user never focuses the terminal.
+                    let next = if next == SessionStatus::Done {
+                        let since = *pane.done_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= DONE_LINGER {
+                            pane.done_since = None;
+                            SessionStatus::Idle
+                        } else {
+                            next
+                        }
+                    } else {
+                        pane.done_since = None;
+                        next
+                    };
+
+                    pane.ack_screen = ack;
+                    if pane.status != next {
+                        pane.status = next;
+                        changed = true;
                     }
-                } else {
-                    session.done_since = None;
-                    next
-                };
 
-                session.ack_screen = ack;
-                if session.status != next {
-                    session.status = next;
+                    pane.poll_cache = Some(poll_key);
+                }
+
+                // Session badge: the highest-ranked pane status wins, so one
+                // blocked pane inside a screen is enough to flag the tab.
+                let mut aggregate = SessionStatus::Idle;
+                for pane in &session.panes {
+                    if pane.status.rank() > aggregate.rank() {
+                        aggregate = pane.status;
+                    }
+                }
+                if session.status != aggregate {
+                    session.status = aggregate;
                     changed = true;
                 }
 
-                let term_title = session.terminal.read(cx).title();
-                let next_logo = logos::resolve_session_logo(
-                    &foreground,
-                    term_title,
-                    session.status,
-                    &session.logo,
-                );
-                if session.logo != next_logo {
-                    session.logo = next_logo;
-                    changed = true;
+                // Sidebar title/logo follow the pane the user is working in.
+                if let Some(idx) = primary_idx {
+                    let (primary_title, primary_status) = {
+                        let pane = &session.panes[idx];
+                        (pane.title.clone(), pane.status)
+                    };
+                    let next_logo = logos::resolve_session_logo(
+                        &primary_fg,
+                        Some(&primary_title),
+                        primary_status,
+                        &session.logo,
+                    );
+                    if session.logo != next_logo {
+                        session.logo = next_logo;
+                        changed = true;
+                    }
+                    if session.title.as_str() != primary_title {
+                        let shared = SharedString::from(primary_title);
+                        session.title = shared;
+                        session.display_title = truncate_title(&session.title);
+                        changed = true;
+                    }
                 }
-
-                session.poll_cache = Some(poll_key);
             }
         }
         if changed {
@@ -637,47 +735,38 @@ impl AppState {
                 .map(|p| p.sessions.len())
                 .unwrap_or(0);
             let title = SharedString::from(format!("terminal {}", session_count + 1));
-            let session = Session {
+            let pane = TerminalPane {
                 id: next_id,
-                title: title.clone(),
-                display_title: truncate_title(&title),
                 terminal,
                 status: SessionStatus::Idle,
+                title: title.to_string(),
+                display_title: truncate_title(&title),
                 pid,
                 screen_scratch: Vec::new(),
                 poll_cache: None,
                 ack_screen: None,
                 agent_active: false,
                 done_since: None,
-                logo: logos::default_logo(),
                 detector: status::Detector::default(),
             };
+            let session = Session {
+                id: next_id,
+                title: title.clone(),
+                display_title: truncate_title(&title),
+                logo: logos::default_logo(),
+                pane_tree: Some(PaneNode::Leaf(next_id)),
+                maximized_pane_id: None,
+                panes: vec![pane],
+                status: SessionStatus::Idle,
+            };
 
-            let p_idx = self.active_project_idx;
-            let pushed = if let Some(project) = self.active_project_mut() {
-                let target_id = project.sessions.get(project.active_session_idx).map(|s| s.id);
+            if let Some(project) = self.active_project_mut() {
                 project.sessions.push(session);
                 project.active_session_idx = project.sessions.len() - 1;
-                if let Some(tree) = &mut project.pane_tree {
-                    if let Some(target) = target_id {
-                        let split_id = next_id;
-                        tree.split(target, next_id, split_id, gpui::Axis::Horizontal);
-                    } else {
-                        *tree = PaneNode::Leaf(next_id);
-                    }
-                } else {
-                    project.pane_tree = Some(PaneNode::Leaf(next_id));
-                }
-                project.maximized_session_id = None;
-                Some(project.active_session_idx)
-            } else {
-                None
-            };
-            if let Some(s_idx) = pushed {
-                self.session_index.insert(next_id, (p_idx, s_idx));
-                self.focused_session_id = Some(next_id);
-                cx.notify();
             }
+            self.focused_pane_id = Some(next_id);
+            self.rebuild_session_index();
+            cx.notify();
         }
     }
 
@@ -700,20 +789,29 @@ impl AppState {
                 cx,
             ) {
                 terminal.read(cx).focus_handle().focus(window);
-                let session = Session {
+                let pane = TerminalPane {
                     id: next_id,
-                    title: SharedString::from("terminal 1"),
-                    display_title: SharedString::from("terminal 1"),
                     terminal,
                     status: SessionStatus::Idle,
+                    title: "terminal 1".to_string(),
+                    display_title: SharedString::from("terminal 1"),
                     pid,
                     screen_scratch: Vec::new(),
                     poll_cache: None,
                     ack_screen: None,
                     agent_active: false,
                     done_since: None,
-                    logo: logos::default_logo(),
                     detector: status::Detector::default(),
+                };
+                let session = Session {
+                    id: next_id,
+                    title: SharedString::from("terminal 1"),
+                    display_title: SharedString::from("terminal 1"),
+                    logo: logos::default_logo(),
+                    pane_tree: Some(PaneNode::Leaf(next_id)),
+                    maximized_pane_id: None,
+                    panes: vec![pane],
+                    status: SessionStatus::Idle,
                 };
                 let project = Project {
                     id: next_id,
@@ -721,15 +819,12 @@ impl AppState {
                     path: folder,
                     sessions: vec![session],
                     active_session_idx: 0,
-                    pane_tree: Some(PaneNode::Leaf(next_id)),
-                    maximized_session_id: None,
                 };
 
                 self.projects.push(project);
                 self.active_project_idx = self.projects.len() - 1;
-                let p_idx = self.active_project_idx;
-                self.session_index.insert(next_id, (p_idx, 0));
-                self.focused_session_id = Some(next_id);
+                self.rebuild_session_index();
+                self.focused_pane_id = Some(next_id);
                 cx.notify();
             }
         }
@@ -737,16 +832,23 @@ impl AppState {
 
     fn rebuild_session_index(&mut self) {
         self.session_index.clear();
+        self.pane_index.clear();
         for (p_idx, project) in self.projects.iter().enumerate() {
             for (s_idx, session) in project.sessions.iter().enumerate() {
                 self.session_index.insert(session.id, (p_idx, s_idx));
+                for (pane_idx, pane) in session.panes.iter().enumerate() {
+                    self.pane_index.insert(pane.id, (p_idx, s_idx, pane_idx));
+                }
             }
         }
     }
 
-    fn split_session(
+    /// Split a pane inside its session's own screen: the new terminal becomes
+    /// a sibling leaf in that session's layout tree. Other sessions' screens
+    /// are untouched.
+    fn split_pane(
         &mut self,
-        target_session_id: usize,
+        target_pane_id: usize,
         axis: gpui::Axis,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -756,13 +858,17 @@ impl AppState {
         self.next_id += 1;
         let next_id = self.next_id;
         self.next_id += 1;
-        let p_idx = self
-            .session_index
-            .get(&target_session_id)
-            .map(|(p, _)| *p)
-            .unwrap_or(self.active_project_idx);
+        let Some(&(p_idx, s_idx, _)) = self.pane_index.get(&target_pane_id) else {
+            return;
+        };
 
         let dir = self.projects.get(p_idx).map(|p| p.path.clone());
+        let pane_count = self
+            .projects
+            .get(p_idx)
+            .and_then(|p| p.sessions.get(s_idx))
+            .map(|s| s.panes.len())
+            .unwrap_or(0);
         if let Ok((terminal, pid)) = Self::spawn_terminal_view(
             dir.as_ref(),
             self.palette.clone(),
@@ -771,91 +877,99 @@ impl AppState {
             cx,
         ) {
             terminal.read(cx).focus_handle().focus(window);
-            let session_count = self
-                .projects
-                .get(p_idx)
-                .map(|p| p.sessions.len())
-                .unwrap_or(0);
-            let title = SharedString::from(format!("terminal {}", session_count + 1));
-            let session = Session {
+            let title = SharedString::from(format!("terminal {}", pane_count + 1));
+            let pane = TerminalPane {
                 id: next_id,
-                title: title.clone(),
-                display_title: truncate_title(&title),
                 terminal,
                 status: SessionStatus::Idle,
+                title: title.to_string(),
+                display_title: truncate_title(&title),
                 pid,
                 screen_scratch: Vec::new(),
                 poll_cache: None,
                 ack_screen: None,
                 agent_active: false,
                 done_since: None,
-                logo: logos::default_logo(),
                 detector: status::Detector::default(),
             };
 
             if let Some(project) = self.projects.get_mut(p_idx) {
-                project.sessions.push(session);
-                project.active_session_idx = project.sessions.len() - 1;
-                if let Some(tree) = &mut project.pane_tree {
-                    tree.split(target_session_id, next_id, split_id, axis);
-                } else {
-                    project.pane_tree = Some(PaneNode::Leaf(next_id));
+                if let Some(session) = project.sessions.get_mut(s_idx) {
+                    session.panes.push(pane);
+                    session.maximized_pane_id = None;
+                    if let Some(tree) = &mut session.pane_tree {
+                        tree.split(target_pane_id, next_id, split_id, axis);
+                    } else {
+                        session.pane_tree = Some(PaneNode::Leaf(next_id));
+                    }
                 }
-                project.maximized_session_id = None;
             }
-            self.focused_session_id = Some(next_id);
+            self.focused_pane_id = Some(next_id);
             self.rebuild_session_index();
             cx.notify();
         }
     }
 
-    fn toggle_maximize_session(&mut self, session_id: usize, cx: &mut Context<Self>) {
-        let p_idx = self
-            .session_index
-            .get(&session_id)
-            .map(|(p, _)| *p)
-            .unwrap_or(self.active_project_idx);
+    fn toggle_maximize_pane(&mut self, pane_id: usize, cx: &mut Context<Self>) {
+        let Some(&(p_idx, s_idx, _)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
 
-        if let Some(project) = self.projects.get_mut(p_idx) {
-            if project.maximized_session_id == Some(session_id) {
-                project.maximized_session_id = None;
+        if let Some(session) = self
+            .projects
+            .get_mut(p_idx)
+            .and_then(|p| p.sessions.get_mut(s_idx))
+        {
+            if session.maximized_pane_id == Some(pane_id) {
+                session.maximized_pane_id = None;
             } else {
-                project.maximized_session_id = Some(session_id);
+                session.maximized_pane_id = Some(pane_id);
             }
             cx.notify();
         }
     }
 
-    fn close_session(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let p_idx = self
-            .session_index
-            .get(&session_id)
-            .map(|(p, _)| *p)
-            .unwrap_or(self.active_project_idx);
+    /// Close one pane inside its session's screen. Closing the last pane also
+    /// removes the session (screen) itself; an emptied project spawns a fresh
+    /// session, like before.
+    fn close_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(&(p_idx, s_idx, _)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
 
+        let mut session_removed = false;
         let mut needs_new_session = false;
         if let Some(project) = self.projects.get_mut(p_idx) {
-            if project.maximized_session_id == Some(session_id) {
-                project.maximized_session_id = None;
-            }
-            project.pane_tree = project.pane_tree.take().and_then(|t| t.remove(session_id));
-            project.sessions.retain(|s| s.id != session_id);
-
-            if let Some(tree) = &project.pane_tree {
-                let next_active = tree.first_leaf();
-                if let Some(pos) = project.sessions.iter().position(|s| s.id == next_active) {
-                    project.active_session_idx = pos;
-                    project.sessions[pos].terminal.read(cx).focus_handle().focus(window);
-                    self.focused_session_id = Some(next_active);
+            if let Some(session) = project.sessions.get_mut(s_idx) {
+                if session.maximized_pane_id == Some(pane_id) {
+                    session.maximized_pane_id = None;
                 }
-            } else if project.sessions.is_empty() {
-                needs_new_session = true;
-            } else {
-                let first_id = project.sessions[0].id;
-                project.pane_tree = Some(PaneNode::Leaf(first_id));
-                project.active_session_idx = 0;
-                project.sessions[0].terminal.read(cx).focus_handle().focus(window);
-                self.focused_session_id = Some(first_id);
+                session.pane_tree = session.pane_tree.take().and_then(|t| t.remove(pane_id));
+                session.panes.retain(|p| p.id != pane_id);
+                if session.pane_tree.is_none() || session.panes.is_empty() {
+                    session_removed = true;
+                }
+            }
+            if session_removed {
+                project.sessions.retain(|s| !s.panes.is_empty());
+                if project.sessions.is_empty() {
+                    needs_new_session = true;
+                } else {
+                    project.active_session_idx = project
+                        .active_session_idx
+                        .min(project.sessions.len() - 1);
+                }
+            } else if let Some(session) = project.sessions.get(s_idx) {
+                // Focus the surviving first pane of this screen.
+                let next_leaf = session
+                    .pane_tree
+                    .as_ref()
+                    .map(|t| t.first_leaf())
+                    .and_then(|id| session.panes.iter().find(|p| p.id == id));
+                if let Some(pane) = next_leaf {
+                    pane.terminal.read(cx).focus_handle().focus(window);
+                    self.focused_pane_id = Some(pane.id);
+                }
             }
         }
 
@@ -868,14 +982,16 @@ impl AppState {
         }
     }
 
-    fn focus_session(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.focused_session_id = Some(session_id);
-        if let Some(&(p_idx, s_idx)) = self.session_index.get(&session_id) {
+    fn focus_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.focused_pane_id = Some(pane_id);
+        if let Some(&(p_idx, s_idx, _)) = self.pane_index.get(&pane_id) {
             self.active_project_idx = p_idx;
             if let Some(p) = self.projects.get_mut(p_idx) {
                 p.active_session_idx = s_idx;
-                if let Some(session) = p.sessions.get(s_idx) {
-                    session.terminal.read(cx).focus_handle().focus(window);
+                if let Some(session) = p.sessions.get_mut(s_idx) {
+                    if let Some(pane) = session.panes.iter_mut().find(|p| p.id == pane_id) {
+                        pane.terminal.read(cx).focus_handle().focus(window);
+                    }
                 }
             }
         }
@@ -884,15 +1000,15 @@ impl AppState {
 
     fn render_terminal_pane(
         &self,
-        session: &Session,
+        pane: &TerminalPane,
         is_maximized: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let session_id = session.id;
-        let is_focused = self.focused_session_id == Some(session_id);
+        let pane_id = pane.id;
+        let is_focused = self.focused_pane_id == Some(pane_id);
 
         div()
-            .id(("terminal-pane", session_id))
+            .id(("terminal-pane", pane_id))
             .flex()
             .flex_col()
             .size_full()
@@ -908,7 +1024,7 @@ impl AppState {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    this.focus_session(session_id, window, cx);
+                    this.focus_pane(pane_id, window, cx);
                 }),
             )
             .child(
@@ -924,7 +1040,7 @@ impl AppState {
                         div()
                             .text_size(px(11.5))
                             .text_color(rgba(0x656679ff))
-                            .child(session.display_title.clone()),
+                            .child(pane.display_title.clone()),
                     )
                     .child(
                         div()
@@ -933,7 +1049,7 @@ impl AppState {
                             .gap(px(6.0))
                             .child(
                                 div()
-                                    .id(("split-v-btn", session_id))
+                                    .id(("split-v-btn", pane_id))
                                     .size(px(22.0))
                                     .flex()
                                     .items_center()
@@ -952,13 +1068,13 @@ impl AppState {
                                         MouseButton::Left,
                                         cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.split_session(session_id, gpui::Axis::Horizontal, window, cx);
+                                            this.split_pane(pane_id, gpui::Axis::Horizontal, window, cx);
                                         }),
                                     ),
                             )
                             .child(
                                 div()
-                                    .id(("split-h-btn", session_id))
+                                    .id(("split-h-btn", pane_id))
                                     .size(px(22.0))
                                     .flex()
                                     .items_center()
@@ -977,13 +1093,13 @@ impl AppState {
                                         MouseButton::Left,
                                         cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.split_session(session_id, gpui::Axis::Vertical, window, cx);
+                                            this.split_pane(pane_id, gpui::Axis::Vertical, window, cx);
                                         }),
                                     ),
                             )
                             .child(
                                 div()
-                                    .id(("maximize-btn", session_id))
+                                    .id(("maximize-btn", pane_id))
                                     .size(px(22.0))
                                     .flex()
                                     .items_center()
@@ -1006,13 +1122,13 @@ impl AppState {
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
-                                            this.toggle_maximize_session(session_id, cx);
+                                            this.toggle_maximize_pane(pane_id, cx);
                                         }),
                                     ),
                             )
                             .child(
                                 div()
-                                    .id(("close-btn", session_id))
+                                    .id(("close-btn", pane_id))
                                     .size(px(22.0))
                                     .flex()
                                     .items_center()
@@ -1031,7 +1147,7 @@ impl AppState {
                                         MouseButton::Left,
                                         cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.close_session(session_id, window, cx);
+                                            this.close_pane(pane_id, window, cx);
                                         }),
                                     ),
                             ),
@@ -1042,29 +1158,29 @@ impl AppState {
                     .flex_1()
                     .size_full()
                     .overflow_hidden()
-                    .child(session.terminal.clone()),
+                    .child(pane.terminal.clone()),
             )
     }
 
     fn render_pane_node(
         &self,
         node: &PaneNode,
-        project: &Project,
+        session: &Session,
         is_maximized: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match node {
-            PaneNode::Leaf(session_id) => {
-                if let Some(session) = project.sessions.iter().find(|s| s.id == *session_id) {
-                    self.render_terminal_pane(session, is_maximized, cx)
+            PaneNode::Leaf(pane_id) => {
+                if let Some(pane) = session.panes.iter().find(|p| p.id == *pane_id) {
+                    self.render_terminal_pane(pane, is_maximized, cx)
                         .into_any_element()
                 } else {
                     div().into_any_element()
                 }
             }
             PaneNode::Split { id, axis, left, right } => {
-                let left_el = self.render_pane_node(left, project, is_maximized, cx);
-                let right_el = self.render_pane_node(right, project, is_maximized, cx);
+                let left_el = self.render_pane_node(left, session, is_maximized, cx);
+                let right_el = self.render_pane_node(right, session, is_maximized, cx);
                 let is_horizontal = *axis == gpui::Axis::Horizontal;
                 let split_id = ("terminal-split", *id);
 
@@ -1099,12 +1215,32 @@ impl AppState {
         }
     }
 
+    /// The pane entity a top-level action (font size) applies to: the focused
+    /// pane, or the first pane of the active session's screen.
+    fn active_pane_terminal(&self) -> Option<Entity<TerminalView>> {
+        let focused_pane = self
+            .focused_pane_id
+            .and_then(|focused| self.pane_index.get(&focused).copied())
+            .and_then(|(p_idx, s_idx, pane_idx)| {
+                self.projects
+                    .get(p_idx)
+                    .and_then(|p| p.sessions.get(s_idx))
+                    .and_then(|s| s.panes.get(pane_idx))
+            })
+            .map(|p| p.terminal.clone());
+        focused_pane.or_else(|| {
+            self.active_session()
+                .and_then(|s| s.panes.first())
+                .map(|p| p.terminal.clone())
+        })
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
 
         if keystroke.modifiers.control && (keystroke.key == "+" || keystroke.key == "=") {
-            if let Some(session) = self.active_session() {
-                session.terminal.update(cx, |terminal, cx| {
+            if let Some(entity) = self.active_pane_terminal() {
+                entity.update(cx, |terminal, cx| {
                     let mut config = terminal.config().clone();
                     config.font_size += px(1.0);
                     terminal.update_config(config, cx);
@@ -1112,8 +1248,8 @@ impl AppState {
             }
             cx.stop_propagation();
         } else if keystroke.modifiers.control && keystroke.key == "-" {
-            if let Some(session) = self.active_session() {
-                session.terminal.update(cx, |terminal, cx| {
+            if let Some(entity) = self.active_pane_terminal() {
+                entity.update(cx, |terminal, cx| {
                     let mut config = terminal.config().clone();
                     if config.font_size > px(6.0) {
                         config.font_size -= px(1.0);
@@ -1128,26 +1264,24 @@ impl AppState {
 
 impl Render for AppState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Track which session owns keyboard focus each frame; the poller uses
+        // Track which pane owns keyboard focus each frame; the poller uses
         // this for Active-state resolution and for clearing sticky Done/Error.
-        if let Some(project) = self.active_project() {
-            let mut focused_id = None;
-            let mut focused_idx = None;
-            for (idx, s) in project.sessions.iter().enumerate() {
-                if s.terminal.read(cx).focus_handle().is_focused(_window) {
-                    focused_id = Some(s.id);
-                    focused_idx = Some(idx);
+        let mut focused_pane = None;
+        if let Some(session) = self.active_session() {
+            for pane in &session.panes {
+                if pane.terminal.read(cx).focus_handle().is_focused(_window) {
+                    focused_pane = Some(pane.id);
                     break;
                 }
             }
-            if let (Some(id), Some(idx)) = (focused_id, focused_idx) {
-                self.focused_session_id = Some(id);
-                if let Some(p) = self.projects.get_mut(self.active_project_idx) {
-                    p.active_session_idx = idx;
-                }
-            } else if self.focused_session_id.is_none() {
-                self.focused_session_id = self.active_session().map(|s| s.id);
-            }
+        }
+        if let Some(focused_pane) = focused_pane {
+            self.focused_pane_id = Some(focused_pane);
+        } else if self.focused_pane_id.is_none() {
+            self.focused_pane_id = self
+                .active_session()
+                .and_then(|s| s.panes.first())
+                .map(|p| p.id);
         }
 
         let active_title = self
@@ -1160,19 +1294,22 @@ impl Render for AppState {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| SharedString::from("No Project"));
 
-        let terminal_area = if let Some(project) = self.active_project() {
-            if let Some(max_id) = project.maximized_session_id {
-                if let Some(session) = project.sessions.iter().find(|s| s.id == max_id) {
-                    self.render_terminal_pane(session, true, cx).into_any_element()
-                } else if let Some(tree) = &project.pane_tree {
-                    self.render_pane_node(tree, project, false, cx)
+        let terminal_area = if let Some(session) = self.active_session() {
+            // Each session is its own screen: its pane tree (and maximized
+            // pane) is rendered exclusively; other sessions' panes keep
+            // running in the background.
+            if let Some(max_pane_id) = session.maximized_pane_id {
+                if let Some(pane) = session.panes.iter().find(|p| p.id == max_pane_id) {
+                    self.render_terminal_pane(pane, true, cx).into_any_element()
+                } else if let Some(tree) = &session.pane_tree {
+                    self.render_pane_node(tree, session, false, cx)
                 } else {
                     div().into_any_element()
                 }
-            } else if let Some(tree) = &project.pane_tree {
-                self.render_pane_node(tree, project, false, cx)
-            } else if let Some(session) = self.active_session() {
-                self.render_terminal_pane(session, false, cx).into_any_element()
+            } else if let Some(tree) = &session.pane_tree {
+                self.render_pane_node(tree, session, false, cx)
+            } else if let Some(pane) = session.panes.first() {
+                self.render_terminal_pane(pane, false, cx).into_any_element()
             } else {
                 div().into_any_element()
             }
@@ -1513,8 +1650,17 @@ impl Render for AppState {
                                         MouseButton::Left,
                                         cx.listener(move |this, _, window, cx| {
                                             this.active_project_idx = p_idx;
-                                            if let Some(session) = this.active_session() {
-                                                session.terminal.read(cx).focus_handle().focus(window);
+                                            let focused = this
+                                                .active_session()
+                                                .and_then(|s| s.panes.first())
+                                                .map(|p| p.id);
+                                            if let Some(pane_id) = focused {
+                                                this.focused_pane_id = Some(pane_id);
+                                            }
+                                            if let Some(pane) =
+                                                this.active_session().and_then(|s| s.panes.first())
+                                            {
+                                                pane.terminal.read(cx).focus_handle().focus(window);
                                             }
                                             cx.notify();
                                         }),
@@ -1651,26 +1797,27 @@ impl Render for AppState {
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, _, window, cx| {
+                                                    // Switching tabs is a pure screen swap: the
+                                                    // clicked session's own pane tree becomes
+                                                    // the whole visible area. Other sessions'
+                                                    // panes keep running in the background.
                                                     this.active_project_idx = p_idx;
-                                                    if let Some(p) = this.projects.get_mut(p_idx) {
-                                                        p.active_session_idx = s_idx;
-                                                        let s_id = p.sessions[s_idx].id;
-                                                        if !p.pane_tree.as_ref().map_or(false, |t| t.contains(s_id)) {
-                                                            let split_id = this.next_id;
-                                                            this.next_id += 1;
-                                                            if let Some(tree) = &mut p.pane_tree {
-                                                                let active_id = tree.first_leaf();
-                                                                tree.split(active_id, s_id, split_id, gpui::Axis::Horizontal);
-                                                            } else {
-                                                                p.pane_tree = Some(PaneNode::Leaf(s_id));
-                                                            }
-                                                        }
-                                                        p.maximized_session_id = None;
+                                                    if let Some(session) = this
+                                                        .projects
+                                                        .get_mut(p_idx)
+                                                        .and_then(|p| {
+                                                            p.active_session_idx = s_idx;
+                                                            p.sessions.get_mut(s_idx)
+                                                        })
+                                                    {
+                                                        session.maximized_pane_id = None;
                                                     }
                                                     if let Some(session) = this.active_session() {
-                                                        session.terminal.read(cx).focus_handle().focus(window);
+                                                        if let Some(pane) = session.panes.first() {
+                                                            pane.terminal.read(cx).focus_handle().focus(window);
+                                                            this.focused_pane_id = Some(pane.id);
+                                                        }
                                                     }
-                                                    this.focused_session_id = this.active_session().map(|s| s.id);
                                                     cx.notify();
                                                 }),
                                             )
@@ -1908,20 +2055,30 @@ fn main() -> Result<()> {
 
                         initial_terminal.read(cx).focus_handle().focus(window);
 
-                        let initial_session = Session {
+                        let initial_pane = TerminalPane {
                             id: 1,
-                            title: SharedString::from("terminal 1"),
-                            display_title: SharedString::from("terminal 1"),
                             terminal: initial_terminal,
                             status: SessionStatus::Idle,
+                            title: "terminal 1".to_string(),
+                            display_title: SharedString::from("terminal 1"),
                             pid,
                             screen_scratch: Vec::new(),
                             poll_cache: None,
                             ack_screen: None,
                             agent_active: false,
                             done_since: None,
-                            logo: logos::default_logo(),
                             detector: status::Detector::default(),
+                        };
+
+                        let initial_session = Session {
+                            id: 1,
+                            title: SharedString::from("terminal 1"),
+                            display_title: SharedString::from("terminal 1"),
+                            logo: logos::default_logo(),
+                            pane_tree: Some(PaneNode::Leaf(1)),
+                            maximized_pane_id: None,
+                            panes: vec![initial_pane],
+                            status: SessionStatus::Idle,
                         };
 
                         let initial_project = Project {
@@ -1930,8 +2087,6 @@ fn main() -> Result<()> {
                             path: current_dir_clone,
                             sessions: vec![initial_session],
                             active_session_idx: 0,
-                            pane_tree: Some(PaneNode::Leaf(1)),
-                            maximized_session_id: None,
                         };
 
                         AppState {
@@ -1939,8 +2094,9 @@ fn main() -> Result<()> {
                             active_project_idx: 0,
                             next_id: 2,
                             session_index: HashMap::from([(1, (0, 0))]),
+                            pane_index: HashMap::from([(1, (0, 0, 0))]),
                             palette: palette_clone,
-                            focused_session_id: None,
+                            focused_pane_id: Some(1),
                             sidebar_visible: true,
                             sidebar_width: px(330.0),
                             drag_start_pos: None,
@@ -2042,6 +2198,21 @@ mod resize_tests {
                 .expect("terminal view");
         let title = SharedString::from("terminal 1");
 
+        let pane = TerminalPane {
+            id: 1,
+            terminal,
+            status: SessionStatus::Idle,
+            title: "terminal 1".to_string(),
+            display_title: title.clone(),
+            pid,
+            screen_scratch: Vec::new(),
+            poll_cache: None,
+            ack_screen: None,
+            agent_active: false,
+            done_since: None,
+            detector: status::Detector::default(),
+        };
+
         AppState {
             projects: vec![Project {
                 id: 1,
@@ -2051,26 +2222,20 @@ mod resize_tests {
                     id: 1,
                     title: title.clone(),
                     display_title: title,
-                    terminal,
-                    status: SessionStatus::Idle,
-                    pid,
-                    screen_scratch: Vec::new(),
-                    poll_cache: None,
-                    ack_screen: None,
-                    agent_active: false,
-                    done_since: None,
                     logo: logos::default_logo(),
-                    detector: status::Detector::default(),
+                    pane_tree: Some(PaneNode::Leaf(1)),
+                    maximized_pane_id: None,
+                    panes: vec![pane],
+                    status: SessionStatus::Idle,
                 }],
                 active_session_idx: 0,
-                pane_tree: Some(PaneNode::Leaf(1)),
-                maximized_session_id: None,
             }],
             active_project_idx: 0,
             next_id: 2,
             session_index: HashMap::from([(1, (0, 0))]),
+            pane_index: HashMap::from([(1, (0, 0, 0))]),
             palette,
-            focused_session_id: None,
+            focused_pane_id: Some(1),
             sidebar_visible: true,
             sidebar_width: px(330.0),
             drag_start_pos: None,
@@ -2114,7 +2279,7 @@ mod resize_tests {
             .expect("headless renderer");
         let (mut cx, app_state) = open_app(&mut cx);
         let terminal = app_state.read_with(&cx, |state, _| {
-            state.active_session().expect("a session").terminal.clone()
+            state.active_session().expect("a session").panes[0].terminal.clone()
         });
 
         let mut grid_sizes = Vec::new();
@@ -2379,46 +2544,44 @@ mod pane_tests {
 
         // Split vertical
         cx.update_window_entity(&app_state, |state, window, cx| {
-            state.split_session(1, gpui::Axis::Horizontal, window, cx);
+            state.split_pane(1, gpui::Axis::Horizontal, window, cx);
         });
         cx.draw_frame().expect("frame after vertical split");
 
-        let session_count = app_state.read_with(&cx, |state, _| {
-            state.active_project().unwrap().sessions.len()
+        let pane_count = app_state.read_with(&cx, |state, _| {
+            state.active_project().unwrap().sessions[0].panes.len()
         });
-        assert_eq!(session_count, 2);
+        assert_eq!(pane_count, 2);
 
-        let new_session_id = app_state.read_with(&cx, |state, _| {
-            state.active_project().unwrap().sessions.last().unwrap().id
-        });
+        let new_pane_id = app_state.read_with(&cx, |state, _| state.focused_pane_id.unwrap());
 
         // Toggle maximize
         app_state.update(&mut cx, |state, cx| {
-            state.toggle_maximize_session(new_session_id, cx);
+            state.toggle_maximize_pane(new_pane_id, cx);
         });
         cx.draw_frame().expect("frame while maximized");
 
         let is_max = app_state.read_with(&cx, |state, _| {
-            state.active_project().unwrap().maximized_session_id
+            state.active_project().unwrap().sessions[0].maximized_pane_id
         });
-        assert_eq!(is_max, Some(new_session_id));
+        assert_eq!(is_max, Some(new_pane_id));
 
         // Restore
         app_state.update(&mut cx, |state, cx| {
-            state.toggle_maximize_session(new_session_id, cx);
+            state.toggle_maximize_pane(new_pane_id, cx);
         });
         cx.draw_frame().expect("frame restored");
 
         // Close the new pane
         cx.update_window_entity(&app_state, |state, window, cx| {
-            state.close_session(new_session_id, window, cx);
+            state.close_pane(new_pane_id, window, cx);
         });
         cx.draw_frame().expect("frame after close");
 
-        let session_count_after = app_state.read_with(&cx, |state, _| {
-            state.active_project().unwrap().sessions.len()
+        let pane_count_after = app_state.read_with(&cx, |state, _| {
+            state.active_project().unwrap().sessions[0].panes.len()
         });
-        assert_eq!(session_count_after, 1);
+        assert_eq!(pane_count_after, 1);
     }
 
     #[test]
@@ -2430,7 +2593,7 @@ mod pane_tests {
 
         // Split vertical
         cx.update_window_entity(&app_state, |state, window, cx| {
-            state.split_session(1, gpui::Axis::Horizontal, window, cx);
+            state.split_pane(1, gpui::Axis::Horizontal, window, cx);
         });
         cx.draw_frame().expect("frame after vertical split");
 
@@ -2458,23 +2621,23 @@ mod pane_tests {
 
         // Split 1 vertically: Left: 1, Right: new (2)
         cx.update_window_entity(&app_state, |state, window, cx| {
-            state.split_session(1, gpui::Axis::Horizontal, window, cx);
+            state.split_pane(1, gpui::Axis::Horizontal, window, cx);
         });
         cx.draw_frame().expect("frame after vertical split");
 
         // Split 1 horizontally: Top-left: 1, Bottom-left: new (3)
         cx.update_window_entity(&app_state, |state, window, cx| {
-            state.split_session(1, gpui::Axis::Vertical, window, cx);
+            state.split_pane(1, gpui::Axis::Vertical, window, cx);
         });
         cx.run_until_parked();
         cx.draw_frame().expect("frame after horizontal split");
 
-        // Check terminal dimensions/bounds for all 3 sessions
+        // Check terminal dimensions/bounds for all 3 panes
         let (term1, term2, term3) = app_state.read_with(&cx, |state, cx| {
-            let project = state.active_project().unwrap();
-            let t1 = project.sessions[0].terminal.read(cx).dimensions();
-            let t2 = project.sessions[1].terminal.read(cx).dimensions();
-            let t3 = project.sessions[2].terminal.read(cx).dimensions();
+            let session = &state.active_project().unwrap().sessions[0];
+            let t1 = session.panes[0].terminal.read(cx).dimensions();
+            let t2 = session.panes[1].terminal.read(cx).dimensions();
+            let t3 = session.panes[2].terminal.read(cx).dimensions();
             (t1, t2, t3)
         });
 
@@ -2493,31 +2656,74 @@ mod pane_tests {
 
         // Split 1 horizontally: Top: 1, Bottom: 2
         cx.update_window_entity(&app_state, |state, window, cx| {
-            state.split_session(1, gpui::Axis::Vertical, window, cx);
+            state.split_pane(1, gpui::Axis::Vertical, window, cx);
         });
         cx.draw_frame().expect("frame after horizontal split");
 
-        let bottom_id = app_state.read_with(&cx, |state, _| {
-            state.active_project().unwrap().sessions.last().unwrap().id
-        });
+        let bottom_id = app_state.read_with(&cx, |state, _| state.focused_pane_id.unwrap());
 
         // Split bottom vertically: Bottom-left: 2, Bottom-right: 3
         cx.update_window_entity(&app_state, |state, window, cx| {
-            state.split_session(bottom_id, gpui::Axis::Horizontal, window, cx);
+            state.split_pane(bottom_id, gpui::Axis::Horizontal, window, cx);
         });
         cx.run_until_parked();
         cx.draw_frame().expect("frame after vertical split");
 
         let (term1, term2, term3) = app_state.read_with(&cx, |state, cx| {
-            let project = state.active_project().unwrap();
-            let t1 = project.sessions[0].terminal.read(cx).dimensions();
-            let t2 = project.sessions[1].terminal.read(cx).dimensions();
-            let t3 = project.sessions[2].terminal.read(cx).dimensions();
+            let session = &state.active_project().unwrap().sessions[0];
+            let t1 = session.panes[0].terminal.read(cx).dimensions();
+            let t2 = session.panes[1].terminal.read(cx).dimensions();
+            let t3 = session.panes[2].terminal.read(cx).dimensions();
             (t1, t2, t3)
         });
 
         assert!(term1.1 > 5, "term1 collapsed: {:?}", term1);
         assert!(term2.1 > 5, "term2 collapsed: {:?}", term2);
         assert!(term3.1 > 5, "term3 collapsed: {:?}", term3);
+    }
+
+    #[test]
+    fn session_isolation_switch_tabs_keeps_screens_separate() {
+        // The herdr-style isolation contract: creating a second session must
+        // not touch the first session's pane tree, and each tab renders its
+        // own screen.
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame");
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.split_pane(1, gpui::Axis::Horizontal, window, cx);
+        });
+        cx.draw_frame().expect("frame after split in session 1");
+
+        let new_pane_id = app_state.read_with(&cx, |state, _| state.focused_pane_id.unwrap());
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.create_new_session_for_active_project(window, cx);
+        });
+        cx.draw_frame().expect("frame after adding a session");
+
+        let (first_pane_count, second_tree) = app_state.read_with(&cx, |state, _| {
+            let project = state.active_project().unwrap();
+            (
+                project.sessions[0].panes.len(),
+                project.sessions[1].pane_tree.clone(),
+            )
+        });
+        assert_eq!(first_pane_count, 2);
+        // The new session starts on its own full-size screen with one pane.
+        assert!(matches!(second_tree, Some(PaneNode::Leaf(_))));
+
+        // Switch back to the first tab: the split is still there.
+        app_state.update(&mut cx, |state, cx| {
+            state.active_project_mut().unwrap().active_session_idx = 0;
+            cx.notify();
+        });
+        cx.draw_frame().expect("frame after switching tabs");
+        let first_tree = app_state.read_with(&cx, |state, _| {
+            state.active_project().unwrap().sessions[0].pane_tree.clone()
+        });
+        assert!(first_tree.map_or(false, |t| t.contains(1) && t.contains(new_pane_id)));
     }
 }
