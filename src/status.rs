@@ -30,12 +30,15 @@
 //! [`foreground_process_names`] returns nothing and detection rests on the
 //! screen and OSC rules alone.
 
+use std::collections::hash_map::DefaultHasher;
 #[cfg(unix)]
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
-#[cfg(unix)]
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
+use regex::{RegexSet, RegexSetBuilder};
 use crate::agent_rules::{self, DetectionInput, RuleState};
 
 /// Foreground-group cache: shell pid -> (tpgid, process names).
@@ -104,6 +107,159 @@ impl SessionStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Running,
+    Idle,
+    AwaitingApproval,
+    Exited,
+}
+
+impl State {
+    pub fn to_session_status(self) -> SessionStatus {
+        match self {
+            State::Running => SessionStatus::Working,
+            State::Idle => SessionStatus::Idle,
+            State::AwaitingApproval => SessionStatus::Blocked,
+            State::Exited => SessionStatus::Done,
+        }
+    }
+}
+
+/// Patterns that describe one agent's UI. `generic()` works for most agents;
+/// add per-agent patterns with `with_approval` / `with_running`.
+#[derive(Debug, Clone)]
+pub struct Profile {
+    approval: Vec<String>,
+    running: Vec<String>,
+}
+
+impl Profile {
+    pub fn generic() -> Self {
+        Self {
+            approval: [
+                r"\(y/n\)",
+                r"\[y/n(/\w+)?\]",
+                r"\by/n\b",
+                r"do you want to (proceed|allow|run|make|create|apply|continue|edit)",
+                r"\b(allow|approve|permit|grant)\b.*\?",
+                r"press enter to (confirm|continue|approve)",
+                r"[❯>›▶]\s*1[.)]\s*(yes|allow|approve|accept)",
+                r"\b(esc|escape) to (cancel|deny|reject)",
+                r"password:",
+                r"yes \(y\)",
+            ]
+            .map(String::from)
+            .to_vec(),
+            running: [
+                r"(esc|ctrl\+c|ctrl-c) to (interrupt|cancel|stop)",
+                r"[\u{2800}-\u{28ff}\u{25d0}-\u{25d3}]",
+                r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]", // braille spinners
+                r"(thinking|working|generating|processing)\s*(…|\.\.\.)",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
+
+    pub fn with_approval(mut self, re: &str) -> Self {
+        self.approval.push(re.into());
+        self
+    }
+
+    pub fn with_running(mut self, re: &str) -> Self {
+        self.running.push(re.into());
+        self
+    }
+
+    pub fn compile(&self) -> (RegexSet, RegexSet) {
+        let b = |v: &[String]| {
+            RegexSetBuilder::new(v)
+                .case_insensitive(true)
+                .build()
+                .expect("bad pattern")
+        };
+        (b(&self.approval), b(&self.running))
+    }
+}
+
+/// Pure state machine: feed it screen text, get a state. It does not care
+/// where the text came from (PTY, tmux capture-pane, ...), so it is easy to test.
+pub struct Detector {
+    approval: RegexSet,
+    running: RegexSet,
+    last_hash: u64,
+    last_change: Instant,
+    /// screen must be unchanged this long before we trust an approval prompt
+    settle: Duration,
+    /// screen must be unchanged this long (with no "running" marker) to be idle
+    idle_after: Duration,
+}
+
+impl Default for Detector {
+    fn default() -> Self {
+        Self::new(Profile::generic(), Instant::now())
+    }
+}
+
+impl Detector {
+    pub fn new(profile: Profile, now: Instant) -> Self {
+        let (approval, running) = profile.compile();
+        Self {
+            approval,
+            running,
+            last_hash: 0,
+            last_change: now,
+            settle: Duration::from_millis(400),
+            idle_after: Duration::from_millis(1500),
+        }
+    }
+
+    pub fn update(&mut self, screen: &str, exited: bool, now: Instant) -> State {
+        if exited {
+            return State::Exited;
+        }
+        let mut h = DefaultHasher::new();
+        screen.hash(&mut h);
+        let hash = h.finish();
+        if hash != self.last_hash {
+            self.last_hash = hash;
+            self.last_change = now;
+        }
+        let stable = now.duration_since(self.last_change);
+        let tail = tail_lines(screen, 12);
+
+        // 1. a prompt waiting on the human (only once the screen stopped moving)
+        if stable >= self.settle && self.approval.is_match(&tail) {
+            return State::AwaitingApproval;
+        }
+        // 2. an explicit "busy" marker is visible (even if output is quiet)
+        if self.running.is_match(&tail) {
+            return State::Running;
+        }
+        // 3. screen still changing => busy; stable => idle at its prompt
+        if stable < self.idle_after {
+            State::Running
+        } else {
+            State::Idle
+        }
+    }
+
+    pub fn settle(&self) -> Duration {
+        self.settle
+    }
+
+    pub fn idle_after(&self) -> Duration {
+        self.idle_after
+    }
+}
+
+/// Last `n` non-empty lines of the screen.
+pub fn tail_lines(screen: &str, n: usize) -> String {
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 /// All inputs needed for one detection pass.
 pub struct StatusInput<'a> {
     /// Visible screen rows, top to bottom.
@@ -112,11 +268,28 @@ pub struct StatusInput<'a> {
     pub title: Option<&'a str>,
     /// Names in the shell's foreground process group. Empty at a prompt.
     pub foreground: &'a [String],
+    /// State from the temporal detector, if available.
+    pub detector_state: Option<State>,
 }
 
-/// Does this process name belong to an agent CLI we have a rule pack for?
+
+const EXTRA_AGENTS: &[&str] = &[
+    "aider",
+    "goose",
+    "cursor-agent",
+    "plandex",
+    "swept",
+    "openman",
+    "avante",
+];
+
+/// Does this process name belong to an agent CLI we recognize?
 pub fn is_agent_process(name: &str) -> bool {
     agent_rules::identify(name).is_some()
+        || EXTRA_AGENTS.iter().any(|&extra| {
+            let key = name.rsplit('/').next().unwrap_or(name).trim().to_ascii_lowercase();
+            key == extra || key.strip_suffix("-cli").is_some_and(|s| s == extra)
+        })
 }
 
 /// The rule pack that owns any of `process_names`, for logging.
@@ -286,20 +459,7 @@ pub fn debug_enabled() -> bool {
 /// `prev` is the last reported status; it drives stickiness. `focused` means
 /// the user is interacting with this terminal right now.
 pub fn evaluate(input: &StatusInput<'_>, prev: SessionStatus, focused: bool) -> SessionStatus {
-    // Sticky states are cleared on focus, otherwise they persist.
-    if matches!(prev, SessionStatus::Done | SessionStatus::Error) {
-        return if focused { SessionStatus::Idle } else { prev };
-    }
-
-    let detected = detect(input, prev);
-
-    // Priority resolution with focus folded in as the lowest rung.
-    let focus_status = if focused { SessionStatus::Active } else { SessionStatus::Idle };
-    if detected.rank() > focus_status.rank() {
-        detected
-    } else {
-        focus_status
-    }
+    evaluate_with_match(input, prev, focused).0
 }
 
 /// Like [`evaluate`], but also returns the agent rule match behind the verdict
@@ -316,19 +476,26 @@ pub fn evaluate_with_match(
 
     let (detected, matched) = detect_full(input, prev);
 
-    // Priority resolution with focus folded in as the lowest rung.
-    let focus_status = if focused { SessionStatus::Active } else { SessionStatus::Idle };
-    let status = if detected.rank() > focus_status.rank() {
-        detected
+    let screen = input.lines.join("\n");
+    let tail = tail_lines(&screen, FallbackRules::WINDOW);
+    let is_agent_working = match &matched {
+        Some(m) => m.state == RuleState::Working,
+        None => FallbackRules::is_running(&tail),
+    };
+
+    // When the user is focused and interacting, plain shell commands report Active.
+    // Only an agent running on its own ("own way") reports Working in a focused tab.
+    let status = if detected == SessionStatus::Working && !is_agent_working && focused {
+        SessionStatus::Active
     } else {
-        focus_status
+        let focus_status = if focused { SessionStatus::Active } else { SessionStatus::Idle };
+        if detected.rank() > focus_status.rank() {
+            detected
+        } else {
+            focus_status
+        }
     };
     (status, matched)
-}
-
-/// Pure detection (no stickiness): agent packs, then the plain-shell fallback.
-fn detect(input: &StatusInput<'_>, prev: SessionStatus) -> SessionStatus {
-    detect_full(input, prev).0
 }
 
 /// Like [`detect`], but also returns the rule match that produced the verdict
@@ -338,69 +505,103 @@ fn detect_full(
     input: &StatusInput<'_>,
     prev: SessionStatus,
 ) -> (SessionStatus, Option<agent_rules::RuleMatch>) {
-    let Some(pack) = agent_rules::embedded().pack_for(input.foreground) else {
-        // No agent CLI is driving this terminal, so the only signals available
-        // are generic ones. The fallback works on the recent lines only and
-        // lowercases them once, shared by both rules.
-        let recent = FallbackRules::recent_lower(input, FallbackRules::WINDOW);
-        if FallbackRules::error_lower(&recent) {
-            return (SessionStatus::Error, None);
-        }
-        if FallbackRules::blocked_lower(&recent) {
-            return (SessionStatus::Blocked, None);
-        }
-        return (
-            if input.foreground.is_empty() {
-                SessionStatus::Idle
-            } else {
-                SessionStatus::Working
-            },
-            None,
-        );
-    };
-
     let screen = input.lines.join("\n");
-    let matched = agent_rules::evaluate(
-        pack,
-        DetectionInput {
-            screen: &screen,
-            osc_title: input.title.unwrap_or(""),
-            // OSC 9;4 progress is not parsed yet; the rules that read it simply
-            // never match, which is how upstream treats a terminal that does
-            // not report progress.
-            osc_progress: "",
-        },
-    );
+    let tail = tail_lines(&screen, FallbackRules::WINDOW);
 
-    let status = match &matched {
-        // A known agent with no matching rule is at rest, per upstream's
-        // known-agent fallback.
-        None => SessionStatus::Idle,
-        // Transient overlays (transcript viewer, model picker) match only to say
-        // "ignore me" — leave the badge where it was.
-        Some(m) if m.skip_state_update => prev,
-        Some(m) => match m.state {
-            RuleState::Blocked => SessionStatus::Blocked,
-            RuleState::Working => SessionStatus::Working,
-            RuleState::Idle => SessionStatus::Idle,
-            // Unknown means "neither" — but the agent process really is
-            // running, so report that rather than claiming the pane is idle.
-            RuleState::Unknown => SessionStatus::Working,
+    if let Some(pack) = agent_rules::embedded().pack_for(input.foreground) {
+        let matched = agent_rules::evaluate(
+            pack,
+            DetectionInput {
+                screen: &screen,
+                osc_title: input.title.unwrap_or(""),
+                // OSC 9;4 progress is not parsed yet; the rules that read it simply
+                // never match, which is how upstream treats a terminal that does
+                // not report progress.
+                osc_progress: "",
+            },
+        );
+
+        let status = match &matched {
+            None => {
+                if let Some(state) = input.detector_state {
+                    match state {
+                        State::AwaitingApproval => SessionStatus::Blocked,
+                        State::Running => SessionStatus::Working,
+                        State::Idle | State::Exited => SessionStatus::Idle,
+                    }
+                } else if FallbackRules::is_blocked(&tail) {
+                    SessionStatus::Blocked
+                } else if FallbackRules::is_running(&tail) {
+                    SessionStatus::Working
+                } else {
+                    SessionStatus::Idle
+                }
+            }
+            Some(m) if m.skip_state_update => prev,
+            Some(m) => match m.state {
+                RuleState::Blocked => SessionStatus::Blocked,
+                RuleState::Working => SessionStatus::Working,
+                RuleState::Idle => SessionStatus::Idle,
+                // Unknown means "neither" — but the agent process really is
+                // running, so report that rather than claiming the pane is idle.
+                RuleState::Unknown => SessionStatus::Working,
+            },
+        };
+        return (status, matched);
+    }
+
+    // No agent CLI is driving this terminal, so generic and fallback signals apply.
+    let recent = FallbackRules::recent_lower(input, FallbackRules::WINDOW);
+    if FallbackRules::error_lower(&recent) {
+        return (SessionStatus::Error, None);
+    }
+
+    if let Some(state) = input.detector_state {
+        match state {
+            State::AwaitingApproval => return (SessionStatus::Blocked, None),
+            State::Running => return (SessionStatus::Working, None),
+            State::Idle | State::Exited => {}
+        }
+    }
+
+    if FallbackRules::is_blocked(&tail) {
+        return (SessionStatus::Blocked, None);
+    }
+    if FallbackRules::is_running(&tail) {
+        return (SessionStatus::Working, None);
+    }
+
+    (
+        if input.foreground.is_empty() {
+            SessionStatus::Idle
+        } else {
+            SessionStatus::Working
         },
-    };
-    (status, matched)
+        None,
+    )
 }
-
 /// Generic rules for terminals with no agent pack: a plain shell.
+static GENERIC_REGEXES: LazyLock<(RegexSet, RegexSet)> = LazyLock::new(|| {
+    Profile::generic().compile()
+});
+
+/// Generic rules for terminals with no agent pack: a plain shell or uncataloged agent CLI.
 struct FallbackRules;
 
 impl FallbackRules {
     /// Lines considered "recent" for the fallback rules.
     const WINDOW: usize = 12;
 
+    fn is_blocked(tail: &str) -> bool {
+        GENERIC_REGEXES.0.is_match(tail)
+    }
+
+    fn is_running(tail: &str) -> bool {
+        GENERIC_REGEXES.1.is_match(tail)
+    }
+
     /// The newest `n` non-empty lines of the visible screen, trimmed and
-    /// lowercased once so both fallback rules share the normalized form
-    /// instead of each joining and lowercasing separately.
+    /// lowercased once so error rules share the normalized form.
     fn recent_lower(input: &StatusInput<'_>, n: usize) -> Vec<String> {
         let mut lines: Vec<String> = input
             .lines
@@ -413,22 +614,6 @@ impl FallbackRules {
         lines.split_off(excess)
     }
 
-    /// The classic interactive prompt a plain command blocks on.
-    ///
-    /// Deliberately narrow: agents have their own packs, and vague wording here
-    /// only produces false positives on ordinary output.
-    ///
-    /// Takes [`Self::recent_lower`] output. Per-line search is equivalent to
-    /// the old joined-text search here: none of the needles contains a newline,
-    /// so no match can span the join boundary.
-    fn blocked_lower(recent: &[String]) -> bool {
-        recent.iter().any(|line| {
-            line.contains("[y/n]")
-                || line.contains("(y/n)")
-                || line.contains("yes (y)")
-                || line.contains("password:")
-        })
-    }
 
     /// Strong failure markers on the most recent output lines.
     ///
@@ -461,6 +646,7 @@ mod tests {
             lines: &lines,
             title: None,
             foreground: &fg,
+            detector_state: None,
         };
         evaluate(&input, SessionStatus::Idle, focused)
     }
@@ -597,6 +783,7 @@ mod tests {
             lines: &lines,
             title: None,
             foreground: &[],
+            detector_state: None,
         };
         assert_eq!(evaluate(&input, SessionStatus::Done, false), SessionStatus::Done);
         assert_eq!(evaluate(&input, SessionStatus::Done, true), SessionStatus::Idle);
@@ -637,6 +824,7 @@ mod tests {
             lines: &lines,
             title: None,
             foreground: &fg,
+            detector_state: None,
         };
         let m = explain(&input).expect("a rule should match");
         assert_eq!(m.pack, "claude");
@@ -669,5 +857,123 @@ mod tests {
         // has to happen at the *last* paren, not the first.
         let stat = "42 (my (weird) comm) S 1 42 42 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 7";
         assert_eq!(parse_stat_tpgid(stat), Some(-1));
+    }
+    fn feed(d: &mut Detector, screen: &str, t0: Instant, ms: u64) -> State {
+        d.update(screen, false, t0 + Duration::from_millis(ms))
+    }
+
+    #[test]
+    fn running_then_idle() {
+        let t0 = Instant::now();
+        let mut d = Detector::new(Profile::generic(), t0);
+        assert_eq!(feed(&mut d, "⠋ Thinking…\n  esc to interrupt", t0, 0), State::Running);
+        // spinner marker still visible and screen frozen: still running
+        assert_eq!(feed(&mut d, "⠋ Thinking…\n  esc to interrupt", t0, 5000), State::Running);
+        // done: plain prompt, then it stays unchanged
+        assert_eq!(feed(&mut d, "All done.\n> ", t0, 5100), State::Running);
+        assert_eq!(feed(&mut d, "All done.\n> ", t0, 7000), State::Idle);
+    }
+
+    #[test]
+    fn approval_needs_settled_screen() {
+        let t0 = Instant::now();
+        let mut d = Detector::new(Profile::generic(), t0);
+        let s = "Run `rm -rf build`?\n❯ 1. Yes\n  2. No";
+        assert_eq!(feed(&mut d, s, t0, 0), State::Running); // just appeared
+        assert_eq!(feed(&mut d, s, t0, 600), State::AwaitingApproval);
+        assert_eq!(feed(&mut d, "Continue? (y/n)", t0, 700), State::Running);
+        assert_eq!(feed(&mut d, "Continue? (y/n)", t0, 1200), State::AwaitingApproval);
+    }
+
+    #[test]
+    fn exit_and_custom_pattern() {
+        let t0 = Instant::now();
+        let p = Profile::generic().with_approval(r"trust this folder");
+        let mut d = Detector::new(p, t0);
+        let s = "Do you trust this folder?";
+        feed(&mut d, s, t0, 0);
+        assert_eq!(feed(&mut d, s, t0, 600), State::AwaitingApproval);
+        assert_eq!(d.update(s, true, t0), State::Exited);
+    }
+
+    #[test]
+    fn generic_agent_approval_patterns_are_blocked() {
+        assert_eq!(
+            eval(&["Do you want to proceed?", "❯ 1. Yes", "  2. No"], &[], false),
+            SessionStatus::Blocked
+        );
+        assert_eq!(
+            eval(&["Allow tool execution `git commit`? (y/n)"], &["python3"], false),
+            SessionStatus::Blocked
+        );
+        assert_eq!(
+            eval(&["Allow dangerous command? [y/n/a/d]"], &[], false),
+            SessionStatus::Blocked
+        );
+        assert_eq!(
+            eval(&["Press enter to continue"], &["aider"], false),
+            SessionStatus::Blocked
+        );
+        assert_eq!(
+            eval(&["Do you want to edit file? esc to cancel"], &[], false),
+            SessionStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn generic_agent_running_markers_are_working() {
+        assert_eq!(
+            eval(&["⠋ Thinking…"], &[], false),
+            SessionStatus::Working
+        );
+        assert_eq!(
+            eval(&["Generating response... (esc to interrupt)"], &[], false),
+            SessionStatus::Working
+        );
+        assert_eq!(
+            eval(&["◐ Processing request…"], &[], false),
+            SessionStatus::Working
+        );
+    }
+
+    #[test]
+    fn detector_state_reflected_in_evaluate() {
+        let lines = vec!["All done.\n> ".to_string()];
+        let input_running = StatusInput {
+            lines: &lines,
+            title: None,
+            foreground: &[],
+            detector_state: Some(State::Running),
+        };
+        assert_eq!(evaluate(&input_running, SessionStatus::Idle, false), SessionStatus::Working);
+
+        let input_approval = StatusInput {
+            lines: &lines,
+            title: None,
+            foreground: &[],
+            detector_state: Some(State::AwaitingApproval),
+        };
+        assert_eq!(evaluate(&input_approval, SessionStatus::Idle, false), SessionStatus::Blocked);
+    }
+    #[test]
+    fn focused_interaction_is_active_not_working() {
+        // When focused and typing or running plain commands, status is Active (not Working).
+        assert_eq!(eval(&["building..."], &["cargo"], true), SessionStatus::Active);
+        assert_eq!(eval(&["user@host ❯ git status"], &["git"], true), SessionStatus::Active);
+        assert_eq!(eval(&["user@host ❯ echo hello"], &[], true), SessionStatus::Active);
+    }
+
+    #[test]
+    fn focused_agent_running_is_working() {
+        // When an agent is running on its own, it reports Working even while focused.
+        assert_eq!(eval(&["⠋ Thinking…"], &[], true), SessionStatus::Working);
+        assert_eq!(
+            eval(
+                &["⏺ Read(src/main.rs)", "✳ Baking… (2m 14s · esc to interrupt)"],
+                &["claude"],
+                true
+            ),
+            SessionStatus::Working
+        );
     }
 }

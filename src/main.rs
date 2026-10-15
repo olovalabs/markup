@@ -76,6 +76,7 @@ pub struct Session {
     pub done_since: Option<std::time::Instant>,
     /// Path of the AI agent / command logo shown in the sidebar.
     pub logo: SharedString,
+    pub detector: status::Detector,
 }
 
 /// How long an unacknowledged Done badge lingers before it falls back to Idle.
@@ -411,7 +412,10 @@ impl AppState {
                         screen_fingerprint(&foreground, ""),
                     )
                 };
-                if session.poll_cache == Some(poll_key) && session.status != SessionStatus::Done {
+                if session.poll_cache == Some(poll_key)
+                    && session.status != SessionStatus::Done
+                    && session.status != SessionStatus::Working
+                {
                     continue;
                 }
 
@@ -420,8 +424,12 @@ impl AppState {
                     let bottom_lines = &session.screen_scratch;
                     let title = terminal.title().unwrap_or("");
                     let screen_fp = screen_fingerprint(bottom_lines, title);
-
-                    // Looking at a finished/failed terminal acknowledges it:
+                    let screen_text = bottom_lines.join("\n");
+                    let detector_state = session.detector.update(
+                        &screen_text,
+                        terminal.has_exited(),
+                        std::time::Instant::now(),
+                    );
                     // while the screen is unchanged the sticky badge stays
                     // cleared; new output re-arms it.
                     let ack = if focused
@@ -447,6 +455,7 @@ impl AppState {
                                 lines: bottom_lines,
                                 title: Some(title),
                                 foreground: &foreground,
+                                detector_state: Some(detector_state),
                             });
                         }
                         if acknowledged {
@@ -462,6 +471,7 @@ impl AppState {
                             lines: bottom_lines,
                             title: Some(title),
                             foreground: &foreground,
+                            detector_state: Some(detector_state),
                         };
                         // Debug builds capture the match for the dump below;
                         // release builds use the plain verdict (same work).
@@ -509,7 +519,7 @@ impl AppState {
                         eprintln!(
                             "[status] session={} focused={focused} exited={} exit={:?} \
                              pid={:?} fg={foreground:?} pack={:?} title={title:?} \
-                             prev={} next={} rule={rule}",
+                             prev={} next={} detector={detector_state:?} rule={rule}",
                             session.id,
                             terminal.has_exited(),
                             terminal.exit_status(),
@@ -640,6 +650,7 @@ impl AppState {
                 agent_active: false,
                 done_since: None,
                 logo: logos::default_logo(),
+                detector: status::Detector::default(),
             };
 
             let p_idx = self.active_project_idx;
@@ -702,6 +713,7 @@ impl AppState {
                     agent_active: false,
                     done_since: None,
                     logo: logos::default_logo(),
+                    detector: status::Detector::default(),
                 };
                 let project = Project {
                     id: next_id,
@@ -778,6 +790,7 @@ impl AppState {
                 agent_active: false,
                 done_since: None,
                 logo: logos::default_logo(),
+                detector: status::Detector::default(),
             };
 
             if let Some(project) = self.projects.get_mut(p_idx) {
@@ -1908,6 +1921,7 @@ fn main() -> Result<()> {
                             agent_active: false,
                             done_since: None,
                             logo: logos::default_logo(),
+                            detector: status::Detector::default(),
                         };
 
                         let initial_project = Project {
@@ -2046,6 +2060,7 @@ mod resize_tests {
                     agent_active: false,
                     done_since: None,
                     logo: logos::default_logo(),
+                    detector: status::Detector::default(),
                 }],
                 active_session_idx: 0,
                 pane_tree: Some(PaneNode::Leaf(1)),
