@@ -114,6 +114,9 @@ pub(crate) struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    /// Pixel dimensions of allocated path intermediates, or `(0, 0)` when
+    /// path rendering has not needed them yet.
+    path_intermediate_size: (i32, i32),
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -129,15 +132,22 @@ pub struct PathRasterizationVertex {
 
 impl MetalRenderer {
     pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
-        // Prefer low‐power integrated GPUs on Intel Mac. On Apple
-        // Silicon, there is only ever one GPU, so this is equivalent to
-        // `metal::Device::system_default()`.
+        // Prefer the built-in low-power device. Prioritizing removable GPUs
+        // caused an attached eGPU to be selected on hybrid Macs, unnecessarily
+        // increasing power use for typical UI work.
+        // On Apple Silicon the sole device is still selected.
         let mut devices = metal::Device::all();
-        devices.sort_by_key(|device| (device.is_removable(), device.is_low_power()));
+        devices.sort_by_key(|device| (!device.is_removable(), device.is_low_power()));
         let Some(device) = devices.pop() else {
             log::error!("unable to access a compatible graphics device");
             std::process::exit(1);
         };
+        log::info!(
+            "Using Metal device '{}' (low_power={}, removable={})",
+            device.name(),
+            device.is_low_power(),
+            device.is_removable(),
+        );
 
         let layer = metal::MetalLayer::new();
         layer.set_device(&device);
@@ -271,6 +281,7 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            path_intermediate_size: (0, 0),
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -296,6 +307,7 @@ impl MetalRenderer {
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
+        let requested_size = (size.width.0, size.height.0);
         let size = NSSize {
             width: size.width.0 as f64,
             height: size.height.0 as f64,
@@ -306,20 +318,31 @@ impl MetalRenderer {
                 setDrawableSize: size
             ];
         }
-        let device_pixels_size = Size {
-            width: DevicePixels(size.width as i32),
-            height: DevicePixels(size.height as i32),
-        };
-        self.update_path_intermediate_textures(device_pixels_size);
+
+        // Drop stale full-window path targets on resize, but do not allocate
+        // replacements until a scene actually contains paths.
+        if requested_size != self.path_intermediate_size {
+            self.path_intermediate_texture = None;
+            self.path_intermediate_msaa_texture = None;
+            self.path_intermediate_size = (0, 0);
+        }
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
-        // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
-        // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
-        // https://github.com/zed-industries/zed/issues/36229
+        // Zero-sized texture creation causes SIGABRT. This can happen before
+        // the layout pass on window creation.
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
+            self.path_intermediate_size = (0, 0);
+            return;
+        }
+
+        let requested_size = (size.width.0, size.height.0);
+        if self.path_intermediate_size == requested_size
+            && self.path_intermediate_texture.is_some()
+            && (self.path_sample_count <= 1 || self.path_intermediate_msaa_texture.is_some())
+        {
             return;
         }
 
@@ -340,6 +363,7 @@ impl MetalRenderer {
         } else {
             self.path_intermediate_msaa_texture = None;
         }
+        self.path_intermediate_size = requested_size;
     }
 
     pub fn update_transparency(&self, _transparent: bool) {
@@ -548,7 +572,7 @@ impl MetalRenderer {
     }
 
     fn draw_paths_to_intermediate(
-        &self,
+        &mut self,
         paths: &[Path<ScaledPixels>],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
@@ -558,6 +582,7 @@ impl MetalRenderer {
         if paths.is_empty() {
             return true;
         }
+        self.update_path_intermediate_textures(viewport_size);
         let Some(intermediate_texture) = &self.path_intermediate_texture else {
             return false;
         };

@@ -155,12 +155,31 @@ instead, which is all a test ever needs.
   roots. `RawWindow` keeps its own impl because `BladeRenderer::new` still takes a
   `&RawWindow` before the `X11WindowState` exists.
 
+### 9. Platform renderer compatibility and resource use
+
+- `src/platform/windows/directx_devices.rs` retries D3D11 device creation with
+  feature levels 11_0/10_1 if a runtime rejects a list containing 11_1. This
+  preserves the hardware renderer on older D3D11 runtimes instead of aborting
+  startup on feature-level negotiation.
+- `src/platform/windows/directx_renderer.rs` allocates full-window path and
+  4x-MSAA intermediates only when a scene has non-empty paths; it drops them on
+  resize and recreates them lazily at the new size.
+- `src/platform/windows/platform.rs` only broadcasts device-loss recovery after
+  a replacement DirectX device was successfully created.
+- `src/platform/mac/metal_renderer.rs` prefers built-in low-power devices over
+  removable GPUs and defers full-window path/MSAA texture allocation until paths
+  are actually drawn. Same-size path targets are reused.
+- `src/platform/blade/blade_renderer.rs` likewise builds path intermediates only
+  for non-empty path batches and releases them on target resize.
+
 ## Feature gating
 
-Everything above is behind `#[cfg(any(test, feature = "test-support"))]`, so none
-of it is compiled into the shipped binary. `app` enables `test-support` from a
-dev-dependency only; `components/gpui` is listed in the workspace `exclude` so its
-own examples and tests are not pulled in.
+The headless renderer and visual-test harness changes are behind
+`#[cfg(any(test, feature = "test-support"))]`. The X11 window-handle fix and the
+platform renderer fixes in sections 8-9 are runtime code and ship normally.
+`app` enables `test-support` from a dev-dependency only; `components/gpui` is
+listed in the workspace `exclude` so its own examples and tests are not pulled
+in.
 
 ## Operating notes
 
@@ -195,7 +214,7 @@ headless box install Mesa's lavapipe (`mesa-vulkan-drivers`) and use
 
 Copy the new release over this directory, delete `examples/`, `tests/`, `docs/`
 and `Cargo.lock`, strip the `[[example]]`, `[[test]]` and `[dev-dependencies]`
-sections from its `Cargo.toml`, then re-apply the eight patches above. The
+sections from its `Cargo.toml`, then re-apply all patches documented above. The
 manifest header says the same thing where Cargo will show it.
 
 **Keep `resources/`.** It is easy to miss because nothing on Linux or macOS

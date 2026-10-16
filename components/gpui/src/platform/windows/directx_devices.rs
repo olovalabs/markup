@@ -24,7 +24,7 @@ pub(crate) fn try_to_recover_from_device_lost<T>(
     mut f: impl FnMut() -> Result<T>,
     on_success: impl FnOnce(T),
     on_error: impl FnOnce(),
-) {
+) -> bool {
     let result = (0..5).find_map(|i| {
         if i > 0 {
             // Add a small delay before retrying
@@ -35,8 +35,10 @@ pub(crate) fn try_to_recover_from_device_lost<T>(
 
     if let Some(result) = result {
         on_success(result);
+        true
     } else {
         on_error();
+        false
     }
 }
 
@@ -150,18 +152,27 @@ fn get_device(
     debug_layer_available: bool,
 ) -> Result<ID3D11Device> {
     let mut device: Option<ID3D11Device> = None;
+    let mut created_context: Option<ID3D11DeviceContext> = None;
+    // Adapter enumeration only needs to know whether device creation works;
+    // avoid creating an immediate context unless the caller requested one.
+    let context_output = context.is_some().then_some(&mut created_context as *mut _);
+    let mut created_feature_level = D3D_FEATURE_LEVEL::default();
     let device_flags = if debug_layer_available {
         D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_DEBUG
     } else {
         D3D11_CREATE_DEVICE_BGRA_SUPPORT
     };
-    unsafe {
+
+    // Older D3D11 runtimes (notably Windows 7 without the platform update)
+    // reject a feature-level list containing 11_1 with E_INVALIDARG, even when
+    // the same adapter supports 11_0. Retry without 11_1 so those drivers keep
+    // the hardware-accelerated backend instead of failing application startup.
+    let first_attempt = unsafe {
         D3D11CreateDevice(
             adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
             HMODULE::default(),
             device_flags,
-            // 4x MSAA is required for Direct3D Feature Level 10.1 or better
             Some(&[
                 D3D_FEATURE_LEVEL_11_1,
                 D3D_FEATURE_LEVEL_11_0,
@@ -169,9 +180,37 @@ fn get_device(
             ]),
             D3D11_SDK_VERSION,
             Some(&mut device),
-            feature_level,
-            context,
-        )?;
+            Some(&mut created_feature_level),
+            context_output,
+        )
+    };
+    if let Err(error) = first_attempt {
+        log::debug!(
+            "D3D11 feature-level negotiation including 11_1 failed ({error:?}); retrying with 11_0/10_1"
+        );
+        device = None;
+        created_context = None;
+        created_feature_level = D3D_FEATURE_LEVEL::default();
+        unsafe {
+            D3D11CreateDevice(
+                adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                device_flags,
+                Some(&[D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                Some(&mut created_feature_level),
+                context_output,
+            )?;
+        }
+    }
+
+    if let Some(output) = context {
+        unsafe { *output = created_context };
+    }
+    if let Some(output) = feature_level {
+        unsafe { *output = created_feature_level };
     }
     let device = device.unwrap();
     let mut data = D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS::default();

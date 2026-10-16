@@ -7,6 +7,7 @@
 use crate::terminal::TerminalState;
 use alacritty_terminal::index::{Direction, Point};
 use alacritty_terminal::term::search::{Match, RegexSearch};
+use std::sync::Arc;
 
 /// Escape a literal string so it can be used as a regex.
 pub fn escape_literal(query: &str) -> String {
@@ -20,14 +21,28 @@ pub fn escape_literal(query: &str) -> String {
     escaped
 }
 
-#[derive(Default)]
 pub struct SearchState {
     query: String,
     regex: Option<RegexSearch>,
-    matches: Vec<Match>,
+    /// Immutable snapshot so render closures can share the current list without
+    /// cloning every match on each repaint. A new snapshot is built only when
+    /// the query or terminal contents change.
+    matches: Arc<[Match]>,
     current: Option<usize>,
     /// When `false` the query is treated as a literal string.
     use_regex: bool,
+}
+
+impl Default for SearchState {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            regex: None,
+            matches: Arc::from(Vec::<Match>::new()),
+            current: None,
+            use_regex: false,
+        }
+    }
 }
 
 impl SearchState {
@@ -51,6 +66,11 @@ impl SearchState {
         &self.matches
     }
 
+    /// Cheaply clone the immutable search snapshot for a deferred paint closure.
+    pub fn matches_arc(&self) -> Arc<[Match]> {
+        Arc::clone(&self.matches)
+    }
+
     /// Index of the currently selected match, if any.
     pub fn current_index(&self) -> Option<usize> {
         self.current
@@ -67,7 +87,7 @@ impl SearchState {
     pub fn clear(&mut self) {
         self.query.clear();
         self.regex = None;
-        self.matches.clear();
+        self.matches = Arc::from(Vec::<Match>::new());
         self.current = None;
     }
 
@@ -78,7 +98,7 @@ impl SearchState {
         self.query = query.to_string();
         self.use_regex = use_regex;
         self.current = None;
-        self.matches.clear();
+        self.matches = Arc::from(Vec::<Match>::new());
 
         if query.is_empty() {
             self.regex = None;
@@ -93,7 +113,7 @@ impl SearchState {
 
         match RegexSearch::new(&pattern) {
             Ok(mut regex) => {
-                self.matches = state.all_matches(&mut regex);
+                self.matches = state.all_matches(&mut regex).into();
                 self.regex = Some(regex);
                 true
             }
@@ -115,7 +135,7 @@ impl SearchState {
         let Some(regex) = self.regex.as_mut() else {
             return;
         };
-        self.matches = state.all_matches(regex);
+        self.matches = state.all_matches(regex).into();
         self.current = anchor.and_then(|point| self.matches.iter().position(|m| *m.start() == point));
     }
 

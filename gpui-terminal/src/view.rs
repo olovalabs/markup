@@ -39,6 +39,7 @@ use gpui::{Edges, *};
 use std::io::{Read, Write};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -158,6 +159,9 @@ pub struct TerminalView {
     /// comparing this against the live size is how a render notices that the
     /// grid moved under it (search matches are stored in grid coordinates).
     last_grid_size: (usize, usize),
+    /// Increments whenever PTY output or a grid resize can change the visible
+    /// screen. The status poller uses this to skip scraping unchanged panes.
+    screen_revision: Arc<AtomicU64>,
 
     resize_callback: Option<Arc<ResizeCallback>>,
     key_handler: Option<Arc<KeyHandler>>,
@@ -278,6 +282,7 @@ impl TerminalView {
 
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
                             view.state.process_bytes(&bytes);
+                            view.screen_revision.fetch_add(1, Ordering::Relaxed);
                             if view.search.is_active() {
                                 // A full-scrollback rescan per batch would stall
                                 // the UI thread under streaming output; throttle
@@ -326,6 +331,7 @@ impl TerminalView {
             palette_handle,
             last_bounds: Arc::new(parking_lot::Mutex::new(Bounds::default())),
             last_grid_size: (0, 0),
+            screen_revision: Arc::new(AtomicU64::new(0)),
             resize_callback: None,
             key_handler: None,
             bell_callback: None,
@@ -1489,7 +1495,13 @@ impl TerminalView {
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.state.resize(cols, rows);
+        self.screen_revision.fetch_add(1, Ordering::Relaxed);
         self.sync_window_size();
+    }
+
+    /// Monotonic change counter for the terminal's visible grid.
+    pub fn screen_revision(&self) -> u64 {
+        self.screen_revision.load(Ordering::Relaxed)
     }
 
     pub fn config(&self) -> &TerminalConfig {
@@ -1527,6 +1539,7 @@ impl TerminalView {
     /// Clear the screen *and* the scrollback.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.state.clear_screen_and_scrollback();
+        self.screen_revision.fetch_add(1, Ordering::Relaxed);
         self.search.clear();
         cx.notify();
     }
@@ -1626,10 +1639,11 @@ impl Render for TerminalView {
         let padding = self.config.padding;
         let last_bounds = self.last_bounds.clone();
         let window_size = self.window_size.clone();
+        let screen_revision = Arc::clone(&self.screen_revision);
 
         let selection: Option<SelectionRange> = self.state.selection_range();
-        let search_matches: Vec<GridMatch> = self.search.matches().to_vec();
-        let active_match: Option<GridMatch> = self.search.current_match().cloned();
+        let search_matches: Arc<[GridMatch]> = self.search.matches_arc();
+        let active_match_index = self.search.current_index();
         let hovered_link: Option<RangeInclusive<GridPoint>> =
             self.hovered_link.as_ref().map(|link| link.range.clone());
         let cursor_visible = self.cursor_visible;
@@ -1682,6 +1696,7 @@ impl Render for TerminalView {
                         let current_rows = term.screen_lines();
                         if cols != current_cols || rows != current_rows {
                             term.resize(crate::terminal::TermDimensions::new(cols, rows));
+                            screen_revision.fetch_add(1, Ordering::Relaxed);
                             *window_size.lock() = PtyWindowSize {
                                 num_lines: rows as u16,
                                 num_cols: cols as u16,
@@ -1696,7 +1711,8 @@ impl Render for TerminalView {
                         let paint_ctx = PaintContext {
                             selection,
                             search_matches: &search_matches,
-                            active_match: active_match.as_ref(),
+                            active_match: active_match_index
+                                .and_then(|index| search_matches.get(index)),
                             hovered_link: hovered_link.as_ref(),
                             is_focused,
                             cursor_visible,

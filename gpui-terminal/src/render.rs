@@ -12,7 +12,9 @@ use gpui::{
     App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point, SharedString,
     Size, StrikethroughStyle, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
 };
+use parking_lot::Mutex;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 /// Everything the renderer needs to know that does not live on the `Term`
 /// itself: selection, search highlights, the hovered hyperlink, focus and
@@ -377,6 +379,26 @@ pub fn rasterize_box_or_block(
     }
 }
 
+fn clear_for_reuse<T>(buffer: &mut Vec<T>, expected_capacity: usize) {
+    buffer.clear();
+    let target = expected_capacity.max(64);
+    if buffer.capacity() > target.saturating_mul(4) {
+        buffer.shrink_to(target);
+    }
+}
+
+#[derive(Default)]
+struct PaintScratch {
+    row_backgrounds: Vec<BackgroundRect>,
+    text_runs: Vec<BatchedTextRun>,
+    block_rects: Vec<BlockElementRect>,
+    selection_rects: Vec<BlockElementRect>,
+    match_rects: Vec<BlockElementRect>,
+    decoration_rects: Vec<BlockElementRect>,
+    /// Indices into the sorted search match list that touch the current row.
+    row_match_indices: Vec<usize>,
+}
+
 #[derive(Clone)]
 pub struct TerminalRenderer {
 
@@ -391,6 +413,11 @@ pub struct TerminalRenderer {
     pub line_height_multiplier: f32,
 
     pub palette: ColorPalette,
+
+    /// Reuses per-frame vectors across paints instead of allocating a fresh set
+    /// on every terminal redraw. `TerminalRenderer` is cloned into GPUI's paint
+    /// closure, so the scratch is shared by those short-lived clones.
+    paint_scratch: Arc<Mutex<PaintScratch>>,
 }
 
 impl TerminalRenderer {
@@ -412,6 +439,7 @@ impl TerminalRenderer {
             cell_height,
             line_height_multiplier,
             palette,
+            paint_scratch: Arc::new(Mutex::new(PaintScratch::default())),
         }
     }
 
@@ -604,24 +632,44 @@ impl TerminalRenderer {
         merged
     }
 
-    pub fn merge_backgrounds_2d(rects: Vec<BackgroundRect>) -> Vec<BackgroundRect> {
-        if rects.is_empty() {
-            return rects;
+    pub fn merge_backgrounds_2d(mut rects: Vec<BackgroundRect>) -> Vec<BackgroundRect> {
+        Self::merge_backgrounds_2d_in_place(&mut rects);
+        rects
+    }
+
+    /// Merge vertically adjacent background runs in place. The old scan looked
+    /// through every previously emitted rectangle for every new run (quadratic
+    /// for highly-coloured output); sorting groups compatible runs so the merge
+    /// itself is linear and reuses the caller's allocation.
+    fn merge_backgrounds_2d_in_place(rects: &mut Vec<BackgroundRect>) {
+        if rects.len() < 2 {
+            return;
         }
-        let mut merged: Vec<BackgroundRect> = Vec::with_capacity(rects.len());
-        for rect in rects {
-            if let Some(existing) = merged.iter_mut().find(|r| {
-                r.color == rect.color
-                    && r.start_col == rect.start_col
-                    && r.end_col == rect.end_col
-                    && r.end_row == rect.row
-            }) {
-                existing.end_row = rect.end_row;
+
+        rects.sort_unstable_by(|a, b| {
+            a.start_col
+                .cmp(&b.start_col)
+                .then_with(|| a.end_col.cmp(&b.end_col))
+                .then_with(|| a.color.cmp(&b.color))
+                .then_with(|| a.row.cmp(&b.row))
+        });
+
+        let mut write = 0;
+        for read in 1..rects.len() {
+            let rect = rects[read];
+            let previous = rects[write];
+            if previous.color == rect.color
+                && previous.start_col == rect.start_col
+                && previous.end_col == rect.end_col
+                && previous.end_row == rect.row
+            {
+                rects[write].end_row = rect.end_row;
             } else {
-                merged.push(rect);
+                write += 1;
+                rects[write] = rect;
             }
         }
-        merged
+        rects.truncate(write + 1);
     }
 
     pub fn paint(
@@ -701,36 +749,50 @@ impl TerminalRenderer {
             color,
         };
 
-        // Pre-sized: these are rebuilt every frame, so growing them from zero
-        // would reallocate several times per repaint on every terminal.
-        let mut row_backgrounds: Vec<BackgroundRect> = Vec::with_capacity(num_lines * 2);
-        let mut batched_text_runs: Vec<BatchedTextRun> = Vec::with_capacity(num_lines * 2);
-        let mut block_rects: Vec<BlockElementRect> = Vec::with_capacity(num_lines);
-        let mut selection_rects: Vec<BlockElementRect> = Vec::new();
-        let mut match_rects: Vec<BlockElementRect> = Vec::new();
-        let mut decoration_rects: Vec<BlockElementRect> = Vec::new();
-        // Scratch buffer holding the search matches that touch the current
-        // row (see below); reused across rows instead of reallocated.
-        let mut row_matches: Vec<&Match> = Vec::new();
+        // Reuse all frame-local vectors across paints. Capacity is retained for
+        // stable terminal sizes, but exceptionally large windows/searches do not
+        // pin that high-water allocation after the view shrinks.
+        let cell_count = num_lines.saturating_mul(num_cols);
+        let mut scratch = self.paint_scratch.lock();
+        let PaintScratch {
+            row_backgrounds,
+            text_runs: batched_text_runs,
+            block_rects,
+            selection_rects,
+            match_rects,
+            decoration_rects,
+            row_match_indices,
+        } = &mut *scratch;
+        clear_for_reuse(row_backgrounds, cell_count);
+        clear_for_reuse(batched_text_runs, cell_count);
+        clear_for_reuse(block_rects, cell_count);
+        clear_for_reuse(selection_rects, cell_count);
+        clear_for_reuse(match_rects, cell_count);
+        clear_for_reuse(decoration_rects, cell_count);
+        clear_for_reuse(row_match_indices, ctx.search_matches.len());
 
         let underline_thickness = ((f32::from(self.font_size) * 0.07).round()).max(1.0);
 
         for line_idx in 0..num_lines {
             let buffer_line = (line_idx as i32) - (display_offset as i32);
 
-            // Narrow the search matches to the ones touching this row, once
-            // per row. The per-cell test below then scans a handful of matches
-            // instead of all of them (up to 5,000 across the scrollback) for
-            // every cell — identical results, since a match can only contain
-            // cells on rows between its start and end lines.
-            row_matches.clear();
+            // Narrow the sorted search matches to the ones touching this row.
+            // A moving cursor below then advances through them once as columns
+            // are painted, instead of rescanning the row's matches for every
+            // cell.
+            row_match_indices.clear();
             if !ctx.search_matches.is_empty() {
-                row_matches.extend(
+                row_match_indices.extend(
                     ctx.search_matches
                         .iter()
-                        .filter(|m| m.start().line.0 <= buffer_line && buffer_line <= m.end().line.0),
+                        .enumerate()
+                        .filter_map(|(index, m)| {
+                            (m.start().line.0 <= buffer_line && buffer_line <= m.end().line.0)
+                                .then_some(index)
+                        }),
                 );
             }
+            let mut match_cursor = 0;
 
             let mut current_bg: Option<BackgroundRect> = None;
             let mut current_run: Option<BatchedTextRun> = None;
@@ -786,10 +848,24 @@ impl TerminalRenderer {
                     ));
                 });
 
-                let match_state = row_matches
-                    .iter()
-                    .find(|m| m.contains(&point))
-                    .map(|m| ctx.active_match.is_some_and(|active| active == *m));
+                let matched = loop {
+                    let Some(&match_index) = row_match_indices.get(match_cursor) else {
+                        break None;
+                    };
+                    let candidate = &ctx.search_matches[match_index];
+                    if candidate.contains(&point) {
+                        break Some(candidate);
+                    }
+                    // Matches are produced in grid order by RegexIter. Once a
+                    // match starts before this cell and no longer contains it,
+                    // it can never match a later column on this row.
+                    if *candidate.start() > point {
+                        break None;
+                    }
+                    match_cursor += 1;
+                };
+                let match_state = matched
+                    .map(|matched| ctx.active_match.is_some_and(|active| active == matched));
                 match match_state {
                     Some(is_active) => {
                         let extend = match match_run {
@@ -964,20 +1040,24 @@ impl TerminalRenderer {
                 }
 
                 // -- box drawing --------------------------------------------
-                if let Some(quads) = rasterize_box_or_block(
-                    ch,
-                    col_idx,
-                    line_idx,
-                    fg_color,
-                    origin,
-                    self.cell_width,
-                    self.cell_height,
-                ) {
-                    block_rects.extend(quads);
-                    if let Some(run) = current_run.take() {
-                        batched_text_runs.push(run);
+                // Most terminal cells are plain text; avoid the geometry
+                // rasterizer's range checks and coordinate math for them.
+                if is_box_or_block(ch) {
+                    if let Some(quads) = rasterize_box_or_block(
+                        ch,
+                        col_idx,
+                        line_idx,
+                        fg_color,
+                        origin,
+                        self.cell_width,
+                        self.cell_height,
+                    ) {
+                        block_rects.extend(quads);
+                        if let Some(run) = current_run.take() {
+                            batched_text_runs.push(run);
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 let is_blank = ch == ' '
@@ -1108,7 +1188,8 @@ impl TerminalRenderer {
         }
 
         // -- paint order: cell backgrounds, blocks, search, selection, text --
-        for bg in Self::merge_backgrounds_2d(row_backgrounds) {
+        Self::merge_backgrounds_2d_in_place(row_backgrounds);
+        for bg in row_backgrounds.iter().copied() {
             let x = origin.x + self.cell_width * (bg.start_col as f32);
             let y = origin.y + self.cell_height * (bg.row as f32);
             let width = self.cell_width * ((bg.end_col - bg.start_col) as f32);
@@ -1127,7 +1208,7 @@ impl TerminalRenderer {
             ));
         }
 
-        for block in block_rects {
+        for block in block_rects.drain(..) {
             window.paint_quad(quad(
                 block.bounds,
                 px(0.0),
@@ -1138,7 +1219,7 @@ impl TerminalRenderer {
             ));
         }
 
-        for rect in match_rects.into_iter().chain(selection_rects) {
+        for rect in match_rects.drain(..).chain(selection_rects.drain(..)) {
             window.paint_quad(quad(
                 rect.bounds,
                 px(0.0),
@@ -1151,7 +1232,7 @@ impl TerminalRenderer {
 
         let font_family: SharedString = self.font_family.clone().into();
         let font_features = FontFeatures::disable_ligatures();
-        for run in batched_text_runs {
+        for run in batched_text_runs.drain(..) {
             let x = origin.x + self.cell_width * (run.start_col as f32);
             let y = origin.y + self.cell_height * (run.row as f32);
 
@@ -1212,7 +1293,7 @@ impl TerminalRenderer {
             let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, _cx);
         }
 
-        for rect in decoration_rects {
+        for rect in decoration_rects.drain(..) {
             window.paint_quad(quad(
                 rect.bounds,
                 px(0.0),
@@ -1453,6 +1534,24 @@ mod tests {
         assert_eq!(merged[0].end_col, 10);
         assert_eq!(merged[0].row, 0);
         assert_eq!(merged[0].end_row, 3);
+    }
+
+    #[test]
+    fn test_merge_backgrounds_2d_groups_interleaved_colors() {
+        let red = gpui::hsla(0.0, 1.0, 0.5, 1.0);
+        let blue = gpui::hsla(0.6, 1.0, 0.5, 1.0);
+        let rects = vec![
+            BackgroundRect::new(0, 10, 0, red),
+            BackgroundRect::new(10, 20, 0, blue),
+            BackgroundRect::new(10, 20, 1, blue),
+            BackgroundRect::new(0, 10, 1, red),
+        ];
+
+        let merged = TerminalRenderer::merge_backgrounds_2d(rects);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|rect| rect.row == 0 && rect.end_row == 2));
+        assert!(merged.iter().any(|rect| rect.color == red));
+        assert!(merged.iter().any(|rect| rect.color == blue));
     }
 
     #[test]

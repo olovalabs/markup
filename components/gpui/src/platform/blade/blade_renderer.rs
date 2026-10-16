@@ -475,10 +475,10 @@ impl BladeRenderer {
             self.core
                 .gpu
                 .reconfigure_surface(&mut self.surface, self.surface_config);
-            // The path intermediates follow the render target, which follows the
-            // surface, so dropping the recorded size makes the next frame rebuild
-            // them at the new size.
-            self.core.path_intermediate_size = NO_INTERMEDIATES;
+            // The path intermediates follow the render target. Free their
+            // window-sized textures on resize; the next non-empty path batch
+            // will recreate them at the new target size.
+            self.core.destroy_path_intermediate_textures();
         }
     }
 
@@ -572,10 +572,9 @@ impl BladeRendererCore {
             #[cfg(target_os = "macos")]
             core_video_texture_cache,
             target_format: surface_info.format,
-            // Built on the first recorded frame rather than here: the
-            // intermediates must match the target we actually draw into, and
-            // allocating them up front is pointless if the device is not usable
-            // yet.
+            // Built lazily for the first non-empty path batch: most terminal
+            // frames do not use vector paths, and these full-target textures are
+            // among the renderer's largest allocations.
             path_intermediate_size: NO_INTERMEDIATES,
             path_intermediate_texture: gpu::Texture::default(),
             path_intermediate_texture_view: gpu::TextureView::default(),
@@ -729,7 +728,6 @@ impl BladeRendererCore {
         if target.needs_init {
             self.command_encoder.init_texture(target.texture);
         }
-        self.ensure_path_intermediate_textures(target.size);
 
         let globals = GlobalParams {
             viewport_size: [target.size.width as f32, target.size.height as f32],
@@ -782,6 +780,7 @@ impl BladeRendererCore {
                         continue;
                     };
                     drop(pass);
+                    self.ensure_path_intermediate_textures(target.size);
                     self.draw_paths_to_intermediate(
                         paths,
                         target.size.width as f32,
