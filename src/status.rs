@@ -35,22 +35,30 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use regex::{RegexSet, RegexSetBuilder};
 use crate::agent_rules::{self, DetectionInput, RuleState};
 
-/// Foreground-group cache: shell pid -> (tpgid, process names).
+/// Shared empty snapshot, so idle panes do not allocate a new `Arc` every poll.
+static EMPTY_FOREGROUND_NAMES: LazyLock<Arc<[String]>> =
+    LazyLock::new(|| Arc::from(Vec::<String>::new()));
+
+fn empty_foreground_names() -> Arc<[String]> {
+    Arc::clone(&*EMPTY_FOREGROUND_NAMES)
+}
+
+/// Foreground-group cache: shell pid -> (tpgid, shared process-name snapshot).
 ///
 /// The poller runs every 500 ms per session, but the foreground group only
 /// changes when a command starts or ends. The `stat` read still happens each
 /// tick (one small read, and it is the change detector), while the heavier
 /// `comm` / `cmdline` / `children` reads are skipped while the group is
-/// unchanged. Entries are keyed by shell pid; pids are few (one per session)
-/// and a changed group simply overwrites its entry.
+/// unchanged. Snapshots are shared across the status and logo paths; closed
+/// panes explicitly remove their entry.
 #[cfg(unix)]
-static FG_CACHE: LazyLock<parking_lot::Mutex<HashMap<u32, (i64, Vec<String>)>>> =
+static FG_CACHE: LazyLock<parking_lot::Mutex<HashMap<u32, (i64, Arc<[String]>)>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// The status a terminal session can report. Exactly one is active at a time.
@@ -326,27 +334,29 @@ pub fn explain(input: &StatusInput<'_>) -> Option<agent_rules::RuleMatch> {
 /// Empty when the shell itself owns the foreground group, i.e. the user is back
 /// at a prompt, or on platforms without `/proc`.
 #[cfg(unix)]
-pub fn foreground_process_names(pid: Option<u32>) -> Vec<String> {
+pub fn foreground_process_names(pid: Option<u32>) -> Arc<[String]> {
     let Some(pid) = pid else {
-        return Vec::new();
+        return empty_foreground_names();
     };
     let Some(tpgid) = read_proc_tpgid(pid) else {
-        return Vec::new();
+        FG_CACHE.lock().remove(&pid);
+        return empty_foreground_names();
     };
     // `tpgid == 0` means no controlling terminal; `tpgid == pid` means the
     // shell itself owns the foreground group, i.e. it is sitting at a prompt.
     if tpgid == 0 || tpgid == pid as i64 {
-        return Vec::new();
+        FG_CACHE.lock().remove(&pid);
+        return empty_foreground_names();
     }
 
     // Fast path: same foreground group as last tick means the same names —
-    // skip the `comm` / `cmdline` / `children` reads. (A wrapper that swaps
-    // its child without changing groups is re-read on the next command; the
-    // worst case is a briefly stale pack selection, never a stuck badge.)
-    if let Some((cached_tpgid, names)) = FG_CACHE.lock().get(&pid) {
-        if *cached_tpgid == tpgid {
-            return names.clone();
-        }
+    // skip the `comm` / `cmdline` / `children` reads and share the immutable
+    // snapshot instead of cloning its strings for every poll.
+    let cached = FG_CACHE.lock().get(&pid).and_then(|(cached_tpgid, names)| {
+        (*cached_tpgid == tpgid).then(|| Arc::clone(names))
+    });
+    if let Some(names) = cached {
+        return names;
     }
 
     let dir = Path::new("/proc").join(tpgid.to_string());
@@ -406,13 +416,28 @@ pub fn foreground_process_names(pid: Option<u32>) -> Vec<String> {
         }
     }
 
-    FG_CACHE.lock().insert(pid, (tpgid, names.clone()));
+    let names: Arc<[String]> = names.into();
+    FG_CACHE
+        .lock()
+        .insert(pid, (tpgid, Arc::clone(&names)));
     names
 }
 
 #[cfg(not(unix))]
-pub fn foreground_process_names(_pid: Option<u32>) -> Vec<String> {
-    Vec::new()
+pub fn foreground_process_names(_pid: Option<u32>) -> Arc<[String]> {
+    empty_foreground_names()
+}
+
+/// Forget cached process names when a pane's shell is closed. The cache is
+/// keyed by shell PID, so explicit removal prevents terminal churn from
+/// retaining one entry per historical session until process shutdown.
+pub fn forget_pid(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        FG_CACHE.lock().remove(&pid);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// The `tpgid` field of `/proc/<pid>/stat`: the terminal's foreground process

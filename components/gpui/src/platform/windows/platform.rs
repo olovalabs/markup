@@ -1041,7 +1041,7 @@ fn handle_gpu_device_lost(
     // If we don't wait, the final drawing result will be blank.
     std::thread::sleep(std::time::Duration::from_millis(350));
 
-    try_to_recover_from_device_lost(
+    let recovered = try_to_recover_from_device_lost(
         || {
             DirectXDevices::new()
                 .context("Failed to recreate new DirectX devices after device lost")
@@ -1054,6 +1054,11 @@ fn handle_gpu_device_lost(
             // std::process::exit(1);
         },
     );
+    if !recovered {
+        // Do not dispatch the stale, device-lost interfaces to windows and text
+        // systems as though a new device had been created.
+        return;
+    }
     log::info!("DirectX devices successfully recreated.");
 
     unsafe {

@@ -61,9 +61,9 @@ pub struct TerminalPane {
     /// Reused scrape buffer: the poller reads the screen into this instead of
     /// allocating a fresh `Vec<String>` every 500 ms per pane.
     pub screen_scratch: Vec<String>,
-    /// (screen fingerprint, focused, exited, foreground fingerprint) from the
-    /// last poll tick. When it matches, nothing observable changed and the
-    /// whole rule-pack evaluation + logo resolution is skipped.
+    /// (screen revision, focused, exited, foreground fingerprint) from the
+    /// last poll tick. The revision lets an idle pane skip rebuilding its screen
+    /// strings and fingerprints entirely.
     pub poll_cache: Option<(u64, bool, bool, u64)>,
     /// Screen fingerprint at the moment the user last looked at a finished or
     /// failed terminal. While the screen still matches, the sticky Done/Error
@@ -408,10 +408,13 @@ impl AppState {
                 let pane_count = session.panes.len();
                 let mut primary_idx: Option<usize> = None;
                 let mut primary_focused = false;
-                let mut primary_fg: Vec<String> = Vec::new();
+                let mut primary_fg: Arc<[String]> = status::foreground_process_names(None);
 
                 for (pane_idx, pane) in session.panes.iter_mut().enumerate() {
                     let focused = focused_id == Some(pane.id);
+                    // Reuse the same immutable foreground snapshot for status,
+                    // cache keys, and the session logo (one /proc probe per pane).
+                    let foreground = status::foreground_process_names(pane.pid);
 
                     // The pane the session badge/title follows: the focused
                     // pane, else the first pane of the screen.
@@ -420,7 +423,7 @@ impl AppState {
                     if focused || (is_default_primary && !primary_focused) {
                         primary_focused = focused;
                         primary_idx = Some(pane_idx);
-                        primary_fg = status::foreground_process_names(pane.pid);
+                        primary_fg = Arc::clone(&foreground);
                     }
 
                     // Background panes never render, so their PTY events
@@ -452,48 +455,51 @@ impl AppState {
                         changed = true;
                     }
 
-                    // Reused for both the debug dump and the agent lifecycle below.
-                    let foreground = status::foreground_process_names(pane.pid);
-
-                    // Scrape into the pane's reused buffer. `bottom_lines` takes
-                    // the last N *rows*, clamped to the visible screen. Ask for the
-                    // whole screen: a fresh shell prints its prompt on row 0, well
-                    // above a 12-row window at the bottom. The rules skip blank
-                    // rows themselves.
-                    pane.terminal
-                        .read(cx)
-                        .bottom_lines_into(usize::MAX, &mut pane.screen_scratch);
-
-                    // Idle fast path: when the screen, focus, exit state, and
-                    // foreground group all match last tick, the status, ack, and
-                    // logo cannot have changed — skip the rule-pack evaluation
-                    // entirely. Done is excluded: it expires on a timer even when
-                    // nothing else changes.
-                    let poll_key = {
+                    // Idle fast path: the screen revision changes on PTY output
+                    // and resize, while focus, exit state, and foreground-group
+                    // changes are checked independently. Stable panes therefore
+                    // skip row extraction, string allocation, and screen hashing.
+                    let foreground_fp = screen_fingerprint(foreground.as_ref(), "");
+                    let (screen_revision, exited) = {
                         let terminal = pane.terminal.read(cx);
-                        let fp = screen_fingerprint(
-                            &pane.screen_scratch,
-                            terminal.title().unwrap_or(""),
-                        );
-                        (
-                            fp,
-                            focused,
-                            terminal.has_exited(),
-                            screen_fingerprint(&foreground, ""),
-                        )
+                        (terminal.screen_revision(), terminal.has_exited())
                     };
-                    if pane.poll_cache == Some(poll_key)
+                    let unchanged = pane.poll_cache.is_some_and(
+                        |(revision, was_focused, was_exited, old_foreground_fp)| {
+                            revision == screen_revision
+                                && was_focused == focused
+                                && was_exited == exited
+                                && old_foreground_fp == foreground_fp
+                        },
+                    );
+                    if unchanged
                         && pane.status != SessionStatus::Done
                         && pane.status != SessionStatus::Working
                     {
                         continue;
                     }
 
-                    let (next, ack, screen_fp) = {
+                    // Scrape into the pane's reused buffer only after the cheap
+                    // revision/focus/process checks show that something changed.
+                    // Ask for the whole visible screen: fresh shells can print
+                    // their prompt on row 0, not just the last dozen rows.
+                    pane.terminal
+                        .read(cx)
+                        .bottom_lines_into(usize::MAX, &mut pane.screen_scratch);
+
+                    let screen_fp = {
+                        let terminal = pane.terminal.read(cx);
+                        screen_fingerprint(
+                            &pane.screen_scratch,
+                            terminal.title().unwrap_or(""),
+                        )
+                    };
+                    let poll_key = (screen_revision, focused, exited, foreground_fp);
+
+                    let (next, ack) = {
                         let terminal = pane.terminal.read(cx);
                         let bottom_lines = &pane.screen_scratch;
                         let title = terminal.title().unwrap_or("");
-                        let screen_fp = screen_fingerprint(bottom_lines, title);
                         let screen_text = bottom_lines.join("\n");
                         let detector_state = pane.detector.update(
                             &screen_text,
@@ -611,7 +617,7 @@ impl AppState {
                             }
                         }
 
-                        (next, ack, screen_fp)
+                        (next, ack)
                     };
 
                     // Agent lifecycle. Two ways a task counts as finished, because
@@ -943,6 +949,9 @@ impl AppState {
             if let Some(session) = project.sessions.get_mut(s_idx) {
                 if session.maximized_pane_id == Some(pane_id) {
                     session.maximized_pane_id = None;
+                }
+                if let Some(closed_pane) = session.panes.iter().find(|pane| pane.id == pane_id) {
+                    status::forget_pid(closed_pane.pid);
                 }
                 session.pane_tree = session.pane_tree.take().and_then(|t| t.remove(pane_id));
                 session.panes.retain(|p| p.id != pane_id);
