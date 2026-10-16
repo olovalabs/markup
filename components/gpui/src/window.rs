@@ -948,6 +948,7 @@ impl Window {
             window_decorations,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             tabbing_identifier,
+            window_icon,
         } = options;
 
         let bounds = window_bounds
@@ -1200,6 +1201,9 @@ impl Window {
 
         if let Some(app_id) = app_id {
             platform_window.set_app_id(&app_id);
+        }
+        if let Some(window_icon) = window_icon {
+            platform_window.set_window_icon(&window_icon);
         }
 
         platform_window.map_window().unwrap();
@@ -1784,6 +1788,11 @@ impl Window {
     pub fn set_app_id(&mut self, app_id: &str) {
         self.platform_window.set_app_id(app_id);
     }
+    /// Sets the window / taskbar icon.
+    pub fn set_window_icon(&mut self, icon: &crate::WindowIcon) {
+        self.platform_window.set_window_icon(icon);
+    }
+
 
     /// Sets the window background appearance.
     pub fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {

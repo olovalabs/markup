@@ -25,6 +25,8 @@ mod status;
 
 use assets::{load_embedded_fonts, sync_component_fonts, CombinedAssets, MONO_FONT};
 use status::{SessionStatus, StatusInput};
+pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/logo/markup.png");
+
 
 struct SharedWriter {
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
@@ -2022,11 +2024,61 @@ fn detect_shell() -> (String, String) {
         ("/bin/bash".to_string(), "bash".to_string())
     }
 }
+#[cfg(target_os = "linux")]
+fn ensure_linux_desktop_entry() {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let data_dir = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    let apps_dir = data_dir.join("applications");
+    let icons_dir = data_dir.join("icons/hicolor/512x512/apps");
+    let _ = std::fs::create_dir_all(&apps_dir);
+    let _ = std::fs::create_dir_all(&icons_dir);
+
+    let icon_path = icons_dir.join("markup.png");
+    if !icon_path.exists() {
+        let _ = std::fs::write(&icon_path, APP_ICON_PNG);
+    }
+
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("markup"));
+    let exe_str = exe_path.to_string_lossy();
+
+    let desktop_content = format!(
+        "[Desktop Entry]\n\
+        Type=Application\n\
+        Name=Markup\n\
+        Comment=GPU-accelerated terminal\n\
+        Exec={exe_str}\n\
+        Icon=markup\n\
+        Terminal=false\n\
+        Categories=System;TerminalEmulator;\n\
+        StartupWMClass=markup\n"
+    );
+
+    let _ = std::fs::write(apps_dir.join("markup.desktop"), desktop_content);
+
+    let t3_content = format!(
+        "[Desktop Entry]\n\
+        Type=Application\n\
+        Name=Markup\n\
+        Exec={exe_str}\n\
+        Icon=markup\n\
+        Terminal=false\n\
+        StartupWMClass=t3code-terminal\n"
+    );
+    let _ = std::fs::write(apps_dir.join("t3code-terminal.desktop"), t3_content);
+}
+
 
 fn main() -> Result<()> {
     Application::new()
         .with_assets(CombinedAssets)
         .run(|cx: &mut App| {
+            #[cfg(target_os = "linux")]
+            ensure_linux_desktop_entry();
+            let window_icon = gpui::WindowIcon::from_png_bytes(APP_ICON_PNG).ok();
             gpui_component::init(cx);
             gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
             load_embedded_fonts(cx);
@@ -2045,7 +2097,8 @@ fn main() -> Result<()> {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitleBar::title_bar_options()),
                     window_decorations: Some(WindowDecorations::Client),
-                    app_id: Some("t3code-terminal".to_string()),
+                    app_id: Some("markup".to_string()),
+                    window_icon,
                     ..Default::default()
                 },
                 |window, cx| {
@@ -2269,7 +2322,8 @@ mod resize_tests {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
                         titlebar: Some(TitleBar::title_bar_options()),
                         window_decorations: Some(WindowDecorations::Client),
-                        app_id: Some("t3code-terminal".to_string()),
+                        app_id: Some("markup".to_string()),
+                        window_icon: gpui::WindowIcon::from_png_bytes(APP_ICON_PNG).ok(),
                         ..Default::default()
                     },
                     |window, cx| cx.new(|cx| Root::new(state.clone(), window, cx)),

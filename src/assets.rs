@@ -21,6 +21,9 @@ impl gpui::AssetSource for CombinedAssets {
             .trim_start_matches("icons/")
             .trim_start_matches("assets/")
             .trim_start_matches('/');
+        if clean == "logo/markup.png" || clean == "markup.png" {
+            return Ok(Some(std::borrow::Cow::Borrowed(crate::APP_ICON_PNG)));
+        }
         if let Some(file) = AppAssets::get(clean) {
             return Ok(Some(file.data));
         }
@@ -94,5 +97,10 @@ mod tests {
         assert!(assets.load("icons/pane-maximize.svg").unwrap().is_some());
         assert!(assets.load("icons/pane-restore.svg").unwrap().is_some());
         assert!(assets.load("icons/pane-close.svg").unwrap().is_some());
+        assert!(assets.load("logo/markup.png").unwrap().is_some());
+        let icon = gpui::WindowIcon::from_png_bytes(crate::APP_ICON_PNG).unwrap();
+        assert_eq!(icon.width, 1364);
+        assert_eq!(icon.height, 1153);
+        assert_eq!(icon.rgba.len(), (1364 * 1153 * 4) as usize);
     }
 }

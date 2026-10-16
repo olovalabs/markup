@@ -860,6 +860,71 @@ impl PlatformWindow for WindowsWindow {
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         // There is no such thing on Windows.
     }
+
+    fn set_window_icon(&mut self, icon: &WindowIcon) {
+        let hwnd = self.0.hwnd;
+        let width = icon.width;
+        let height = icon.height;
+
+        let mut bi = BITMAPV5HEADER::default();
+        bi.bV5Size = std::mem::size_of::<BITMAPV5HEADER>() as u32;
+        bi.bV5Width = width as i32;
+        bi.bV5Height = -(height as i32);
+        bi.bV5Planes = 1;
+        bi.bV5BitCount = 32;
+        bi.bV5Compression = BI_BITFIELDS;
+        bi.bV5RedMask = 0x00ff0000;
+        bi.bV5GreenMask = 0x0000ff00;
+        bi.bV5BlueMask = 0x000000ff;
+        bi.bV5AlphaMask = 0xff000000;
+
+        let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            let dc = GetDC(None);
+            let Ok(color_bmp) = CreateDIBSection(
+                dc,
+                &bi as *const _ as *const BITMAPINFO,
+                DIB_RGB_COLORS,
+                &mut bits_ptr,
+                None,
+                0,
+            ) else {
+                ReleaseDC(None, dc);
+                return;
+            };
+            ReleaseDC(None, dc);
+
+            if !bits_ptr.is_null() {
+                let dest = std::slice::from_raw_parts_mut(bits_ptr as *mut u8, (width * height * 4) as usize);
+                for (src, dst) in icon.rgba.chunks_exact(4).zip(dest.chunks_exact_mut(4)) {
+                    dst[0] = src[2];
+                    dst[1] = src[1];
+                    dst[2] = src[0];
+                    dst[3] = src[3];
+                }
+            }
+
+            let Ok(mask_bmp) = CreateBitmap(width as i32, height as i32, 1, 1, None) else {
+                let _ = DeleteObject(color_bmp);
+                return;
+            };
+            let icon_info = ICONINFO {
+                fIcon: true.into(),
+                xHotspot: 0,
+                yHotspot: 0,
+                hbmMask: mask_bmp,
+                hbmColor: color_bmp,
+            };
+
+            if let Ok(hicon) = CreateIconIndirect(&icon_info) {
+                SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as _), LPARAM(hicon.0 as _));
+                SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as _), LPARAM(hicon.0 as _));
+            }
+
+            let _ = DeleteObject(color_bmp);
+            let _ = DeleteObject(mask_bmp);
+        }
+    }
 }
 
 #[implement(IDropTarget)]

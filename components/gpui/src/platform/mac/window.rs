@@ -1253,6 +1253,34 @@ impl PlatformWindow for MacWindow {
     }
 
     fn set_app_id(&mut self, _app_id: &str) {}
+    fn set_window_icon(&mut self, icon: &WindowIcon) {
+        unsafe {
+            let png_bytes = if let Some(bytes) = &icon.png_bytes {
+                bytes.clone()
+            } else {
+                let mut bytes = Vec::new();
+                if let Some(img) = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba.clone()) {
+                    let _ = img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png);
+                }
+                bytes
+            };
+
+            if !png_bytes.is_empty() {
+                let data: id = msg_send![
+                    class!(NSData),
+                    dataWithBytes: png_bytes.as_ptr()
+                    length: png_bytes.len()
+                ];
+                let image: id = msg_send![class!(NSImage), alloc];
+                let image: id = msg_send![image, initWithData: data];
+                if !image.is_null() {
+                    let app = NSApplication::sharedApplication(nil);
+                    let _: () = msg_send![app, setApplicationIconImage: image];
+                    let _: () = msg_send![image, release];
+                }
+            }
+        }
+    }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();

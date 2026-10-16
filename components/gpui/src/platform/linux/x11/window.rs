@@ -8,6 +8,7 @@ use crate::{
     Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowKind, WindowParams, X11ClientStatePtr, px, size,
+    WindowIcon,
 };
 
 use blade_graphics as gpu;
@@ -60,6 +61,7 @@ x11rb::atom_manager! {
         WM_TRANSIENT_FOR,
         _NET_WM_PID,
         _NET_WM_NAME,
+        _NET_WM_ICON,
         _NET_WM_STATE,
         _NET_WM_STATE_MAXIMIZED_VERT,
         _NET_WM_STATE_MAXIMIZED_HORZ,
@@ -1400,6 +1402,49 @@ impl PlatformWindow for X11Window {
             ),
         )
         .log_err();
+    }
+    fn set_window_icon(&mut self, icon: &WindowIcon) {
+        let standard_sizes = [16, 24, 32, 48, 64, 128, 256];
+        let src_img = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba.clone());
+        let mut data: Vec<u32> = Vec::new();
+
+        if let Some(src) = src_img {
+            for &size in &standard_sizes {
+                if size <= icon.width.max(icon.height) || size == 16 {
+                    let resized = if size == icon.width && size == icon.height {
+                        src.clone()
+                    } else {
+                        image::imageops::resize(&src, size, size, image::imageops::FilterType::Lanczos3)
+                    };
+                    data.push(size);
+                    data.push(size);
+                    for pixel in resized.pixels() {
+                        let [r, g, b, a] = pixel.0;
+                        data.push(((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
+                    }
+                }
+            }
+        } else {
+            data.push(icon.width);
+            data.push(icon.height);
+            for chunk in icon.rgba.chunks_exact(4) {
+                data.push(((chunk[3] as u32) << 24) | ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32));
+            }
+        }
+
+        let state = self.0.state.borrow();
+        check_reply(
+            || "X11 ChangeProperty for _NET_WM_ICON failed.",
+            self.0.xcb.change_property32(
+                xproto::PropMode::REPLACE,
+                self.0.x_window,
+                state.atoms._NET_WM_ICON,
+                xproto::AtomEnum::CARDINAL,
+                &data,
+            ),
+        )
+        .log_err();
+        xcb_flush(&self.0.xcb);
     }
 
     fn map_window(&mut self) -> anyhow::Result<()> {

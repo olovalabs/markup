@@ -539,6 +539,7 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         Decorations::Server
     }
     fn set_app_id(&mut self, _app_id: &str) {}
+    fn set_window_icon(&mut self, _icon: &WindowIcon) {}
     fn map_window(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -1200,6 +1201,48 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+    /// Window icon for the taskbar, dock, and window title bar.
+    pub window_icon: Option<WindowIcon>,
+}
+
+/// The icon for a window, used in taskbars, docks, and window title bars.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowIcon {
+    /// Width of the icon in pixels.
+    pub width: u32,
+    /// Height of the icon in pixels.
+    pub height: u32,
+    /// Raw RGBA8 pixel data (width * height * 4 bytes).
+    pub rgba: Vec<u8>,
+    /// Optional original PNG-encoded bytes for platforms that consume PNG directly (e.g. macOS).
+    pub png_bytes: Option<Vec<u8>>,
+}
+
+impl WindowIcon {
+    /// Creates a window icon from raw RGBA8 pixels.
+    pub fn from_rgba(rgba: Vec<u8>, width: u32, height: u32) -> anyhow::Result<Self> {
+        if (width * height * 4) as usize != rgba.len() {
+            anyhow::bail!("invalid rgba buffer length for window icon");
+        }
+        Ok(Self {
+            width,
+            height,
+            rgba,
+            png_bytes: None,
+        })
+    }
+
+    /// Creates a window icon from PNG-encoded image bytes.
+    pub fn from_png_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?.into_rgba8();
+        let (width, height) = img.dimensions();
+        Ok(Self {
+            width,
+            height,
+            rgba: img.into_raw(),
+            png_bytes: Some(bytes.to_vec()),
+        })
+    }
 }
 
 /// The variables that can be configured when creating a new window
@@ -1307,6 +1350,7 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            window_icon: None,
         }
     }
 }
