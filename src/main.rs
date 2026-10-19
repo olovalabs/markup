@@ -249,6 +249,7 @@ impl AppState {
         self.projects.get(self.active_project_idx)
     }
 
+    #[cfg(test)]
     fn active_project_mut(&mut self) -> Option<&mut Project> {
         self.projects.get_mut(self.active_project_idx)
     }
@@ -743,19 +744,14 @@ impl AppState {
             .active_session_idx
             .min(project.sessions.len().saturating_sub(1));
         project.active_session_idx = session_idx;
-        let pane_id = project
+        let first_pane = project
             .sessions
             .get(session_idx)
-            .and_then(|s| s.panes.first())
-            .map(|pane| pane.id);
-        if let Some(pane_id) = pane_id {
-            if let Some(session) = project.sessions.get(session_idx) {
-                if let Some(pane) = session.panes.first() {
-                    pane.terminal.read(cx).focus_handle().focus(window);
-                }
-            }
+            .and_then(|s| s.panes.first());
+        if let Some(pane) = first_pane {
+            pane.terminal.read(cx).focus_handle().focus(window);
         }
-        self.focused_pane_id = pane_id;
+        self.focused_pane_id = first_pane.map(|pane| pane.id);
         cx.notify();
     }
 
