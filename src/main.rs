@@ -183,6 +183,10 @@ pub struct Project {
     pub path: PathBuf,
     pub sessions: Vec<Session>,
     pub active_session_idx: usize,
+    /// Whether this project's session list is expanded in the sidebar. Every
+    /// project keeps its own state, so several open projects can be browsed
+    /// independently without switching away from the one being worked in.
+    pub expanded: bool,
 }
 
 struct AppState {
@@ -720,8 +724,54 @@ impl AppState {
             cx.notify();
         }
     }
-    fn create_new_session_for_active_project(
+
+    /// Make a project the one shown in the workspace and focus its current
+    /// pane. Expanding it is part of activation: selecting a project should
+    /// always reveal the sessions that belong to it.
+    fn activate_project(
         &mut self,
+        project_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.projects.get_mut(project_idx) else {
+            return;
+        };
+        self.active_project_idx = project_idx;
+        project.expanded = true;
+        let session_idx = project
+            .active_session_idx
+            .min(project.sessions.len().saturating_sub(1));
+        project.active_session_idx = session_idx;
+        let pane_id = project
+            .sessions
+            .get(session_idx)
+            .and_then(|s| s.panes.first())
+            .map(|pane| pane.id);
+        if let Some(pane_id) = pane_id {
+            if let Some(session) = project.sessions.get(session_idx) {
+                if let Some(pane) = session.panes.first() {
+                    pane.terminal.read(cx).focus_handle().focus(window);
+                }
+            }
+        }
+        self.focused_pane_id = pane_id;
+        cx.notify();
+    }
+
+    fn toggle_project_expanded(&mut self, project_idx: usize, cx: &mut Context<Self>) {
+        if let Some(project) = self.projects.get_mut(project_idx) {
+            project.expanded = !project.expanded;
+            cx.notify();
+        }
+    }
+
+    /// Create a session inside one specific project, switching the workspace
+    /// to that project so the new terminal is the one being worked in. This
+    /// backs the "+" on every project header, not just the active project.
+    fn create_new_session_in_project(
+        &mut self,
+        project_idx: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -729,9 +779,11 @@ impl AppState {
         let next_id = self.next_id;
         self.next_id += 1;
 
-        let dir = self.active_project().map(|p| p.path.clone());
+        let Some(dir) = self.projects.get(project_idx).map(|p| p.path.clone()) else {
+            return;
+        };
         if let Ok((terminal, pid)) = Self::spawn_terminal_view(
-            dir.as_ref(),
+            Some(&dir),
             self.palette.clone(),
             self_weak,
             next_id,
@@ -739,7 +791,8 @@ impl AppState {
         ) {
             terminal.read(cx).focus_handle().focus(window);
             let session_count = self
-                .active_project()
+                .projects
+                .get(project_idx)
                 .map(|p| p.sessions.len())
                 .unwrap_or(0);
             let title = SharedString::from(format!("terminal {}", session_count + 1));
@@ -768,73 +821,198 @@ impl AppState {
                 status: SessionStatus::Idle,
             };
 
-            if let Some(project) = self.active_project_mut() {
+            if let Some(project) = self.projects.get_mut(project_idx) {
                 project.sessions.push(session);
                 project.active_session_idx = project.sessions.len() - 1;
+                project.expanded = true;
             }
+            self.active_project_idx = project_idx;
             self.focused_pane_id = Some(next_id);
             self.rebuild_session_index();
             cx.notify();
         }
     }
 
+    /// New session in whichever project is currently open in the workspace.
+    fn create_new_session_for_active_project(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project_idx = self.active_project_idx;
+        if self.projects.get(project_idx).is_none() {
+            // With no project open there is nothing to add a session to, so
+            // the request turns into "open a project first".
+            self.select_folder_and_add_project(window, cx);
+            return;
+        }
+        self.create_new_session_in_project(project_idx, window, cx);
+    }
+
+    /// Close one session (all of its panes) without touching the other
+    /// sessions and projects. The project stays open, with an empty state that
+    /// offers to create a new session.
+    fn close_session(
+        &mut self,
+        project_idx: usize,
+        session_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.projects.get_mut(project_idx) else {
+            return;
+        };
+        if session_idx >= project.sessions.len() {
+            return;
+        }
+        let removed = project.sessions.remove(session_idx);
+        for pane in &removed.panes {
+            status::forget_pid(pane.pid);
+        }
+        if project.active_session_idx > session_idx {
+            project.active_session_idx -= 1;
+        }
+        if project.active_session_idx >= project.sessions.len() {
+            project.active_session_idx = project.sessions.len().saturating_sub(1);
+        }
+        let is_active_project = project_idx == self.active_project_idx;
+        let pane_id = project
+            .sessions
+            .get(project.active_session_idx)
+            .and_then(|s| s.panes.first())
+            .map(|pane| pane.id);
+        if is_active_project {
+            if let Some(pane_id) = pane_id {
+                if let Some(pane) = project.sessions[project.active_session_idx].panes.first() {
+                    pane.terminal.read(cx).focus_handle().focus(window);
+                }
+                self.focused_pane_id = Some(pane_id);
+            } else {
+                self.focused_pane_id = None;
+            }
+        }
+        // Drop the removed terminals after forgetting their pids, so their
+        // PTY masters close and the shells go away with them.
+        drop(removed);
+        self.rebuild_session_index();
+        cx.notify();
+    }
+
+    /// Close a whole project. Its sessions and PTYs go away; the remaining
+    /// projects (and their sessions) are left exactly as they were.
+    fn close_project(
+        &mut self,
+        project_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if project_idx >= self.projects.len() {
+            return;
+        }
+        let was_active = project_idx == self.active_project_idx;
+        let removed = self.projects.remove(project_idx);
+        for session in &removed.sessions {
+            for pane in &session.panes {
+                status::forget_pid(pane.pid);
+            }
+        }
+        if self.active_project_idx > project_idx {
+            self.active_project_idx -= 1;
+        }
+        if self.active_project_idx >= self.projects.len() {
+            self.active_project_idx = self.projects.len().saturating_sub(1);
+        }
+        drop(removed);
+        if was_active && !self.projects.is_empty() {
+            let next_idx = self.active_project_idx;
+            self.activate_project(next_idx, window, cx);
+        } else if self.projects.is_empty() {
+            self.focused_pane_id = None;
+        }
+        self.rebuild_session_index();
+        cx.notify();
+    }
+
+    /// Open a folder as a project. Opening a folder that is already in the
+    /// sidebar focuses that project (and revives it if it has no sessions)
+    /// rather than creating a duplicate.
+    fn open_project_path(
+        &mut self,
+        folder: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(existing) = self.projects.iter().position(|p| p.path == folder) {
+            if self.projects[existing].sessions.is_empty() {
+                self.create_new_session_in_project(existing, window, cx);
+            } else {
+                self.activate_project(existing, window, cx);
+            }
+            return;
+        }
+
+        let name = folder
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string());
+
+        let self_weak = cx.entity().downgrade();
+        let next_id = self.next_id;
+        self.next_id += 1;
+
+        if let Ok((terminal, pid)) = Self::spawn_terminal_view(
+            Some(&folder),
+            self.palette.clone(),
+            self_weak,
+            next_id,
+            cx,
+        ) {
+            terminal.read(cx).focus_handle().focus(window);
+            let title = SharedString::from("terminal 1");
+            let pane = TerminalPane {
+                id: next_id,
+                terminal,
+                status: SessionStatus::Idle,
+                title: title.to_string(),
+                display_title: title.clone(),
+                pid,
+                screen_scratch: Vec::new(),
+                poll_cache: None,
+                ack_screen: None,
+                agent_active: false,
+                done_since: None,
+                detector: status::Detector::default(),
+            };
+            let session = Session {
+                id: next_id,
+                title: title.clone(),
+                display_title: title,
+                logo: logos::default_logo(),
+                pane_tree: Some(PaneNode::Leaf(next_id)),
+                maximized_pane_id: None,
+                panes: vec![pane],
+                status: SessionStatus::Idle,
+            };
+            let project = Project {
+                id: next_id,
+                name: SharedString::from(name),
+                path: folder,
+                sessions: vec![session],
+                active_session_idx: 0,
+                expanded: true,
+            };
+
+            self.projects.push(project);
+            self.active_project_idx = self.projects.len() - 1;
+            self.rebuild_session_index();
+            self.focused_pane_id = Some(next_id);
+            cx.notify();
+        }
+    }
+
     fn select_folder_and_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-            let name = folder
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "project".to_string());
-
-            let self_weak = cx.entity().downgrade();
-            let next_id = self.next_id;
-            self.next_id += 1;
-
-            if let Ok((terminal, pid)) = Self::spawn_terminal_view(
-                Some(&folder),
-                self.palette.clone(),
-                self_weak,
-                next_id,
-                cx,
-            ) {
-                terminal.read(cx).focus_handle().focus(window);
-                let pane = TerminalPane {
-                    id: next_id,
-                    terminal,
-                    status: SessionStatus::Idle,
-                    title: "terminal 1".to_string(),
-                    display_title: SharedString::from("terminal 1"),
-                    pid,
-                    screen_scratch: Vec::new(),
-                    poll_cache: None,
-                    ack_screen: None,
-                    agent_active: false,
-                    done_since: None,
-                    detector: status::Detector::default(),
-                };
-                let session = Session {
-                    id: next_id,
-                    title: SharedString::from("terminal 1"),
-                    display_title: SharedString::from("terminal 1"),
-                    logo: logos::default_logo(),
-                    pane_tree: Some(PaneNode::Leaf(next_id)),
-                    maximized_pane_id: None,
-                    panes: vec![pane],
-                    status: SessionStatus::Idle,
-                };
-                let project = Project {
-                    id: next_id,
-                    name: SharedString::from(name),
-                    path: folder,
-                    sessions: vec![session],
-                    active_session_idx: 0,
-                };
-
-                self.projects.push(project);
-                self.active_project_idx = self.projects.len() - 1;
-                self.rebuild_session_index();
-                self.focused_pane_id = Some(next_id);
-                cx.notify();
-            }
+            self.open_project_path(folder, window, cx);
         }
     }
 
@@ -987,7 +1165,7 @@ impl AppState {
         self.rebuild_session_index();
 
         if needs_new_session {
-            self.create_new_session_for_active_project(window, cx);
+            self.create_new_session_in_project(p_idx, window, cx);
         } else {
             cx.notify();
         }
@@ -1271,6 +1449,688 @@ impl AppState {
             cx.stop_propagation();
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Sidebar: projects and their sessions
+    // ---------------------------------------------------------------------
+
+    /// The whole left rail: a toolbar, the Projects header with its "Open
+    /// project" action, and one collapsible block per open project.
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let project_rows: Vec<gpui::AnyElement> = self
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(p_idx, project)| self.render_project_entry(p_idx, project, cx))
+            .collect();
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgba(0x1b1c22ff))
+            .border_r_1()
+            .border_color(rgba(0x26272fff))
+            .child(self.render_sidebar_toolbar(cx))
+            .child(self.render_sidebar_projects_header(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .flex()
+                    .flex_col()
+                    .pb(px(10.0))
+                    .children(project_rows)
+                    .when(self.projects.is_empty(), |this| {
+                        this.child(self.render_sidebar_empty_state(cx))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_sidebar_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .h(px(38.0))
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .pl(px(14.0))
+            .pr(px(10.0))
+            .child(sidebar_icon_button(
+                "sidebar-toggle-btn",
+                "icons/panel-left.svg",
+                16.0,
+                cx.listener::<MouseDownEvent>(|this, _, _, cx| {
+                    this.sidebar_visible = !this.sidebar_visible;
+                    cx.notify();
+                }),
+            ))
+            .child(self.make_drag_area(cx).flex_1().h_full())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(sidebar_icon_button(
+                        "sidebar-open-project-btn",
+                        "icons/folder-plus.svg",
+                        15.0,
+                        cx.listener::<MouseDownEvent>(|this, _, window, cx| {
+                            this.select_folder_and_add_project(window, cx);
+                        }),
+                    ))
+                    .child(sidebar_icon_button(
+                        "sidebar-new-session-btn",
+                        "icons/plus.svg",
+                        15.0,
+                        cx.listener::<MouseDownEvent>(|this, _, window, cx| {
+                            this.create_new_session_for_active_project(window, cx);
+                        }),
+                    )),
+            )
+    }
+
+    fn render_sidebar_projects_header(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .w_full()
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .pl(px(16.0))
+            .pr(px(10.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgba(0x656679ff))
+                    .child("PROJECTS"),
+            )
+            .child(sidebar_text_button(
+                "sidebar-open-project-text-btn",
+                "Open project",
+                "icons/folder-plus.svg",
+                false,
+                cx.listener::<MouseDownEvent>(|this, _, window, cx| {
+                    this.select_folder_and_add_project(window, cx);
+                }),
+            ))
+    }
+
+    /// One collapsible project block: the project header (activate, expand,
+    /// new session, close project) followed by its session rows.
+    fn render_project_entry(
+        &self,
+        project_idx: usize,
+        project: &Project,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let is_active_project = project_idx == self.active_project_idx;
+        let session_count = project.sessions.len();
+        let chevron = if project.expanded {
+            "icons/chevron-down.svg"
+        } else {
+            "icons/chevron-right.svg"
+        };
+
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        if project.expanded {
+            if project.sessions.is_empty() {
+                rows.push(
+                    div()
+                        .pl(px(34.0))
+                        .pr(px(16.0))
+                        .py(px(6.0))
+                        .text_size(px(11.5))
+                        .text_color(rgba(0x656679ff))
+                        .child("No sessions yet")
+                        .into_any_element(),
+                );
+            }
+            for (s_idx, session) in project.sessions.iter().enumerate() {
+                let is_active_session = is_active_project && s_idx == project.active_session_idx;
+                rows.push(self.render_session_entry(
+                    project_idx,
+                    s_idx,
+                    session,
+                    is_active_session,
+                    cx,
+                ));
+            }
+            rows.push(self.render_new_session_row(project_idx, project.id, cx));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id(("project-row", project.id))
+                    .ml(px(6.0))
+                    .mr(px(6.0))
+                    .mt(px(2.0))
+                    .h(px(32.0))
+                    .pl(px(4.0))
+                    .pr(px(4.0))
+                    .rounded(px(6.0))
+                    .cursor(CursorStyle::PointingHand)
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .bg(if is_active_project {
+                        rgba(0x26272fff)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .hover(|s| s.bg(rgba(0x23242cff)))
+                    .child(
+                        div()
+                            .id(("project-chevron", project.id))
+                            .size(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.0))
+                            .hover(|s| s.bg(rgba(0x32333eff)))
+                            .child(
+                                svg()
+                                    .path(chevron)
+                                    .size(px(12.0))
+                                    .text_color(rgba(0x8788a5ff)),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener::<MouseDownEvent>(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_project_expanded(project_idx, cx);
+                                }),
+                            ),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/folder.svg")
+                            .size(px(14.0))
+                            .text_color(if is_active_project {
+                                rgba(0xc3c1eeff)
+                            } else {
+                                rgba(0x8788a5ff)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(if is_active_project {
+                                rgba(0xe6edf3ff)
+                            } else {
+                                rgba(0xb9bac9ff)
+                            })
+                            .child(project.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(10.5))
+                            .text_color(rgba(0x656679ff))
+                            .child(format!("{session_count}")),
+                    )
+                    .child(sidebar_icon_button(
+                        ("project-new-session", project.id),
+                        "icons/plus.svg",
+                        13.0,
+                        cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                            this.create_new_session_in_project(project_idx, window, cx);
+                        }),
+                    ))
+                    .child(sidebar_icon_button(
+                        ("project-close", project.id),
+                        "icons/x.svg",
+                        12.0,
+                        cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                            this.close_project(project_idx, window, cx);
+                        }),
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                            // The whole header selects the project and reveals
+                            // its sessions; the chevron is what collapses it.
+                            this.activate_project(project_idx, window, cx);
+                        }),
+                    ),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// One session (screen) inside a project: logo, live status, title and a
+    /// close action. Clicking it swaps the workspace to that session.
+    fn render_session_entry(
+        &self,
+        project_idx: usize,
+        session_idx: usize,
+        session: &Session,
+        is_active_session: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (dot_color, text_color, badge_bg) = session.status.colors();
+        let display_status = match session.status {
+            SessionStatus::Active => "Active",
+            SessionStatus::Idle => "Idle",
+            SessionStatus::Working => "Working",
+            SessionStatus::Blocked => "Blocked",
+            SessionStatus::Error => "Error",
+            SessionStatus::Done => "Done",
+        };
+
+        div()
+            .id(("session-item", session.id))
+            .ml(px(6.0))
+            .mr(px(6.0))
+            .h(px(34.0))
+            .pl(px(16.0))
+            .pr(px(5.0))
+            .rounded(px(6.0))
+            .cursor(CursorStyle::PointingHand)
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .bg(if is_active_session {
+                rgba(0x2b2c37ff)
+            } else {
+                rgba(0x00000000)
+            })
+            .border_1()
+            .border_color(if is_active_session {
+                rgba(0x353645ff)
+            } else {
+                rgba(0x00000000)
+            })
+            .hover(|s| {
+                if !is_active_session {
+                    s.bg(rgba(0x23242c88))
+                } else {
+                    s
+                }
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        // AI Agent / Command logo with status indicator
+                        div()
+                            .relative()
+                            .size(px(20.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .flex_shrink_0()
+                            .child(
+                                gpui::img(session.logo.clone())
+                                    .size(px(18.0))
+                                    .rounded(px(3.5)),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .bottom(-px(1.0))
+                                    .right(-px(1.0))
+                                    .size(px(7.0))
+                                    .rounded_full()
+                                    .bg(rgba(dot_color))
+                                    .border_1()
+                                    .border_color(if is_active_session {
+                                        rgba(0x2b2c37ff)
+                                    } else {
+                                        rgba(0x1b1c22ff)
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .truncate()
+                            .text_color(if is_active_session {
+                                rgba(0xd7d5f4ff)
+                            } else {
+                                rgba(0x8788a5ff)
+                            })
+                            .hover(|s| {
+                                if !is_active_session {
+                                    s.text_color(rgba(0xc3c1eeff))
+                                } else {
+                                    s
+                                }
+                            })
+                            .child(session.display_title.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .h(px(18.0))
+                    .px(px(6.0))
+                    .rounded_full()
+                    .bg(rgba(badge_bg))
+                    .border_1()
+                    .border_color(rgba((dot_color & 0xffffff00) | 0x33))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .size(px(5.0))
+                            .rounded_full()
+                            .bg(rgba(dot_color)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgba(text_color))
+                            .child(display_status),
+                    ),
+            )
+            .child(sidebar_icon_button(
+                ("session-close", session.id),
+                "icons/x.svg",
+                11.0,
+                cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                    this.close_session(project_idx, session_idx, window, cx);
+                }),
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                    this.select_session(project_idx, session_idx, window, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// A quiet "+ New session" row under each expanded project, so creating a
+    /// session never requires guessing which project is active.
+    fn render_new_session_row(
+        &self,
+        project_idx: usize,
+        project_id: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(("project-new-session-row", project_id))
+            .ml(px(6.0))
+            .mr(px(6.0))
+            .mb(px(4.0))
+            .h(px(26.0))
+            .pl(px(17.0))
+            .pr(px(6.0))
+            .rounded(px(6.0))
+            .cursor(CursorStyle::PointingHand)
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .text_size(px(11.5))
+            .text_color(rgba(0x656679ff))
+            .hover(|s| s.bg(rgba(0x23242cff)).text_color(rgba(0xc3c1eeff)))
+            .child(
+                svg()
+                    .path("icons/plus.svg")
+                    .size(px(11.0))
+                    .text_color(rgba(0x656679ff)),
+            )
+            .child("New session")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                    this.create_new_session_in_project(project_idx, window, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn render_sidebar_empty_state(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(36.0))
+            .px(px(20.0))
+            .gap(px(8.0))
+            .child(
+                div()
+                    .size(px(40.0))
+                    .rounded(px(10.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(0x23242cff))
+                    .child(
+                        svg()
+                            .path("icons/folder.svg")
+                            .size(px(20.0))
+                            .text_color(rgba(0x8788a5ff)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgba(0xc3c1eeff))
+                    .child("No projects open"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgba(0x656679ff))
+                    .text_center()
+                    .child("Open any folder to start a project with its own sessions."),
+            )
+            .child(sidebar_text_button(
+                "sidebar-empty-open-project",
+                "Open project",
+                "icons/folder-plus.svg",
+                true,
+                cx.listener::<MouseDownEvent>(|this, _, window, cx| {
+                    this.select_folder_and_add_project(window, cx);
+                }),
+            ))
+    }
+
+    /// Shown in the terminal area when the active project has no session, or
+    /// when no project is open at all.
+    fn render_empty_terminal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let has_project = self.active_project().is_some();
+        let project_idx = self.active_project_idx;
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .size(px(48.0))
+                    .rounded(px(12.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(0x1b1c22ff))
+                    .child(
+                        svg()
+                            .path("icons/folder.svg")
+                            .size(px(24.0))
+                            .text_color(rgba(0x8788a5ff)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgba(0xc3c1eeff))
+                    .child(if has_project {
+                        "No session in this project"
+                    } else {
+                        "No project open"
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgba(0x656679ff))
+                    .child(if has_project {
+                        "Create a session to start a terminal in this project."
+                    } else {
+                        "Open a folder to start a project with its own sessions."
+                    }),
+            )
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(sidebar_text_button(
+                        "empty-terminal-open-project",
+                        "Open project",
+                        "icons/folder-plus.svg",
+                        true,
+                        cx.listener::<MouseDownEvent>(|this, _, window, cx| {
+                            this.select_folder_and_add_project(window, cx);
+                        }),
+                    ))
+                    .when(has_project, |this| {
+                        this.child(sidebar_text_button(
+                            "empty-terminal-new-session",
+                            "New session",
+                            "icons/plus.svg",
+                            false,
+                            cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                                this.create_new_session_in_project(project_idx, window, cx);
+                            }),
+                        ))
+                    }),
+            )
+    }
+
+    /// Switch the workspace to a session in a given project.
+    fn select_session(
+        &mut self,
+        project_idx: usize,
+        session_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.projects.get_mut(project_idx) else {
+            return;
+        };
+        if session_idx >= project.sessions.len() {
+            return;
+        }
+        project.active_session_idx = session_idx;
+        project.expanded = true;
+        self.active_project_idx = project_idx;
+        let pane_id = project.sessions[session_idx].panes.first().map(|p| p.id);
+        if let Some(pane) = project.sessions[session_idx].panes.first() {
+            pane.terminal.read(cx).focus_handle().focus(window);
+        }
+        self.focused_pane_id = pane_id;
+        cx.notify();
+    }
+}
+
+/// Small square icon button used by the sidebar rows and the sidebar
+/// toolbar. `on_click` is a `cx.listener`; the button stops mouse propagation
+/// so clicking it never also activates the row it sits in.
+fn sidebar_icon_button(
+    id: impl Into<gpui::ElementId>,
+    icon: &'static str,
+    icon_size: f32,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(20.0))
+        .rounded(px(4.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .cursor(CursorStyle::PointingHand)
+        .hover(|s| s.bg(rgba(0x32333eff)))
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+            cx.stop_propagation();
+            on_click(ev, window, cx);
+        })
+        .child(
+            svg()
+                .path(icon)
+                .size(px(icon_size))
+                .text_color(rgba(0x8788a5ff))
+                .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+        )
+}
+
+/// Slightly larger labelled button used for "Open project" / "New session"
+/// empty-state actions.
+fn sidebar_text_button(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    icon: &'static str,
+    primary: bool,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(30.0))
+        .px(px(12.0))
+        .rounded(px(6.0))
+        .cursor(CursorStyle::PointingHand)
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .bg(if primary {
+            rgba(0x1f6febff)
+        } else {
+            rgba(0x26272fff)
+        })
+        .border_1()
+        .border_color(if primary {
+            rgba(0x1f6febff)
+        } else {
+            rgba(0x32333eff)
+        })
+        .hover(move |s| {
+            if primary {
+                s.bg(rgba(0x2f81f7ff))
+            } else {
+                s.bg(rgba(0x2d2e38ff))
+            }
+        })
+        .child(
+            svg()
+                .path(icon)
+                .size(px(13.0))
+                .text_color(rgba(0xffffffff)),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgba(0xffffffff))
+                .child(label),
+        )
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+            cx.stop_propagation();
+            on_click(ev, window, cx);
+        })
 }
 
 impl Render for AppState {
@@ -1298,12 +2158,12 @@ impl Render for AppState {
         let active_title = self
             .active_session()
             .map(|s| s.title.clone())
-            .unwrap_or_else(|| SharedString::from("Terminal"));
+            .unwrap_or_else(|| SharedString::from("No session"));
 
         let active_project_name = self
             .active_project()
             .map(|p| p.name.clone())
-            .unwrap_or_else(|| SharedString::from("No Project"));
+            .unwrap_or_else(|| SharedString::from("No project"));
 
         let terminal_area = if let Some(session) = self.active_session() {
             // Each session is its own screen: its pane tree (and maximized
@@ -1325,7 +2185,7 @@ impl Render for AppState {
                 div().into_any_element()
             }
         } else {
-            div().into_any_element()
+            self.render_empty_terminal(cx).into_any_element()
         };
         // Focused terminal's status and logo, mirrored in the title bar.
         let titlebar_status = self.active_session().map(|s| s.status);
@@ -1514,328 +2374,7 @@ impl Render for AppState {
                     .child(div().flex().flex_col().size_full().child(terminal_area)),
             );
 
-        let sidebar_content = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgba(0x1b1c22ff))
-            .border_r_1()
-            .border_color(rgba(0x26272fff))
-            // Top Row: sidebar toggle, spacer, eye, cmd, plus
-            .child(
-                div()
-                    .h(px(38.0))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .pl(px(14.0))
-                    .pr(px(14.0))
-                    .child(
-                        div()
-                            .id("sidebar-toggle-btn")
-                            .cursor(CursorStyle::PointingHand)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                svg()
-                                    .path("icons/panel-left.svg")
-                                    .size(px(16.0))
-                                    .text_color(rgba(0x8788a5ff))
-                                    .hover(|s| s.text_color(rgba(0xf0f6fcff))),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.sidebar_visible = !this.sidebar_visible;
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(
-                        self.make_drag_area(cx)
-                            .flex_1()
-                            .h_full(),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(14.0))
-                            .child(
-                                div()
-                                    .id("sidebar-view-btn")
-                                    .cursor(CursorStyle::PointingHand)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        svg()
-                                            .path("icons/eye.svg")
-                                            .size(px(16.0))
-                                            .text_color(rgba(0x8788a5ff))
-                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        |_, _, cx| cx.stop_propagation(),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("sidebar-command-btn")
-                                    .cursor(CursorStyle::PointingHand)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        svg()
-                                            .path("icons/command.svg")
-                                            .size(px(14.0))
-                                            .text_color(rgba(0x8788a5ff))
-                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.select_folder_and_add_project(window, cx);
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("sidebar-add-btn")
-                                    .cursor(CursorStyle::PointingHand)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        svg()
-                                            .path("icons/plus.svg")
-                                            .size(px(16.0))
-                                            .text_color(rgba(0x8788a5ff))
-                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.create_new_session_for_active_project(window, cx);
-                                        }),
-                                    ),
-                            ),
-                    ),
-            )
-            // Projects & Sessions List
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_y_scrollbar()
-                    .flex()
-                    .flex_col()
-                    .children(self.projects.iter().enumerate().map(|(p_idx, project)| {
-                        let is_active_project = p_idx == self.active_project_idx;
-                        div()
-                            .flex()
-                            .flex_col()
-                            // Project Title Header ("icy-narrows")
-                            .child(
-                                div()
-                                    .id(("project-header", project.id))
-                                    .pt(px(14.0))
-                                    .pb(px(8.0))
-                                    .px(px(16.0))
-                                    .cursor(CursorStyle::PointingHand)
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgba(0x656679ff))
-                                            .hover(|s| s.text_color(rgba(0x8b949eff)))
-                                            .child(project.name.clone()),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.active_project_idx = p_idx;
-                                            let focused = this
-                                                .active_session()
-                                                .and_then(|s| s.panes.first())
-                                                .map(|p| p.id);
-                                            if let Some(pane_id) = focused {
-                                                this.focused_pane_id = Some(pane_id);
-                                            }
-                                            if let Some(pane) =
-                                                this.active_session().and_then(|s| s.panes.first())
-                                            {
-                                                pane.terminal.read(cx).focus_handle().focus(window);
-                                            }
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            // Sessions List for this project
-                            .child(
-                                div()
-                                    .px(px(6.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(4.0))
-                                    .children(project.sessions.iter().enumerate().map(|(s_idx, session)| {
-                                        let is_active_session = is_active_project && s_idx == project.active_session_idx;
-                                        let (dot_color, text_color, badge_bg) = session.status.colors();
-                                        let display_status = match session.status {
-                                            SessionStatus::Active => "Active",
-                                            SessionStatus::Idle => "Idle",
-                                            SessionStatus::Working => "Working",
-                                            SessionStatus::Blocked => "Blocked",
-                                            SessionStatus::Error => "Error",
-                                            SessionStatus::Done => "Done",
-                                        };
-                                        div()
-                                            .id(("session-item", session.id))
-                                            .h(px(36.0))
-                                            .px(px(10.0))
-                                            .rounded_full()
-                                            .cursor(CursorStyle::PointingHand)
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(8.0))
-                                            .bg(if is_active_session {
-                                                rgba(0x26272fff)
-                                            } else {
-                                                rgba(0x00000000)
-                                            })
-                                            .border_1()
-                                            .border_color(if is_active_session {
-                                                rgba(0x32333eff)
-                                            } else {
-                                                rgba(0x00000000)
-                                            })
-                                            .hover(|s| {
-                                                if !is_active_session {
-                                                    s.bg(rgba(0x23242c88))
-                                                } else {
-                                                    s
-                                                }
-                                            })
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(10.0))
-                                                    .min_w_0()
-                                                    .flex_1()
-                                                    .child(
-                                                        // AI Agent / Command logo with status indicator
-                                                        div()
-                                                            .relative()
-                                                            .size(px(20.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .flex_shrink_0()
-                                                            .child(
-                                                                gpui::img(session.logo.clone())
-                                                                    .size(px(18.0))
-                                                                    .rounded(px(3.5)),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .absolute()
-                                                                    .bottom(-px(1.0))
-                                                                    .right(-px(1.0))
-                                                                    .size(px(7.0))
-                                                                    .rounded_full()
-                                                                    .bg(rgba(dot_color))
-                                                                    .border_1()
-                                                                    .border_color(if is_active_session {
-                                                                        rgba(0x26272fff)
-                                                                    } else {
-                                                                        rgba(0x1b1c22ff)
-                                                                    }),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(13.0))
-                                                            .truncate()
-                                                            .text_color(if is_active_session {
-                                                                rgba(0xc3c1eeff)
-                                                            } else {
-                                                                rgba(0x8788a5ff)
-                                                            })
-                                                            .hover(|s| {
-                                                                if !is_active_session {
-                                                                    s.text_color(rgba(0xc3c1eeff))
-                                                                } else {
-                                                                    s
-                                                                }
-                                                            })
-                                                            .child(session.display_title.clone()),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_shrink_0()
-                                                    .h(px(19.0))
-                                                    .px(px(7.0))
-                                                    .rounded_full()
-                                                    .bg(rgba(badge_bg))
-                                                    .border_1()
-                                                    .border_color(rgba((dot_color & 0xffffff00) | 0x33))
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(5.0))
-                                                    .child(
-                                                        div()
-                                                            .size(px(5.0))
-                                                            .rounded_full()
-                                                            .bg(rgba(dot_color)),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(10.5))
-                                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                                            .text_color(rgba(text_color))
-                                                            .child(display_status),
-                                                    ),
-                                            )
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, window, cx| {
-                                                    // Switching tabs is a pure screen swap: the
-                                                    // clicked session's own pane tree becomes
-                                                    // the whole visible area. Other sessions'
-                                                    // panes keep running in the background.
-                                                    this.active_project_idx = p_idx;
-                                                    if let Some(session) = this
-                                                        .projects
-                                                        .get_mut(p_idx)
-                                                        .and_then(|p| {
-                                                            p.active_session_idx = s_idx;
-                                                            p.sessions.get_mut(s_idx)
-                                                        })
-                                                    {
-                                                        session.maximized_pane_id = None;
-                                                    }
-                                                    if let Some(session) = this.active_session() {
-                                                        if let Some(pane) = session.panes.first() {
-                                                            pane.terminal.read(cx).focus_handle().focus(window);
-                                                            this.focused_pane_id = Some(pane.id);
-                                                        }
-                                                    }
-                                                    cx.notify();
-                                                }),
-                                            )
-                                    }))
-                            )
-                    })),
-            );
+        let sidebar_content = self.render_sidebar(cx);
 
         div()
             .flex()
@@ -2149,6 +2688,7 @@ fn main() -> Result<()> {
                             path: current_dir_clone,
                             sessions: vec![initial_session],
                             active_session_idx: 0,
+                            expanded: true,
                         };
 
                         AppState {
@@ -2291,6 +2831,7 @@ mod resize_tests {
                     status: SessionStatus::Idle,
                 }],
                 active_session_idx: 0,
+                expanded: true,
             }],
             active_project_idx: 0,
             next_id: 2,
@@ -2789,4 +3330,154 @@ mod pane_tests {
         });
         assert!(first_tree.map_or(false, |t| t.contains(1) && t.contains(new_pane_id)));
     }
+    /// A project directory that is not the repository the test runs in, so
+    /// opening it really is "a second project".
+    fn scratch_project_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&dir).expect("scratch project dir");
+        dir
+    }
+
+    #[test]
+    fn opening_a_second_project_keeps_the_first_one_alive() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame");
+
+        let dir = scratch_project_dir("markup-multi-project-open");
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.open_project_path(dir, window, cx);
+        });
+        cx.draw_frame().expect("frame with two projects");
+
+        let (project_count, active_idx, first_sessions, second_sessions, expanded) =
+            app_state.read_with(&cx, |state, _| {
+                (
+                    state.projects.len(),
+                    state.active_project_idx,
+                    state.projects[0].sessions.len(),
+                    state.projects[1].sessions.len(),
+                    state.projects[1].expanded,
+                )
+            });
+        assert_eq!(project_count, 2);
+        assert_eq!(active_idx, 1);
+        assert_eq!(first_sessions, 1, "the first project keeps its session");
+        assert_eq!(second_sessions, 1, "the new project starts with a session");
+        assert!(expanded, "the newly opened project is expanded");
+    }
+
+    #[test]
+    fn sessions_are_created_in_the_project_that_asks_for_them() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame");
+
+        let dir = scratch_project_dir("markup-multi-project-sessions");
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.open_project_path(dir, window, cx);
+        });
+        cx.draw_frame().expect("frame with two projects");
+
+        // Create a session in the *first* project while the second one is the
+        // active project: the new terminal must land in project 0 and switch
+        // the workspace over to it.
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.create_new_session_in_project(0, window, cx);
+        });
+        cx.draw_frame().expect("frame after creating a session");
+
+        let (first, second, active) = app_state.read_with(&cx, |state, _| {
+            (
+                state.projects[0].sessions.len(),
+                state.projects[1].sessions.len(),
+                state.active_project_idx,
+            )
+        });
+        assert_eq!(first, 2);
+        assert_eq!(second, 1);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn closing_a_session_or_project_leaves_the_others_intact() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame");
+
+        let dir = scratch_project_dir("markup-multi-project-close");
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.open_project_path(dir, window, cx);
+        });
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.create_new_session_in_project(0, window, cx);
+        });
+        cx.draw_frame().expect("frame with two projects and two sessions");
+
+        // Close the extra session in project 0. Project 1 must be untouched.
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.close_session(0, 1, window, cx);
+        });
+        cx.draw_frame().expect("frame after closing a session");
+        let (first, second) = app_state.read_with(&cx, |state, _| {
+            (state.projects[0].sessions.len(), state.projects[1].sessions.len())
+        });
+        assert_eq!((first, second), (1, 1));
+
+        // Close the first project. The second one becomes active with its own
+        // session still running.
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.close_project(0, window, cx);
+        });
+        cx.draw_frame().expect("frame after closing a project");
+        let (project_count, active_sessions, name) = app_state.read_with(&cx, |state, _| {
+            (
+                state.projects.len(),
+                state.active_session().map(|s| s.panes.len()).unwrap_or(0),
+                state.projects[0].name.to_string(),
+            )
+        });
+        assert_eq!(project_count, 1);
+        assert_eq!(active_sessions, 1);
+        assert_eq!(name, "markup-multi-project-close");
+    }
+
+    #[test]
+    fn sidebar_renders_collapsed_and_expanded_projects() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame");
+
+        let dir = scratch_project_dir("markup-multi-project-collapse");
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.open_project_path(dir, window, cx);
+        });
+        cx.draw_frame().expect("frame with two expanded projects");
+
+        // Collapse the first project while the second stays expanded.
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            state.toggle_project_expanded(0, cx);
+        });
+        cx.draw_frame().expect("frame with one collapsed project");
+        let expanded = app_state.read_with(&cx, |state, _| {
+            (state.projects[0].expanded, state.projects[1].expanded)
+        });
+        assert_eq!(expanded, (false, true));
+
+        // Activating a collapsed project expands it again.
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.activate_project(0, window, cx);
+        });
+        cx.draw_frame().expect("frame after activating a project");
+        let (active, expanded) = app_state.read_with(&cx, |state, _| {
+            (state.active_project_idx, state.projects[0].expanded)
+        });
+        assert_eq!(active, 0);
+        assert!(expanded);
+    }
+
 }
