@@ -7,6 +7,7 @@
 
 pub mod clipboard;
 pub mod colors;
+pub mod diagnostics;
 pub mod event;
 pub mod hyperlink;
 pub mod input;

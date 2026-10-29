@@ -247,4 +247,43 @@ mod tests {
         assert!(!search.is_active());
         assert_eq!(search.match_count(), 0);
     }
+
+    /// Measurement, not a correctness check: how long does one full-scrollback
+    /// rescan take while output streams?
+    ///
+    /// `cargo test --release -p gpui-terminal -- --ignored --nocapture search_refresh`
+    #[test]
+    #[ignore = "measurement; run with --release --ignored --nocapture"]
+    fn search_refresh_cost_over_full_scrollback() {
+        let (tx, _rx) = channel();
+        let mut state = TerminalState::new(120, 40, GpuiEventProxy::new(tx));
+        // Default config keeps 10_000 lines of scrollback.
+        for i in 0..20_000 {
+            state.process_bytes(
+                format!("line {i}: the quick brown fox jumps over the lazy dog\r\n").as_bytes(),
+            );
+        }
+        let mut search = SearchState::new();
+        assert!(search.set_query("quick brown", false, &state));
+
+        let rounds = 50;
+        let mut total = std::time::Duration::ZERO;
+        let mut worst = std::time::Duration::ZERO;
+        for _ in 0..rounds {
+            state.process_bytes(b"one more line of streamed output\r\n");
+            let start = std::time::Instant::now();
+            search.refresh(&state);
+            let elapsed = start.elapsed();
+            total += elapsed;
+            worst = worst.max(elapsed);
+        }
+        eprintln!(
+            "search refresh over {} history lines x {} cols: avg={:.2}ms max={:.2}ms matches={}",
+            state.history_size(),
+            state.cols(),
+            total.as_secs_f64() * 1000.0 / rounds as f64,
+            worst.as_secs_f64() * 1000.0,
+            search.match_count()
+        );
+    }
 }

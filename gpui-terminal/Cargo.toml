@@ -54,6 +54,3 @@ version = "0.12"
 
 [dependencies.portable-pty]
 version = "0.9"
-
-[dependencies.ropey]
-version = "1"

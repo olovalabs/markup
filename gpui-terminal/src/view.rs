@@ -199,12 +199,42 @@ pub struct TerminalView {
     search_last_refresh: Option<std::time::Instant>,
     /// A throttled rescan is owed once the throttle interval has elapsed.
     search_refresh_pending: bool,
+    /// Last time this view rendered. Used to tell a visible terminal from a
+    /// background one, which does not need live search matches.
+    last_render: Option<std::time::Instant>,
 }
 
 /// Minimum gap between full-scrollback search rescans while output streams in.
 /// Without this, every PTY batch re-scans up to 10k scrollback lines on the UI
 /// thread; with it, matches lag at most this long behind a burst.
-const SEARCH_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(150);
+///
+/// Measured cost of one rescan over 10k lines x 120 cols (see the ignored
+/// `search_refresh_cost_over_full_scrollback` test): 8.0 ms average, 9.4 ms
+/// worst case. At this 500 ms cadence a visible search spends ~1.6% of the UI
+/// thread while a firehose runs; the old 150 ms cadence spent ~5.3% and could
+/// drop a frame every 150 ms. Hidden terminals skip the rescan entirely.
+const SEARCH_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A view that has not rendered for this long is treated as hidden. Background
+/// terminals still parse their output (the grid must stay current), but they do
+/// not rescan the whole scrollback for search matches; the first render after
+/// they reappear rebuilds the match list.
+const SEARCH_VISIBLE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Upper bound on the bytes one UI-thread parse may cover. The reader already
+/// coalesces whatever is queued so a firehose costs one parse and one repaint
+/// instead of hundreds, but without a cap the batch (and the frame it stalls)
+/// grows with the backlog. At the measured parse throughput a full 128 KiB
+/// batch is ~4 ms, comfortably inside a 60 fps frame. The remainder stays
+/// queued and is picked up by the next loop iteration.
+const MAX_COALESCE_BYTES: usize = 128 * 1024;
+
+/// Give a fast producer a moment to queue more before parsing, so a trickle of
+/// small reads becomes a few larger batches instead of tens of thousands of
+/// tiny UI updates (measured: ~35k updates/s at 38 MB/s without it). Applied
+/// only when the reader has caught up; a backlog is parsed immediately. One
+/// millisecond is below interactive perceptibility.
+const COALESCE_DELAY: Duration = Duration::from_millis(1);
 
 impl TerminalView {
     pub fn new<W, R>(
@@ -273,17 +303,36 @@ impl TerminalView {
             loop {
                 match bytes_rx.recv_async().await {
                     Ok(mut bytes) => {
-                        // Coalesce everything that already arrived so a firehose
-                        // of output costs one parse + one repaint, not hundreds.
-                        while let Ok(more) = bytes_rx.try_recv() {
+                        // Coalesce what already arrived so a firehose of output
+                        // costs one parse + one repaint, not hundreds — but stop
+                        // at a budget so the parse, which runs on the UI thread,
+                        // cannot grow with the queued backlog. The rest stays in
+                        // the channel for the next iteration.
+                        //
+                        // Wait only when the reader has caught up with the PTY.
+                        // A non-empty queue means the producer is already ahead,
+                        // so parsing immediately keeps bulk throughput intact;
+                        // the pause is only there to batch the trickle a fast
+                        // producer writes between wakeups.
+                        if bytes.len() < MAX_COALESCE_BYTES && bytes_rx.is_empty() {
+                            cx.background_executor().timer(COALESCE_DELAY).await;
+                        }
+                        while bytes.len() < MAX_COALESCE_BYTES {
+                            let Ok(more) = bytes_rx.try_recv() else {
+                                break;
+                            };
                             bytes.reserve(more.len());
                             bytes.extend(more);
                         }
 
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
+                            let diag_parse = crate::diagnostics::parse_start();
                             view.state.process_bytes(&bytes);
+                            crate::diagnostics::parse_end(diag_parse, bytes.len());
                             view.screen_revision.fetch_add(1, Ordering::Relaxed);
-                            if view.search.is_active() {
+                            // Hidden terminals do not need a live match list;
+                            // the first render after they reappear refreshes it.
+                            if view.search.is_active() && view.visible_recently() {
                                 // A full-scrollback rescan per batch would stall
                                 // the UI thread under streaming output; throttle
                                 // it and let `render` run the owed trailing pass.
@@ -358,6 +407,7 @@ impl TerminalView {
             event_scratch: Vec::new(),
             search_last_refresh: None,
             search_refresh_pending: false,
+            last_render: None,
         }
     }
 
@@ -1512,6 +1562,14 @@ impl TerminalView {
         &self.focus_handle
     }
 
+    /// `true` when this view has painted recently, i.e. it is on screen. A
+    /// background terminal keeps parsing its output but does not spend UI time
+    /// rescanning the scrollback for a search nobody can see.
+    fn visible_recently(&self) -> bool {
+        self.last_render
+            .is_some_and(|at| at.elapsed() < SEARCH_VISIBLE_WINDOW)
+    }
+
     /// Title reported by the application through `OSC 0 / 2`.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
@@ -1591,6 +1649,17 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_events(window, cx);
+
+        // Coming back on screen after being hidden: matches may have gone
+        // stale while output kept arriving, and no reader-side rescan was
+        // scheduled. Rebuild them once here.
+        let was_hidden = !self.visible_recently();
+        self.last_render = Some(std::time::Instant::now());
+        if was_hidden && self.search.is_active() {
+            self.search.refresh(&self.state);
+            self.search_last_refresh = Some(std::time::Instant::now());
+            self.search_refresh_pending = false;
+        }
 
         // Trailing pass for a search rescan the reader task throttled: once the
         // throttle interval has elapsed, refresh so matches never lag a burst

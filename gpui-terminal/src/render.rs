@@ -681,6 +681,7 @@ impl TerminalRenderer {
         window: &mut Window,
         _cx: &mut App,
     ) {
+        let diag_paint = crate::diagnostics::paint_start();
         let grid = term.grid();
         let num_lines = grid.screen_lines();
         let num_cols = grid.columns();
@@ -1344,6 +1345,8 @@ impl TerminalRenderer {
                 Default::default(),
             ));
         }
+
+        crate::diagnostics::paint_end(diag_paint);
     }
 
     #[allow(clippy::too_many_arguments)]

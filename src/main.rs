@@ -20,6 +20,7 @@ use serde_json::Value;
 
 mod agent_rules;
 mod assets;
+mod diagnostics;
 mod logos;
 mod status;
 
@@ -63,10 +64,12 @@ pub struct TerminalPane {
     /// Reused scrape buffer: the poller reads the screen into this instead of
     /// allocating a fresh `Vec<String>` every 500 ms per pane.
     pub screen_scratch: Vec<String>,
-    /// (screen revision, focused, exited, foreground fingerprint) from the
-    /// last poll tick. The revision lets an idle pane skip rebuilding its screen
-    /// strings and fingerprints entirely.
-    pub poll_cache: Option<(u64, bool, bool, u64)>,
+    /// (screen revision, focused, exited, foreground snapshot) from the last
+    /// poll tick. The revision lets an idle pane skip rebuilding its screen
+    /// strings entirely; the process snapshot is compared by `Arc` identity,
+    /// which is O(1) because the `/proc` cache hands back the same allocation
+    /// while the foreground process group is unchanged.
+    pub poll_cache: Option<(u64, bool, bool, Arc<[String]>)>,
     /// Screen fingerprint at the moment the user last looked at a finished or
     /// failed terminal. While the screen still matches, the sticky Done/Error
     /// badge stays acknowledged (Idle); any new output invalidates it and lets
@@ -101,6 +104,12 @@ pub struct Session {
 
 /// How long an unacknowledged Done badge lingers before it falls back to Idle.
 const DONE_LINGER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Status poll period. Process status cannot be evented portably across the
+/// platforms this app supports, so this bounded timer is the change detector;
+/// the work it triggers is small (`/proc` reads now happen off the UI thread).
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaneNode {
     Leaf(usize),
@@ -403,8 +412,57 @@ impl AppState {
     /// Every pane of every session is polled; the session badge is the
     /// highest-ranked pane status and the sidebar title/logo follow the pane
     /// the user is working in.
+    ///
+    /// This variant gathers process information on the caller's thread. The app
+    /// loop uses [`Self::poll_sessions_status_with`] so the blocking `/proc`
+    /// reads run on the background executor; this entry point remains for tests
+    /// and for callers that already have a snapshot.
+    #[allow(dead_code)]
     pub fn poll_sessions_status(&mut self, cx: &mut Context<Self>) {
+        let foregrounds = self.gather_foreground_processes();
+        self.poll_sessions_status_with(&foregrounds, cx);
+    }
+
+    /// Shell pid of every live pane, deduplicated. Cheap and UI-thread safe:
+    /// the background inspector needs a list, not an entity borrow.
+    pub fn pane_pids(&self) -> Vec<u32> {
+        let mut pids = Vec::new();
+        for project in &self.projects {
+            for session in &project.sessions {
+                for pane in &session.panes {
+                    if let Some(pid) = pane.pid
+                        && !pids.contains(&pid)
+                    {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+        pids
+    }
+
+    /// Read `/proc` for every pane on the calling thread. The app loop uses
+    /// [`Self::poll_sessions_status_with`] and gathers these on the background
+    /// executor instead, so the blocking reads never sit in a frame.
+    #[allow(dead_code)]
+    fn gather_foreground_processes(&self) -> HashMap<u32, Arc<[String]>> {
+        self.pane_pids()
+            .into_iter()
+            .map(|pid| (pid, status::foreground_process_names(Some(pid))))
+            .collect()
+    }
+
+    /// Poll every pane against a foreground-process snapshot gathered off the
+    /// UI thread. The snapshot is keyed by shell pid; a pane whose pid is
+    /// missing simply sees an empty foreground group for this tick.
+    pub fn poll_sessions_status_with(
+        &mut self,
+        foregrounds: &HashMap<u32, Arc<[String]>>,
+        cx: &mut Context<Self>,
+    ) {
+        let diag_poll = diagnostics::poll_start();
         let mut changed = false;
+        let mut panes_polled = 0u64;
         let focused_id = self.focused_pane_id;
         // `T3_STATUS_DEBUG=1` dumps every detection pass: the facts that went in
         // and the badge that came out. Without this the poller is invisible.
@@ -415,13 +473,19 @@ impl AppState {
                 let pane_count = session.panes.len();
                 let mut primary_idx: Option<usize> = None;
                 let mut primary_focused = false;
-                let mut primary_fg: Arc<[String]> = status::foreground_process_names(None);
+                let mut primary_fg: Arc<[String]> = status::empty_foreground_names();
 
                 for (pane_idx, pane) in session.panes.iter_mut().enumerate() {
+                    panes_polled += 1;
                     let focused = focused_id == Some(pane.id);
                     // Reuse the same immutable foreground snapshot for status,
-                    // cache keys, and the session logo (one /proc probe per pane).
-                    let foreground = status::foreground_process_names(pane.pid);
+                    // cache keys, and the session logo (one /proc probe per pane,
+                    // gathered off the UI thread).
+                    let foreground = pane
+                        .pid
+                        .and_then(|pid| foregrounds.get(&pid))
+                        .cloned()
+                        .unwrap_or_else(status::empty_foreground_names);
 
                     // The pane the session badge/title follows: the focused
                     // pane, else the first pane of the screen.
@@ -466,33 +530,64 @@ impl AppState {
                     // and resize, while focus, exit state, and foreground-group
                     // changes are checked independently. Stable panes therefore
                     // skip row extraction, string allocation, and screen hashing.
-                    let foreground_fp = screen_fingerprint(foreground.as_ref(), "");
+                    // The foreground snapshot is compared by pointer: the /proc
+                    // cache returns the same allocation while the group is
+                    // unchanged, so this is a load and a compare.
                     let (screen_revision, exited) = {
                         let terminal = pane.terminal.read(cx);
                         (terminal.screen_revision(), terminal.has_exited())
                     };
-                    let unchanged = pane.poll_cache.is_some_and(
-                        |(revision, was_focused, was_exited, old_foreground_fp)| {
-                            revision == screen_revision
-                                && was_focused == focused
-                                && was_exited == exited
-                                && old_foreground_fp == foreground_fp
+                    let unchanged = pane.poll_cache.as_ref().is_some_and(
+                        |(revision, was_focused, was_exited, old_foreground)| {
+                            *revision == screen_revision
+                                && *was_focused == focused
+                                && *was_exited == exited
+                                && Arc::ptr_eq(old_foreground, &foreground)
                         },
                     );
-                    if unchanged
-                        && pane.status != SessionStatus::Done
-                        && pane.status != SessionStatus::Working
-                    {
-                        continue;
+                    // The grid only moved if the revision did; a focus or
+                    // process-group change still needs a fresh verdict but can
+                    // reuse the rows already in the scratch buffer.
+                    let screen_unchanged = pane.poll_cache.as_ref().is_some_and(
+                        |(revision, ..)| *revision == screen_revision,
+                    );
+                    if unchanged {
+                        match pane.status {
+                            // A finished pane's badge only changes when it is
+                            // focused (in the cache key) or when the linger
+                            // timeout expires. Re-scraping the screen every
+                            // 500 ms for 30 s cannot change either.
+                            SessionStatus::Done => {
+                                let since = *pane
+                                    .done_since
+                                    .get_or_insert_with(std::time::Instant::now);
+                                if since.elapsed() >= DONE_LINGER {
+                                    pane.done_since = None;
+                                    pane.status = SessionStatus::Idle;
+                                    changed = true;
+                                }
+                                continue;
+                            }
+                            // Working panes still need the detector's idle
+                            // transition, but the grid did not move since the
+                            // last scrape: reuse the cached rows instead of
+                            // re-extracting and re-allocating the screen.
+                            SessionStatus::Working => {}
+                            _ => continue,
+                        }
                     }
 
                     // Scrape into the pane's reused buffer only after the cheap
                     // revision/focus/process checks show that something changed.
                     // Ask for the whole visible screen: fresh shells can print
                     // their prompt on row 0, not just the last dozen rows.
-                    pane.terminal
-                        .read(cx)
-                        .bottom_lines_into(usize::MAX, &mut pane.screen_scratch);
+                    if !screen_unchanged || pane.screen_scratch.is_empty() {
+                        let diag_scrape = diagnostics::scrape_start();
+                        pane.terminal
+                            .read(cx)
+                            .bottom_lines_into(usize::MAX, &mut pane.screen_scratch);
+                        diagnostics::scrape_end(diag_scrape);
+                    }
 
                     let screen_fp = {
                         let terminal = pane.terminal.read(cx);
@@ -501,9 +596,10 @@ impl AppState {
                             terminal.title().unwrap_or(""),
                         )
                     };
-                    let poll_key = (screen_revision, focused, exited, foreground_fp);
+                    let poll_key = (screen_revision, focused, exited, Arc::clone(&foreground));
 
                     let (next, ack) = {
+                        let diag_detect = diagnostics::detect_start();
                         let terminal = pane.terminal.read(cx);
                         let bottom_lines = &pane.screen_scratch;
                         let title = terminal.title().unwrap_or("");
@@ -556,16 +652,19 @@ impl AppState {
                                 foreground: &foreground,
                                 detector_state: Some(detector_state),
                             };
-                            // Debug builds capture the match for the dump below;
-                            // release builds use the plain verdict (same work).
-                            let (detected, rule_match) = if debug {
-                                status::evaluate_with_match(&input, pane.status, focused)
+                            // The match is already computed by detection, so the
+                            // debug dump can use it without a second evaluation.
+                            let (detected, rule_match) = status::evaluate_screen_with_match(
+                                &screen_text,
+                                &input,
+                                pane.status,
+                                focused,
+                            );
+                            if !debug {
+                                debug_match = None;
                             } else {
-                                (status::evaluate(&input, pane.status, focused), None)
-                            };
-                            // Stash the match for the debug dump below so the pack
-                            // is not evaluated a second time to explain the badge.
-                            debug_match = rule_match;
+                                debug_match = rule_match.clone();
+                            }
                             if acknowledged
                                 && matches!(detected, SessionStatus::Done | SessionStatus::Error)
                             {
@@ -624,6 +723,7 @@ impl AppState {
                             }
                         }
 
+                        diagnostics::detect_end(diag_detect);
                         (next, ack)
                     };
 
@@ -721,6 +821,8 @@ impl AppState {
                 }
             }
         }
+        diagnostics::panes_polled(panes_polled);
+        diagnostics::poll_end(diag_poll);
         if changed {
             cx.notify();
         }
@@ -2131,6 +2233,7 @@ fn sidebar_text_button(
 
 impl Render for AppState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let diag_render = diagnostics::render_start();
         // Track which pane owns keyboard focus each frame; the poller uses
         // this for Active-state resolution and for clearing sticky Done/Error.
         let mut focused_pane = None;
@@ -2372,7 +2475,7 @@ impl Render for AppState {
 
         let sidebar_content = self.render_sidebar(cx);
 
-        div()
+        let root = div()
             .flex()
             .size_full()
             .bg(rgba(0x14151bff))
@@ -2392,7 +2495,9 @@ impl Render for AppState {
                 } else {
                     terminal_content.into_any_element()
                 },
-            )
+            );
+        diagnostics::render_end(diag_render);
+        root
     }
 }
 
@@ -2704,9 +2809,32 @@ fn main() -> Result<()> {
                     let app_state_weak = app_state.downgrade();
                     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
                         loop {
-                            cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                            cx.background_executor().timer(POLL_INTERVAL).await;
+
+                            // Snapshot the shell pids on the UI thread (a borrow
+                            // over the pane list), do the blocking `/proc`
+                            // inspection on the background executor, then apply
+                            // the result back on the UI thread. Nothing in this
+                            // loop reads files or waits on I/O while a frame
+                            // could be building.
+                            let Ok(pids) =
+                                app_state_weak.update(cx, |state, _| state.pane_pids())
+                            else {
+                                break;
+                            };
+                            let foregrounds = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    pids.into_iter()
+                                        .map(|pid| {
+                                            (pid, status::foreground_process_names(Some(pid)))
+                                        })
+                                        .collect::<HashMap<u32, Arc<[String]>>>()
+                                })
+                                .await;
+
                             let res = app_state_weak.update(cx, |state, cx| {
-                                state.poll_sessions_status(cx);
+                                state.poll_sessions_status_with(&foregrounds, cx);
                             });
                             if res.is_err() {
                                 break;
@@ -2714,6 +2842,22 @@ fn main() -> Result<()> {
                         }
                     })
                     .detach();
+
+                    // Opt-in diagnostics: one line per second with frame
+                    // timing, UI-thread work, CPU, RSS and wakeups. Not spawned
+                    // at all unless `MARKUP_DIAGNOSTICS` is set.
+                    if diagnostics::enabled() {
+                        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                            let mut sampler = diagnostics::Sampler::new();
+                            loop {
+                                cx.background_executor()
+                                    .timer(diagnostics::REPORT_INTERVAL)
+                                    .await;
+                                eprintln!("{}", sampler.report());
+                            }
+                        })
+                        .detach();
+                    }
 
                     // TEMPORARY DIAGNOSTIC: MARKUP_RESIZE_PROBE=<rounds> drags
                     // the window edge in small steps, the way a real resize

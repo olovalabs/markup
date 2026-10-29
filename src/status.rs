@@ -31,9 +31,10 @@
 //! screen and OSC rules alone.
 
 use std::collections::hash_map::DefaultHasher;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -45,7 +46,8 @@ use crate::agent_rules::{self, DetectionInput, RuleState};
 static EMPTY_FOREGROUND_NAMES: LazyLock<Arc<[String]>> =
     LazyLock::new(|| Arc::from(Vec::<String>::new()));
 
-fn empty_foreground_names() -> Arc<[String]> {
+/// The shared empty snapshot, for panes that have no pid or no foreground job.
+pub fn empty_foreground_names() -> Arc<[String]> {
     Arc::clone(&*EMPTY_FOREGROUND_NAMES)
 }
 
@@ -57,7 +59,7 @@ fn empty_foreground_names() -> Arc<[String]> {
 /// `comm` / `cmdline` / `children` reads are skipped while the group is
 /// unchanged. Snapshots are shared across the status and logo paths; closed
 /// panes explicitly remove their entry.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 static FG_CACHE: LazyLock<parking_lot::Mutex<HashMap<u32, (i64, Arc<[String]>)>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
@@ -262,10 +264,27 @@ impl Detector {
     }
 }
 
-/// Last `n` non-empty lines of the screen.
+/// Last `n` non-empty lines of the screen, trailing whitespace trimmed.
+///
+/// Walks backwards and stops after `n` lines so a poller evaluating a quiet
+/// screen does not collect and then discard every line above the window it
+/// actually reads.
 pub fn tail_lines(screen: &str, n: usize) -> String {
-    let lines: Vec<&str> = screen.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
+    if n == 0 {
+        return String::new();
+    }
+    let mut tail: Vec<&str> = Vec::with_capacity(n);
+    for line in screen.lines().rev().map(str::trim_end) {
+        if line.is_empty() {
+            continue;
+        }
+        tail.push(line);
+        if tail.len() == n {
+            break;
+        }
+    }
+    tail.reverse();
+    tail.join("\n")
 }
 
 /// All inputs needed for one detection pass.
@@ -332,9 +351,17 @@ pub fn explain(input: &StatusInput<'_>) -> Option<agent_rules::RuleMatch> {
 /// * `argv[1]` basename — where npm-installed agents live (`node …/claude`).
 ///
 /// Empty when the shell itself owns the foreground group, i.e. the user is back
-/// at a prompt, or on platforms without `/proc`.
-#[cfg(unix)]
+/// at a prompt, or on platforms without `/proc` (macOS and Windows rest on the
+/// screen and OSC rules alone).
 pub fn foreground_process_names(pid: Option<u32>) -> Arc<[String]> {
+    let started = crate::diagnostics::foreground_start();
+    let names = foreground_process_names_inner(pid);
+    crate::diagnostics::foreground_end(started);
+    names
+}
+
+#[cfg(target_os = "linux")]
+fn foreground_process_names_inner(pid: Option<u32>) -> Arc<[String]> {
     let Some(pid) = pid else {
         return empty_foreground_names();
     };
@@ -423,8 +450,8 @@ pub fn foreground_process_names(pid: Option<u32>) -> Arc<[String]> {
     names
 }
 
-#[cfg(not(unix))]
-pub fn foreground_process_names(_pid: Option<u32>) -> Arc<[String]> {
+#[cfg(not(target_os = "linux"))]
+fn foreground_process_names_inner(_pid: Option<u32>) -> Arc<[String]> {
     empty_foreground_names()
 }
 
@@ -432,11 +459,11 @@ pub fn foreground_process_names(_pid: Option<u32>) -> Arc<[String]> {
 /// keyed by shell PID, so explicit removal prevents terminal churn from
 /// retaining one entry per historical session until process shutdown.
 pub fn forget_pid(pid: Option<u32>) {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if let Some(pid) = pid {
         FG_CACHE.lock().remove(&pid);
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     let _ = pid;
 }
 
@@ -456,14 +483,14 @@ pub fn forget_pid(pid: Option<u32>) {
 /// shell is its own process-group leader, so `pgrp == pid` and the guard below
 /// rejected every result. The whole process-tree half of detection was silently
 /// dead: a running CLI could never be reported as `Working`.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_proc_tpgid(pid: u32) -> Option<i64> {
     let stat = std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
     parse_stat_tpgid(&stat)
 }
 
 /// Field 8 (`tpgid`) of one `/proc/<pid>/stat` line.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn parse_stat_tpgid(stat: &str) -> Option<i64> {
     let after_comm = stat.rsplit_once(')')?.1;
     // This slice starts at field 3 (state), so tpgid at field 8 is index 5.
@@ -479,17 +506,34 @@ pub fn debug_enabled() -> bool {
     std::env::var_os("T3_STATUS_DEBUG").is_some()
 }
 
-/// The single current status for a terminal.
+/// Single status for a terminal, joining the screen itself.
 ///
-/// `prev` is the last reported status; it drives stickiness. `focused` means
-/// the user is interacting with this terminal right now.
+/// The poller uses [`evaluate_screen_with_match`] with text it already built;
+/// this keeps the pure, easy-to-test entry point used by the unit tests.
+#[allow(dead_code)]
 pub fn evaluate(input: &StatusInput<'_>, prev: SessionStatus, focused: bool) -> SessionStatus {
     evaluate_with_match(input, prev, focused).0
 }
 
 /// Like [`evaluate`], but also returns the agent rule match behind the verdict
 /// (if any), so callers that log the explanation do not evaluate twice.
+#[allow(dead_code)]
 pub fn evaluate_with_match(
+    input: &StatusInput<'_>,
+    prev: SessionStatus,
+    focused: bool,
+) -> (SessionStatus, Option<agent_rules::RuleMatch>) {
+    let screen = input.lines.join("\n");
+    evaluate_screen_with_match(&screen, input, prev, focused)
+}
+
+/// [`evaluate_with_match`] for callers that already joined the screen.
+///
+/// The status poller scrapes the screen and needs the same joined text for the
+/// temporal detector, the rule packs and the fallback rules. Passing it in
+/// keeps a tick to one join instead of one per helper.
+pub fn evaluate_screen_with_match(
+    screen: &str,
     input: &StatusInput<'_>,
     prev: SessionStatus,
     focused: bool,
@@ -499,10 +543,9 @@ pub fn evaluate_with_match(
         return (if focused { SessionStatus::Idle } else { prev }, None);
     }
 
-    let (detected, matched) = detect_full(input, prev);
+    let (detected, matched) = detect_full_screen(screen, input, prev);
 
-    let screen = input.lines.join("\n");
-    let tail = tail_lines(&screen, FallbackRules::WINDOW);
+    let tail = tail_lines(screen, FallbackRules::WINDOW);
     let is_agent_working = match &matched {
         Some(m) => m.state == RuleState::Working,
         None => FallbackRules::is_running(&tail),
@@ -526,18 +569,18 @@ pub fn evaluate_with_match(
 /// Like [`detect`], but also returns the rule match that produced the verdict
 /// (when an agent pack matched), so debug logging does not have to evaluate
 /// the pack a second time to explain the badge.
-fn detect_full(
+fn detect_full_screen(
+    screen: &str,
     input: &StatusInput<'_>,
     prev: SessionStatus,
 ) -> (SessionStatus, Option<agent_rules::RuleMatch>) {
-    let screen = input.lines.join("\n");
-    let tail = tail_lines(&screen, FallbackRules::WINDOW);
+    let tail = tail_lines(screen, FallbackRules::WINDOW);
 
     if let Some(pack) = agent_rules::embedded().pack_for(input.foreground) {
         let matched = agent_rules::evaluate(
             pack,
             DetectionInput {
-                screen: &screen,
+                screen,
                 osc_title: input.title.unwrap_or(""),
                 // OSC 9;4 progress is not parsed yet; the rules that read it simply
                 // never match, which is how upstream treats a terminal that does
@@ -605,6 +648,7 @@ fn detect_full(
         None,
     )
 }
+
 /// Generic rules for terminals with no agent pack: a plain shell.
 static GENERIC_REGEXES: LazyLock<(RegexSet, RegexSet)> = LazyLock::new(|| {
     Profile::generic().compile()
@@ -685,6 +729,16 @@ mod tests {
         "──────────────────────────────────",
         "  ? for shortcuts",
     ];
+
+    #[test]
+    fn tail_lines_keeps_the_last_non_empty_lines() {
+        assert_eq!(tail_lines("a\nb\n\nc\n", 2), "b\nc");
+        assert_eq!(tail_lines("only", 5), "only");
+        assert_eq!(tail_lines("", 3), "");
+        assert_eq!(tail_lines("a\nb\nc", 0), "");
+        // Trailing whitespace is trimmed, blank lines are skipped.
+        assert_eq!(tail_lines("one  \n\ntwo\t\n", 5), "one\ntwo");
+    }
 
     #[test]
     fn priority_order() {
@@ -863,7 +917,7 @@ mod tests {
         assert_eq!(pack_for(&["bash".to_string()]), None);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn tpgid_is_field_8_not_pgrp() {
         // Real line captured from the `portable-pty` fish shell this app spawns.
@@ -875,7 +929,7 @@ mod tests {
         assert_eq!(parse_stat_tpgid(stat), Some(380572));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn tpgid_parses_comm_with_spaces_and_parens() {
         // `comm` is user-controlled and may contain spaces and `)`, so the split
