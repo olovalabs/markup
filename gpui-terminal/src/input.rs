@@ -255,7 +255,6 @@ fn keystroke_to_bytes_internal(
     }
 
     if !keystroke.modifiers.control && !keystroke.modifiers.alt {
-
         let should_uppercase = if is_caps {
             keystroke.modifiers.shift ^ true
         } else {
@@ -509,19 +508,34 @@ mod tests {
         let mode = TermMode::empty();
 
         let shift_up = Keystroke::parse("shift-up").unwrap();
-        assert_eq!(keystroke_to_bytes(&shift_up, mode), Some(b"\x1b[1;2A".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&shift_up, mode),
+            Some(b"\x1b[1;2A".to_vec())
+        );
 
         let alt_down = Keystroke::parse("alt-down").unwrap();
-        assert_eq!(keystroke_to_bytes(&alt_down, mode), Some(b"\x1b[1;3B".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&alt_down, mode),
+            Some(b"\x1b[1;3B".to_vec())
+        );
 
         let ctrl_left = Keystroke::parse("ctrl-left").unwrap();
-        assert_eq!(keystroke_to_bytes(&ctrl_left, mode), Some(b"\x1b[1;5D".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_left, mode),
+            Some(b"\x1b[1;5D".to_vec())
+        );
 
         let ctrl_right = Keystroke::parse("ctrl-right").unwrap();
-        assert_eq!(keystroke_to_bytes(&ctrl_right, mode), Some(b"\x1b[1;5C".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_right, mode),
+            Some(b"\x1b[1;5C".to_vec())
+        );
 
         let ctrl_shift_right = Keystroke::parse("ctrl-shift-right").unwrap();
-        assert_eq!(keystroke_to_bytes(&ctrl_shift_right, mode), Some(b"\x1b[1;6C".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_shift_right, mode),
+            Some(b"\x1b[1;6C".to_vec())
+        );
     }
 
     #[test]
@@ -529,13 +543,22 @@ mod tests {
         let mode = TermMode::empty();
 
         let ctrl_home = Keystroke::parse("ctrl-home").unwrap();
-        assert_eq!(keystroke_to_bytes(&ctrl_home, mode), Some(b"\x1b[1;5H".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_home, mode),
+            Some(b"\x1b[1;5H".to_vec())
+        );
 
         let shift_f1 = Keystroke::parse("shift-f1").unwrap();
-        assert_eq!(keystroke_to_bytes(&shift_f1, mode), Some(b"\x1b[1;2P".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&shift_f1, mode),
+            Some(b"\x1b[1;2P".to_vec())
+        );
 
         let ctrl_f5 = Keystroke::parse("ctrl-f5").unwrap();
-        assert_eq!(keystroke_to_bytes(&ctrl_f5, mode), Some(b"\x1b[15;5~".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_f5, mode),
+            Some(b"\x1b[15;5~".to_vec())
+        );
     }
 
     #[test]
@@ -557,20 +580,38 @@ mod tests {
         let mode = TermMode::empty();
 
         let a = Keystroke::parse("a").unwrap();
-        assert_eq!(keystroke_to_bytes_with_caps(&a, mode, true), Some(b"A".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_with_caps(&a, mode, true),
+            Some(b"A".to_vec())
+        );
 
         let z = Keystroke::parse("z").unwrap();
-        assert_eq!(keystroke_to_bytes_with_caps(&z, mode, true), Some(b"Z".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_with_caps(&z, mode, true),
+            Some(b"Z".to_vec())
+        );
 
         let shift_a = Keystroke::parse("shift-a").unwrap();
-        assert_eq!(keystroke_to_bytes_with_caps(&shift_a, mode, true), Some(b"a".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_with_caps(&shift_a, mode, true),
+            Some(b"a".to_vec())
+        );
 
-        assert_eq!(keystroke_to_bytes_with_caps(&shift_a, mode, false), Some(b"A".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_with_caps(&shift_a, mode, false),
+            Some(b"A".to_vec())
+        );
 
-        assert_eq!(keystroke_to_bytes_with_caps(&a, mode, false), Some(b"a".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_with_caps(&a, mode, false),
+            Some(b"a".to_vec())
+        );
 
         let one = Keystroke::parse("1").unwrap();
-        assert_eq!(keystroke_to_bytes_with_caps(&one, mode, true), Some(b"1".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_with_caps(&one, mode, true),
+            Some(b"1".to_vec())
+        );
     }
 
     #[test]
@@ -579,6 +620,9 @@ mod tests {
         let mut keystroke = Keystroke::parse("a").unwrap();
         keystroke.key_char = Some("a".to_string());
 
-        assert_eq!(keystroke_to_bytes_with_caps(&keystroke, mode, true), Some(b"A".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_with_caps(&keystroke, mode, true),
+            Some(b"A".to_vec())
+        );
     }
 }

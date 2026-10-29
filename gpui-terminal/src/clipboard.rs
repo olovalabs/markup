@@ -5,7 +5,6 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-
     pub fn new() -> Result<Self> {
         Ok(Self {
             clipboard: arboard::Clipboard::new()?,
@@ -28,7 +27,6 @@ impl Clipboard {
 }
 
 impl Default for Clipboard {
-
     fn default() -> Self {
         Self::new().expect("Failed to initialize clipboard")
     }
@@ -40,7 +38,6 @@ mod tests {
 
     #[test]
     fn test_clipboard_creation() {
-
         let result = Clipboard::new();
 
         if result.is_err() {
@@ -50,7 +47,6 @@ mod tests {
 
     #[test]
     fn test_clipboard_copy_paste() {
-
         let Ok(mut clipboard) = Clipboard::new() else {
             eprintln!("Clipboard not available (headless environment)");
             return;
@@ -65,9 +61,7 @@ mod tests {
 
         match clipboard.paste() {
             Ok(pasted) => {
-
                 if pasted == test_text {
-
                 } else {
                     eprintln!("Clipboard content mismatch (environment issue)");
                 }
@@ -80,7 +74,6 @@ mod tests {
 
     #[test]
     fn test_clipboard_clear() {
-
         let Ok(mut clipboard) = Clipboard::new() else {
             eprintln!("Clipboard not available (headless environment)");
             return;
@@ -90,7 +83,6 @@ mod tests {
 
         if clipboard.copy(test_text).is_ok() {
             let _ = clipboard.clear();
-
         }
     }
 }

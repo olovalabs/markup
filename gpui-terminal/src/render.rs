@@ -9,8 +9,9 @@ use alacritty_terminal::term::search::Match;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 use gpui::{
-    App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point, SharedString,
-    Size, StrikethroughStyle, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
+    App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
+    SharedString, Size, StrikethroughStyle, TextRun, UnderlineStyle, Window, px, quad,
+    transparent_black,
 };
 use parking_lot::Mutex;
 use std::ops::RangeInclusive;
@@ -84,7 +85,6 @@ fn accumulate_run<F: FnMut(usize, usize)>(
 
 #[derive(Debug, Clone)]
 pub struct BatchedTextRun {
-
     pub text: String,
 
     /// Number of `char`s in `text`, tracked while batching so the paint loop
@@ -115,7 +115,6 @@ pub struct BatchedTextRun {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BackgroundRect {
-
     pub start_col: usize,
 
     pub end_col: usize,
@@ -128,7 +127,6 @@ pub struct BackgroundRect {
 }
 
 impl BackgroundRect {
-
     pub fn new(start_col: usize, end_col: usize, row: usize, color: Hsla) -> Self {
         Self {
             start_col,
@@ -216,30 +214,93 @@ pub fn rasterize_box_or_block(
         0x258E => return Some(vec![rect(0.0, 0.0, w * 0.25, h)]),
         0x258F => return Some(vec![rect(0.0, 0.0, w * 0.125, h)]),
         0x2590 => return Some(vec![rect(w * 0.5, 0.0, w * 0.5, h)]),
-        0x2591 => return Some(vec![BlockElementRect {
-            bounds: Bounds { origin: Point { x: cx, y: cy }, size: Size { width: px(w), height: px(h) } },
-            color: Hsla { a: color.a * 0.25, ..color },
-        }]),
-        0x2592 => return Some(vec![BlockElementRect {
-            bounds: Bounds { origin: Point { x: cx, y: cy }, size: Size { width: px(w), height: px(h) } },
-            color: Hsla { a: color.a * 0.50, ..color },
-        }]),
-        0x2593 => return Some(vec![BlockElementRect {
-            bounds: Bounds { origin: Point { x: cx, y: cy }, size: Size { width: px(w), height: px(h) } },
-            color: Hsla { a: color.a * 0.75, ..color },
-        }]),
+        0x2591 => {
+            return Some(vec![BlockElementRect {
+                bounds: Bounds {
+                    origin: Point { x: cx, y: cy },
+                    size: Size {
+                        width: px(w),
+                        height: px(h),
+                    },
+                },
+                color: Hsla {
+                    a: color.a * 0.25,
+                    ..color
+                },
+            }]);
+        }
+        0x2592 => {
+            return Some(vec![BlockElementRect {
+                bounds: Bounds {
+                    origin: Point { x: cx, y: cy },
+                    size: Size {
+                        width: px(w),
+                        height: px(h),
+                    },
+                },
+                color: Hsla {
+                    a: color.a * 0.50,
+                    ..color
+                },
+            }]);
+        }
+        0x2593 => {
+            return Some(vec![BlockElementRect {
+                bounds: Bounds {
+                    origin: Point { x: cx, y: cy },
+                    size: Size {
+                        width: px(w),
+                        height: px(h),
+                    },
+                },
+                color: Hsla {
+                    a: color.a * 0.75,
+                    ..color
+                },
+            }]);
+        }
         0x2594 => return Some(vec![rect(0.0, 0.0, w, h * 0.125)]),
         0x2595 => return Some(vec![rect(w * 0.875, 0.0, w * 0.125, h)]),
         0x2596 => return Some(vec![rect(0.0, h * 0.5, w * 0.5, h * 0.5)]),
         0x2597 => return Some(vec![rect(w * 0.5, h * 0.5, w * 0.5, h * 0.5)]),
         0x2598 => return Some(vec![rect(0.0, 0.0, w * 0.5, h * 0.5)]),
-        0x2599 => return Some(vec![rect(0.0, 0.0, w * 0.5, h), rect(w * 0.5, h * 0.5, w * 0.5, h * 0.5)]),
-        0x259A => return Some(vec![rect(0.0, 0.0, w * 0.5, h * 0.5), rect(w * 0.5, h * 0.5, w * 0.5, h * 0.5)]),
-        0x259B => return Some(vec![rect(0.0, 0.0, w, h * 0.5), rect(0.0, h * 0.5, w * 0.5, h * 0.5)]),
-        0x259C => return Some(vec![rect(0.0, 0.0, w, h * 0.5), rect(w * 0.5, h * 0.5, w * 0.5, h * 0.5)]),
+        0x2599 => {
+            return Some(vec![
+                rect(0.0, 0.0, w * 0.5, h),
+                rect(w * 0.5, h * 0.5, w * 0.5, h * 0.5),
+            ]);
+        }
+        0x259A => {
+            return Some(vec![
+                rect(0.0, 0.0, w * 0.5, h * 0.5),
+                rect(w * 0.5, h * 0.5, w * 0.5, h * 0.5),
+            ]);
+        }
+        0x259B => {
+            return Some(vec![
+                rect(0.0, 0.0, w, h * 0.5),
+                rect(0.0, h * 0.5, w * 0.5, h * 0.5),
+            ]);
+        }
+        0x259C => {
+            return Some(vec![
+                rect(0.0, 0.0, w, h * 0.5),
+                rect(w * 0.5, h * 0.5, w * 0.5, h * 0.5),
+            ]);
+        }
         0x259D => return Some(vec![rect(w * 0.5, 0.0, w * 0.5, h * 0.5)]),
-        0x259E => return Some(vec![rect(w * 0.5, 0.0, w * 0.5, h * 0.5), rect(0.0, h * 0.5, w * 0.5, h * 0.5)]),
-        0x259F => return Some(vec![rect(0.0, h * 0.5, w, h * 0.5), rect(w * 0.5, 0.0, w * 0.5, h * 0.5)]),
+        0x259E => {
+            return Some(vec![
+                rect(w * 0.5, 0.0, w * 0.5, h * 0.5),
+                rect(0.0, h * 0.5, w * 0.5, h * 0.5),
+            ]);
+        }
+        0x259F => {
+            return Some(vec![
+                rect(0.0, h * 0.5, w, h * 0.5),
+                rect(w * 0.5, 0.0, w * 0.5, h * 0.5),
+            ]);
+        }
         _ => {}
     }
 
@@ -251,7 +312,6 @@ pub fn rasterize_box_or_block(
     let hmy = (h - ht) * 0.5;
 
     match code {
-
         0x2500 | 0x2504 | 0x2508 => Some(vec![rect(0.0, my, w, t)]),
         0x2502 | 0x2506 | 0x250A => Some(vec![rect(mx, 0.0, t, h)]),
         0x250C | 0x256D => Some(vec![rect(mx, my, w - mx, t), rect(mx, my, t, h - my)]),
@@ -266,10 +326,22 @@ pub fn rasterize_box_or_block(
 
         0x2501 | 0x2505 | 0x2509 => Some(vec![rect(0.0, hmy, w, ht)]),
         0x2503 | 0x2507 | 0x250B => Some(vec![rect(hmx, 0.0, ht, h)]),
-        0x250F => Some(vec![rect(hmx, hmy, w - hmx, ht), rect(hmx, hmy, ht, h - hmy)]),
-        0x2513 => Some(vec![rect(0.0, hmy, hmx + ht, ht), rect(hmx, hmy, ht, h - hmy)]),
-        0x2517 => Some(vec![rect(hmx, hmy, w - hmx, ht), rect(hmx, 0.0, ht, hmy + ht)]),
-        0x251B => Some(vec![rect(0.0, hmy, hmx + ht, ht), rect(hmx, 0.0, ht, hmy + ht)]),
+        0x250F => Some(vec![
+            rect(hmx, hmy, w - hmx, ht),
+            rect(hmx, hmy, ht, h - hmy),
+        ]),
+        0x2513 => Some(vec![
+            rect(0.0, hmy, hmx + ht, ht),
+            rect(hmx, hmy, ht, h - hmy),
+        ]),
+        0x2517 => Some(vec![
+            rect(hmx, hmy, w - hmx, ht),
+            rect(hmx, 0.0, ht, hmy + ht),
+        ]),
+        0x251B => Some(vec![
+            rect(0.0, hmy, hmx + ht, ht),
+            rect(hmx, 0.0, ht, hmy + ht),
+        ]),
         0x2523 => Some(vec![rect(hmx, 0.0, ht, h), rect(hmx, hmy, w - hmx, ht)]),
         0x252B => Some(vec![rect(hmx, 0.0, ht, h), rect(0.0, hmy, hmx + ht, ht)]),
         0x2533 => Some(vec![rect(0.0, hmy, w, ht), rect(hmx, hmy, ht, h - hmy)]),
@@ -287,11 +359,17 @@ pub fn rasterize_box_or_block(
 
         0x2550 => {
             let offset = (t * 1.3).max(2.0);
-            Some(vec![rect(0.0, my - offset, w, t), rect(0.0, my + offset, w, t)])
+            Some(vec![
+                rect(0.0, my - offset, w, t),
+                rect(0.0, my + offset, w, t),
+            ])
         }
         0x2551 => {
             let offset = (t * 1.3).max(2.0);
-            Some(vec![rect(mx - offset, 0.0, t, h), rect(mx + offset, 0.0, t, h)])
+            Some(vec![
+                rect(mx - offset, 0.0, t, h),
+                rect(mx + offset, 0.0, t, h),
+            ])
         }
         0x2554 => {
             let offset = (t * 1.3).max(2.0);
@@ -401,7 +479,6 @@ struct PaintScratch {
 
 #[derive(Clone)]
 pub struct TerminalRenderer {
-
     pub font_family: String,
 
     pub font_size: Pixels,
@@ -421,14 +498,12 @@ pub struct TerminalRenderer {
 }
 
 impl TerminalRenderer {
-
     pub fn new(
         font_family: String,
         font_size: Pixels,
         line_height_multiplier: f32,
         palette: ColorPalette,
     ) -> Self {
-
         let cell_width = font_size * 0.6;
         let cell_height = font_size * 1.4;
 
@@ -444,7 +519,6 @@ impl TerminalRenderer {
     }
 
     pub fn measure_cell(&mut self, window: &mut Window) {
-
         let font = Font {
             family: self.font_family.clone().into(),
             features: FontFeatures::default(),
@@ -489,7 +563,6 @@ impl TerminalRenderer {
         let mut current_bg: Option<BackgroundRect> = None;
 
         for (col, cell) in cells {
-
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
             }
@@ -526,14 +599,16 @@ impl TerminalRenderer {
                     cell_text.push(zc);
                 }
             }
-            let cell_width_units = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+            let cell_width_units = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
 
             if let Some(ref mut bg_rect) = current_bg {
                 if bg_rect.color == bg_color && bg_rect.end_col == col {
-
                     bg_rect.end_col = col + 1;
                 } else {
-
                     let finished = std::mem::replace(
                         bg_rect,
                         BackgroundRect::new(col, col + 1, row, bg_color),
@@ -541,7 +616,6 @@ impl TerminalRenderer {
                     backgrounds.push(finished);
                 }
             } else {
-
                 current_bg = Some(BackgroundRect::new(col, col + 1, row, bg_color));
             }
 
@@ -555,12 +629,10 @@ impl TerminalRenderer {
                     && run.strikethrough == strikethrough
                     && run.start_col + run.cell_count == col
                 {
-
                     run.text.push_str(&cell_text);
                     run.char_count += cell_char_count;
                     run.cell_count += cell_width_units;
                 } else {
-
                     let finished = std::mem::replace(
                         run,
                         BatchedTextRun {
@@ -581,7 +653,6 @@ impl TerminalRenderer {
                     text_runs.push(finished);
                 }
             } else {
-
                 current_run = Some(BatchedTextRun {
                     text: cell_text,
                     char_count: cell_char_count,
@@ -783,15 +854,12 @@ impl TerminalRenderer {
             // cell.
             row_match_indices.clear();
             if !ctx.search_matches.is_empty() {
-                row_match_indices.extend(
-                    ctx.search_matches
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, m)| {
-                            (m.start().line.0 <= buffer_line && buffer_line <= m.end().line.0)
-                                .then_some(index)
-                        }),
-                );
+                row_match_indices.extend(ctx.search_matches.iter().enumerate().filter_map(
+                    |(index, m)| {
+                        (m.start().line.0 <= buffer_line && buffer_line <= m.end().line.0)
+                            .then_some(index)
+                    },
+                ));
             }
             let mut match_cursor = 0;
 
@@ -865,8 +933,8 @@ impl TerminalRenderer {
                     }
                     match_cursor += 1;
                 };
-                let match_state = matched
-                    .map(|matched| ctx.active_match.is_some_and(|active| active == matched));
+                let match_state =
+                    matched.map(|matched| ctx.active_match.is_some_and(|active| active == matched));
                 match match_state {
                     Some(is_active) => {
                         let extend = match match_run {
@@ -937,8 +1005,12 @@ impl TerminalRenderer {
                             row_backgrounds.push(finished);
                         }
                     } else {
-                        current_bg =
-                            Some(BackgroundRect::new(col_idx, col_idx + 1, line_idx, bg_color));
+                        current_bg = Some(BackgroundRect::new(
+                            col_idx,
+                            col_idx + 1,
+                            line_idx,
+                            bg_color,
+                        ));
                     }
                 } else if let Some(bg) = current_bg.take() {
                     row_backgrounds.push(bg);
@@ -1316,7 +1388,11 @@ impl TerminalRenderer {
             let thumb_h = (available_h * (num_lines as f32 / total_lines)).max(24.0);
             let scroll_fraction = (history_size - display_offset) as f32 / (history_size as f32);
             let thumb_y = bounds.origin.y + px((available_h - thumb_h) * scroll_fraction);
-            let thumb_w = if ctx.scrollbar_active { px(8.0) } else { px(4.0) };
+            let thumb_w = if ctx.scrollbar_active {
+                px(8.0)
+            } else {
+                px(4.0)
+            };
             let thumb_x = bounds.origin.x + bounds.size.width - thumb_w - px(2.0);
 
             let thumb_color = if ctx.scrollbar_active {

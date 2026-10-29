@@ -7,9 +7,8 @@
 //!    the screen, the OSC title, and the OSC progress field. This is where
 //!    `working` and `blocked` come from, and it is the only tier that
 //!    understands an agent's own UI.
-//! 2. **Plain-shell fallback.** With no agent running, a foreground command
-//!    means `Working`; a `[y/n]` prompt means `Blocked`; failure output means
-//!    `Error`.
+//! 2. **Conservative fallback.** Recent output or an animating busy marker can
+//!    mean `Working`; an ambiguous live process remains `Unknown`.
 //!
 //! The foreground group is read from `/proc/<pid>/stat` field 8 (`tpgid`). Note
 //! that a `portable-pty` shell is its own process-group leader, so `pgrp == pid`
@@ -22,33 +21,40 @@
 //! an agent pack is active, because agent transcripts are full of `error:` lines
 //! belonging to the code being discussed rather than to the terminal.
 //!
-//! Sticky states: `Done` and `Error` persist while a terminal is unfocused and
-//! clear when the user looks at it, so a completion stays visible until it has
-//! been seen.
+//! Completion persistence is applied by the app lifecycle reducer, not the
+//! screen detector: Done/Error survive focus and idle transitions, then clear
+//! on new work or an explicit acknowledgment.
 //!
 //! Platform note: the process-tree half is Linux-only (`/proc`). Elsewhere
 //! [`foreground_process_names`] returns nothing and detection rests on the
 //! screen and OSC rules alone.
 
-use std::collections::hash_map::DefaultHasher;
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use regex::{RegexSet, RegexSetBuilder};
 use crate::agent_rules::{self, DetectionInput, RuleState};
+use regex::{RegexSet, RegexSetBuilder};
 
 /// Shared empty snapshot, so idle panes do not allocate a new `Arc` every poll.
 static EMPTY_FOREGROUND_NAMES: LazyLock<Arc<[String]>> =
     LazyLock::new(|| Arc::from(Vec::<String>::new()));
+static UNKNOWN_FOREGROUND_NAMES: LazyLock<Arc<[String]>> =
+    LazyLock::new(|| Arc::from(["<process-state-unavailable>".to_string()]));
 
 /// The shared empty snapshot, for panes that have no pid or no foreground job.
 pub fn empty_foreground_names() -> Arc<[String]> {
     Arc::clone(&*EMPTY_FOREGROUND_NAMES)
+}
+
+/// Snapshot used when the process state could not be inspected.
+pub fn unknown_foreground_names() -> Arc<[String]> {
+    Arc::clone(&*UNKNOWN_FOREGROUND_NAMES)
 }
 
 /// Foreground-group cache: shell pid -> (tpgid, shared process-name snapshot).
@@ -60,8 +66,9 @@ pub fn empty_foreground_names() -> Arc<[String]> {
 /// unchanged. Snapshots are shared across the status and logo paths; closed
 /// panes explicitly remove their entry.
 #[cfg(target_os = "linux")]
-static FG_CACHE: LazyLock<parking_lot::Mutex<HashMap<u32, (i64, Arc<[String]>)>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+static FG_CACHE: LazyLock<
+    parking_lot::Mutex<HashMap<u32, (i64, Vec<(u32, Option<u64>)>, Arc<[String]>)>>,
+> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// The status a terminal session can report. Exactly one is active at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,16 +85,20 @@ pub enum SessionStatus {
     Error,
     /// Task finished successfully.
     Done,
+    /// Evidence is insufficient to tell whether an unfamiliar program is
+    /// working, waiting, or finished while it remains open.
+    Unknown,
 }
 
 impl SessionStatus {
-    /// Render priority: Error > Blocked > Working > Done > Active > Idle.
+    /// Render priority used when multiple panes contribute to a session.
     pub fn rank(self) -> u8 {
         match self {
-            SessionStatus::Error => 6,
-            SessionStatus::Blocked => 5,
-            SessionStatus::Working => 4,
-            SessionStatus::Done => 3,
+            SessionStatus::Error => 7,
+            SessionStatus::Blocked => 6,
+            SessionStatus::Working => 5,
+            SessionStatus::Done => 4,
+            SessionStatus::Unknown => 3,
             SessionStatus::Active => 2,
             SessionStatus::Idle => 1,
         }
@@ -101,6 +112,7 @@ impl SessionStatus {
             SessionStatus::Blocked => "blocked",
             SessionStatus::Error => "error",
             SessionStatus::Done => "done",
+            SessionStatus::Unknown => "unknown",
         }
     }
 
@@ -113,6 +125,45 @@ impl SessionStatus {
             SessionStatus::Blocked => (0xdb6d28ff, 0xdb6d28ff, 0xbd561444),
             SessionStatus::Error => (0xf85149ff, 0xf85149ff, 0xda363344),
             SessionStatus::Done => (0x3fb950ff, 0x3fb950ff, 0x23863644),
+            SessionStatus::Unknown => (0x9b9ba5ff, 0x74747eff, 0x77778122),
+        }
+    }
+}
+
+/// Provenance for a pane's current status reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceSource {
+    ProcessExit,
+    AgentReport,
+    AgentRule,
+    AgentLifecycle,
+    TerminalProgress,
+    ScreenHeuristic,
+    ForegroundProcess,
+    NoSignal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetectionResult {
+    pub status: SessionStatus,
+    pub evidence: EvidenceSource,
+    pub confidence: Confidence,
+}
+
+impl DetectionResult {
+    pub fn new(status: SessionStatus, evidence: EvidenceSource, confidence: Confidence) -> Self {
+        Self {
+            status,
+            evidence,
+            confidence,
         }
     }
 }
@@ -200,6 +251,8 @@ pub struct Detector {
     running: RegexSet,
     last_hash: u64,
     last_change: Instant,
+    last_busy_hash: Option<u64>,
+    last_busy_change: Instant,
     /// screen must be unchanged this long before we trust an approval prompt
     settle: Duration,
     /// screen must be unchanged this long (with no "running" marker) to be idle
@@ -220,6 +273,8 @@ impl Detector {
             running,
             last_hash: 0,
             last_change: now,
+            last_busy_hash: None,
+            last_busy_change: now,
             settle: Duration::from_millis(400),
             idle_after: Duration::from_millis(1500),
         }
@@ -243,10 +298,27 @@ impl Detector {
         if stable >= self.settle && self.approval.is_match(&tail) {
             return State::AwaitingApproval;
         }
-        // 2. an explicit "busy" marker is visible (even if output is quiet)
+        // Generic transcript text is weak evidence. Only changes to the busy
+        // lines refresh it; an unrelated clock/cursor must not keep an old
+        // spinner alive. Known agent rules and native reports remain authoritative.
         if self.running.is_match(&tail) {
-            return State::Running;
+            let mut h = DefaultHasher::new();
+            for line in tail.lines().filter(|line| self.running.is_match(line)) {
+                line.hash(&mut h);
+            }
+            let busy_hash = h.finish();
+            if self.last_busy_hash != Some(busy_hash) {
+                self.last_busy_hash = Some(busy_hash);
+                self.last_busy_change = now;
+            }
+            return if now.duration_since(self.last_busy_change) < Duration::from_secs(5) {
+                State::Running
+            } else {
+                // Idle here means no current evidence, never task completion.
+                State::Idle
+            };
         }
+        self.last_busy_hash = None;
         // 3. screen still changing => busy; stable => idle at its prompt
         if stable < self.idle_after {
             State::Running
@@ -297,8 +369,9 @@ pub struct StatusInput<'a> {
     pub foreground: &'a [String],
     /// State from the temporal detector, if available.
     pub detector_state: Option<State>,
+    /// OSC 9;4 progress from the terminal, when the program reports it.
+    pub osc_progress: &'a str,
 }
-
 
 const EXTRA_AGENTS: &[&str] = &[
     "aider",
@@ -314,7 +387,12 @@ const EXTRA_AGENTS: &[&str] = &[
 pub fn is_agent_process(name: &str) -> bool {
     agent_rules::identify(name).is_some()
         || EXTRA_AGENTS.iter().any(|&extra| {
-            let key = name.rsplit('/').next().unwrap_or(name).trim().to_ascii_lowercase();
+            let key = name
+                .rsplit('/')
+                .next()
+                .unwrap_or(name)
+                .trim()
+                .to_ascii_lowercase();
             key == extra || key.strip_suffix("-cli").is_some_and(|s| s == extra)
         })
 }
@@ -338,7 +416,7 @@ pub fn explain(input: &StatusInput<'_>) -> Option<agent_rules::RuleMatch> {
         DetectionInput {
             screen: &screen,
             osc_title: input.title.unwrap_or(""),
-            osc_progress: "",
+            osc_progress: input.osc_progress,
         },
     )
 }
@@ -363,29 +441,26 @@ pub fn foreground_process_names(pid: Option<u32>) -> Arc<[String]> {
 #[cfg(target_os = "linux")]
 fn foreground_process_names_inner(pid: Option<u32>) -> Arc<[String]> {
     let Some(pid) = pid else {
-        return empty_foreground_names();
+        return unknown_foreground_names();
     };
     let Some(tpgid) = read_proc_tpgid(pid) else {
         FG_CACHE.lock().remove(&pid);
-        return empty_foreground_names();
+        return unknown_foreground_names();
     };
     // `tpgid == 0` means no controlling terminal; `tpgid == pid` means the
     // shell itself owns the foreground group, i.e. it is sitting at a prompt.
-    if tpgid == 0 || tpgid == pid as i64 {
+    if tpgid == 0 {
+        FG_CACHE.lock().remove(&pid);
+        return unknown_foreground_names();
+    }
+    if tpgid == pid as i64 {
         FG_CACHE.lock().remove(&pid);
         return empty_foreground_names();
     }
 
-    // Fast path: same foreground group as last tick means the same names —
-    // skip the `comm` / `cmdline` / `children` reads and share the immutable
-    // snapshot instead of cloning its strings for every poll.
-    let cached = FG_CACHE.lock().get(&pid).and_then(|(cached_tpgid, names)| {
-        (*cached_tpgid == tpgid).then(|| Arc::clone(names))
-    });
-    if let Some(names) = cached {
-        return names;
-    }
-
+    // Refresh process details every tick. A wrapper can launch or replace a
+    // child without changing its process group, so a tpgid-only cache goes
+    // stale. Reuse the old allocation only when the refreshed names match.
     let dir = Path::new("/proc").join(tpgid.to_string());
     let mut names = Vec::with_capacity(3);
 
@@ -409,7 +484,10 @@ fn foreground_process_names_inner(pid: Option<u32>) -> Arc<[String]> {
                     .unwrap_or_default()
                     .to_string()
             }
-            let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).collect();
+            let args: Vec<&[u8]> = cmdline
+                .split(|&b| b == 0)
+                .filter(|a| !a.is_empty())
+                .collect();
             if let Some(argv0) = args.first() {
                 push(basename(argv0));
             }
@@ -434,25 +512,69 @@ fn foreground_process_names_inner(pid: Option<u32>) -> Arc<[String]> {
 
     read_proc_info(&dir, &mut push);
 
-    // Also inspect child processes of the group leader (e.g. wrappers like bash script running node)
-    let children_path = dir.join("task").join(tpgid.to_string()).join("children");
-    if let Ok(children_data) = std::fs::read_to_string(children_path) {
-        for child_pid_str in children_data.split_whitespace() {
-            let child_dir = Path::new("/proc").join(child_pid_str);
-            read_proc_info(&child_dir, &mut push);
+    // Walk descendants so nested shell and package-manager wrappers are
+    // visible. Bound the walk to avoid pathological process trees.
+    let mut pending = vec![tpgid as u32];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(parent) = pending.pop() {
+        if !seen.insert(parent) || seen.len() > 256 {
+            continue;
+        }
+        let task_dir = Path::new("/proc")
+            .join(parent.to_string())
+            .join("task")
+            .join(parent.to_string());
+        if let Ok(children) = std::fs::read_to_string(task_dir.join("children")) {
+            for child in children
+                .split_whitespace()
+                .filter_map(|s| s.parse::<u32>().ok())
+            {
+                let child_dir = Path::new("/proc").join(child.to_string());
+                read_proc_info(&child_dir, &mut push);
+                pending.push(child);
+            }
         }
     }
 
+    if names.is_empty() {
+        names.push("<process-state-unavailable>".to_string());
+    }
+    names.sort();
+    let mut process_ids: Vec<(u32, Option<u64>)> = seen
+        .into_iter()
+        .map(|process_id| (process_id, read_proc_start_time(process_id)))
+        .collect();
+    process_ids.sort_unstable_by_key(|(process_id, _)| *process_id);
+    cache_foreground_names(&mut FG_CACHE.lock(), pid, tpgid, process_ids, names)
+}
+
+#[cfg(target_os = "linux")]
+fn cache_foreground_names(
+    cache: &mut HashMap<u32, (i64, Vec<(u32, Option<u64>)>, Arc<[String]>)>,
+    pid: u32,
+    tpgid: i64,
+    process_ids: Vec<(u32, Option<u64>)>,
+    names: Vec<String>,
+) -> Arc<[String]> {
+    if let Some(previous) = cache
+        .get(&pid)
+        .filter(|(old_group, old_pids, old_names)| {
+            *old_group == tpgid
+                && *old_pids == process_ids
+                && old_names.as_ref() == names.as_slice()
+        })
+        .map(|(_, _, old_names)| Arc::clone(old_names))
+    {
+        return previous;
+    }
     let names: Arc<[String]> = names.into();
-    FG_CACHE
-        .lock()
-        .insert(pid, (tpgid, Arc::clone(&names)));
+    cache.insert(pid, (tpgid, process_ids, Arc::clone(&names)));
     names
 }
 
 #[cfg(not(target_os = "linux"))]
 fn foreground_process_names_inner(_pid: Option<u32>) -> Arc<[String]> {
-    empty_foreground_names()
+    unknown_foreground_names()
 }
 
 /// Forget cached process names when a pane's shell is closed. The cache is
@@ -485,7 +607,8 @@ pub fn forget_pid(pid: Option<u32>) {
 /// dead: a running CLI could never be reported as `Working`.
 #[cfg(target_os = "linux")]
 fn read_proc_tpgid(pid: u32) -> Option<i64> {
-    let stat = std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
+    let stat =
+        std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
     parse_stat_tpgid(&stat)
 }
 
@@ -497,6 +620,18 @@ fn parse_stat_tpgid(stat: &str) -> Option<i64> {
     after_comm.split_whitespace().nth(8 - 3)?.parse().ok()
 }
 
+#[cfg(target_os = "linux")]
+fn read_proc_start_time(pid: u32) -> Option<u64> {
+    let stat =
+        std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(22 - 3)?
+        .parse()
+        .ok()
+}
+
 /// True when `T3_STATUS_DEBUG` is set: the poller logs every detection pass
 /// together with the facts that produced it.
 ///
@@ -504,6 +639,11 @@ fn parse_stat_tpgid(stat: &str) -> Option<i64> {
 /// `T3_STATUS_DEBUG=1` and the terminal shows exactly why each state changed.
 pub fn debug_enabled() -> bool {
     std::env::var_os("T3_STATUS_DEBUG").is_some()
+}
+
+/// Compact state and evidence transitions, without screen contents.
+pub fn trace_enabled() -> bool {
+    std::env::var_os("T3_STATUS_TRACE").is_some()
 }
 
 /// Single status for a terminal, joining the screen itself.
@@ -538,11 +678,6 @@ pub fn evaluate_screen_with_match(
     prev: SessionStatus,
     focused: bool,
 ) -> (SessionStatus, Option<agent_rules::RuleMatch>) {
-    // Sticky states are cleared on focus, otherwise they persist.
-    if matches!(prev, SessionStatus::Done | SessionStatus::Error) {
-        return (if focused { SessionStatus::Idle } else { prev }, None);
-    }
-
     let (detected, matched) = detect_full_screen(screen, input, prev);
 
     let tail = tail_lines(screen, FallbackRules::WINDOW);
@@ -553,10 +688,16 @@ pub fn evaluate_screen_with_match(
 
     // When the user is focused and interacting, plain shell commands report Active.
     // Only an agent running on its own ("own way") reports Working in a focused tab.
-    let status = if detected == SessionStatus::Working && !is_agent_working && focused {
+    let status = if detected == SessionStatus::Unknown {
+        SessionStatus::Unknown
+    } else if detected == SessionStatus::Working && !is_agent_working && focused {
         SessionStatus::Active
     } else {
-        let focus_status = if focused { SessionStatus::Active } else { SessionStatus::Idle };
+        let focus_status = if focused {
+            SessionStatus::Active
+        } else {
+            SessionStatus::Idle
+        };
         if detected.rank() > focus_status.rank() {
             detected
         } else {
@@ -582,10 +723,7 @@ fn detect_full_screen(
             DetectionInput {
                 screen,
                 osc_title: input.title.unwrap_or(""),
-                // OSC 9;4 progress is not parsed yet; the rules that read it simply
-                // never match, which is how upstream treats a terminal that does
-                // not report progress.
-                osc_progress: "",
+                osc_progress: input.osc_progress,
             },
         );
 
@@ -595,14 +733,14 @@ fn detect_full_screen(
                     match state {
                         State::AwaitingApproval => SessionStatus::Blocked,
                         State::Running => SessionStatus::Working,
-                        State::Idle | State::Exited => SessionStatus::Idle,
+                        State::Idle | State::Exited => SessionStatus::Unknown,
                     }
                 } else if FallbackRules::is_blocked(&tail) {
                     SessionStatus::Blocked
                 } else if FallbackRules::is_running(&tail) {
                     SessionStatus::Working
                 } else {
-                    SessionStatus::Idle
+                    SessionStatus::Unknown
                 }
             }
             Some(m) if m.skip_state_update => prev,
@@ -612,7 +750,7 @@ fn detect_full_screen(
                 RuleState::Idle => SessionStatus::Idle,
                 // Unknown means "neither" — but the agent process really is
                 // running, so report that rather than claiming the pane is idle.
-                RuleState::Unknown => SessionStatus::Working,
+                RuleState::Unknown => SessionStatus::Unknown,
             },
         };
         return (status, matched);
@@ -635,7 +773,7 @@ fn detect_full_screen(
     if FallbackRules::is_blocked(&tail) {
         return (SessionStatus::Blocked, None);
     }
-    if FallbackRules::is_running(&tail) {
+    if input.detector_state.is_none() && FallbackRules::is_running(&tail) {
         return (SessionStatus::Working, None);
     }
 
@@ -643,23 +781,22 @@ fn detect_full_screen(
         if input.foreground.is_empty() {
             SessionStatus::Idle
         } else {
-            SessionStatus::Working
+            SessionStatus::Unknown
         },
         None,
     )
 }
 
 /// Generic rules for terminals with no agent pack: a plain shell.
-static GENERIC_REGEXES: LazyLock<(RegexSet, RegexSet)> = LazyLock::new(|| {
-    Profile::generic().compile()
-});
+static GENERIC_REGEXES: LazyLock<(RegexSet, RegexSet)> =
+    LazyLock::new(|| Profile::generic().compile());
 
 /// Generic rules for terminals with no agent pack: a plain shell or uncataloged agent CLI.
 struct FallbackRules;
 
 impl FallbackRules {
     /// Lines considered "recent" for the fallback rules.
-    const WINDOW: usize = 12;
+    const WINDOW: usize = 5;
 
     fn is_blocked(tail: &str) -> bool {
         GENERIC_REGEXES.0.is_match(tail)
@@ -682,7 +819,6 @@ impl FallbackRules {
         let excess = lines.len().saturating_sub(n);
         lines.split_off(excess)
     }
-
 
     /// Strong failure markers on the most recent output lines.
     ///
@@ -716,6 +852,7 @@ mod tests {
             title: None,
             foreground: &fg,
             detector_state: None,
+            osc_progress: "",
         };
         evaluate(&input, SessionStatus::Idle, focused)
     }
@@ -743,6 +880,8 @@ mod tests {
     #[test]
     fn priority_order() {
         assert!(SessionStatus::Error.rank() > SessionStatus::Blocked.rank());
+        assert!(SessionStatus::Unknown.rank() > SessionStatus::Active.rank());
+        assert!(SessionStatus::Done.rank() > SessionStatus::Unknown.rank());
         assert!(SessionStatus::Blocked.rank() > SessionStatus::Working.rank());
         assert!(SessionStatus::Working.rank() > SessionStatus::Done.rank());
         assert!(SessionStatus::Done.rank() > SessionStatus::Active.rank());
@@ -751,13 +890,19 @@ mod tests {
 
     #[test]
     fn plain_shell_command_is_working() {
-        // No agent → anything in the foreground group is a running command.
-        assert_eq!(eval(&["building..."], &["cargo"], false), SessionStatus::Working);
+        // Process presence alone cannot prove that an unfamiliar command is active.
+        assert_eq!(
+            eval(&["building..."], &["cargo"], false),
+            SessionStatus::Unknown
+        );
     }
 
     #[test]
-    fn plain_shell_prompt_is_idle() {
-        assert_eq!(eval(&["user@host ~/project ❯"], &[], false), SessionStatus::Idle);
+    fn shell_prompt_is_idle_without_foreground_process() {
+        assert_eq!(
+            eval(&["user@host ~/project ❯"], &[], false),
+            SessionStatus::Idle
+        );
         assert_eq!(eval(&[], &[], false), SessionStatus::Idle);
     }
 
@@ -775,7 +920,10 @@ mod tests {
     fn claude_working_footer_is_working() {
         assert_eq!(
             eval(
-                &["⏺ Read(src/main.rs)", "✳ Baking… (2m 14s · esc to interrupt)"],
+                &[
+                    "⏺ Read(src/main.rs)",
+                    "✳ Baking… (2m 14s · esc to interrupt)"
+                ],
                 &["claude"],
                 false
             ),
@@ -826,10 +974,10 @@ mod tests {
     }
 
     #[test]
-    fn agent_running_with_no_matching_rule_is_idle() {
-        // Upstream's known-agent fallback: the agent is up but showing nothing
-        // recognizable, so it is treated as idle rather than busy.
-        assert_eq!(eval(&["hello"], &["claude"], false), SessionStatus::Idle);
+    fn agent_running_with_no_matching_rule_is_unknown() {
+        // A process being present does not reveal whether the agent is waiting
+        // for input or has completed its turn.
+        assert_eq!(eval(&["hello"], &["claude"], false), SessionStatus::Unknown);
     }
 
     #[test]
@@ -845,28 +993,45 @@ mod tests {
         // The shell redraws its prompt under the failure; the error must still
         // be visible in the window.
         assert_eq!(
-            eval(&["error: could not compile `markup`", "user@host ~/markup ❯"], &[], false),
+            eval(
+                &["error: could not compile `markup`", "user@host ~/markup ❯"],
+                &[],
+                false
+            ),
             SessionStatus::Error
         );
     }
 
     #[test]
     fn plain_shell_confirmation_prompt_is_blocked() {
-        assert_eq!(eval(&["Overwrite the file? [y/n]"], &["cp"], false), SessionStatus::Blocked);
+        assert_eq!(
+            eval(&["Overwrite the file? [y/n]"], &["cp"], false),
+            SessionStatus::Blocked
+        );
     }
 
     #[test]
-    fn sticky_done_until_focus() {
+    fn screen_evaluator_does_not_mask_fresh_state_after_completion() {
         let lines = vec!["$".to_string()];
         let input = StatusInput {
             lines: &lines,
             title: None,
             foreground: &[],
             detector_state: None,
+            osc_progress: "",
         };
-        assert_eq!(evaluate(&input, SessionStatus::Done, false), SessionStatus::Done);
-        assert_eq!(evaluate(&input, SessionStatus::Done, true), SessionStatus::Idle);
-        assert_eq!(evaluate(&input, SessionStatus::Error, false), SessionStatus::Error);
+        assert_eq!(
+            evaluate(&input, SessionStatus::Done, false),
+            SessionStatus::Idle
+        );
+        assert_eq!(
+            evaluate(&input, SessionStatus::Done, true),
+            SessionStatus::Active
+        );
+        assert_eq!(
+            evaluate(&input, SessionStatus::Error, false),
+            SessionStatus::Idle
+        );
     }
 
     #[test]
@@ -877,7 +1042,10 @@ mod tests {
 
     #[test]
     fn blocked_beats_active() {
-        assert_eq!(eval(&["Delete everything? [y/n]"], &["rm"], true), SessionStatus::Blocked);
+        assert_eq!(
+            eval(&["Delete everything? [y/n]"], &["rm"], true),
+            SessionStatus::Blocked
+        );
     }
 
     #[test]
@@ -904,6 +1072,7 @@ mod tests {
             title: None,
             foreground: &fg,
             detector_state: None,
+            osc_progress: "",
         };
         let m = explain(&input).expect("a rule should match");
         assert_eq!(m.pack, "claude");
@@ -917,6 +1086,37 @@ mod tests {
         assert_eq!(pack_for(&["bash".to_string()]), None);
     }
 
+    #[test]
+    fn missing_process_metadata_is_marked_unknown() {
+        assert_eq!(
+            unknown_foreground_names().as_ref(),
+            &["<process-state-unavailable>"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_names_refresh_when_children_change_in_same_group() {
+        let mut cache = HashMap::new();
+        let first = cache_foreground_names(
+            &mut cache,
+            41,
+            72,
+            vec![(41, Some(1)), (72, Some(2))],
+            vec!["bash".into()],
+        );
+        let second = cache_foreground_names(
+            &mut cache,
+            41,
+            72,
+            vec![(41, Some(1)), (72, Some(2)), (73, Some(3))],
+            vec!["agent".into(), "node".into()],
+        );
+        assert_eq!(first.as_ref(), &["bash"]);
+        assert_eq!(second.as_ref(), &["agent", "node"]);
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn tpgid_is_field_8_not_pgrp() {
@@ -927,6 +1127,27 @@ mod tests {
         let stat = "380159 (fish) S 379762 380159 380159 34822 380572 4194304 1445 \
                     5045 8 9 4 3 1 2 16 -4 1 0 5676308 300417024 2121 18446744073709551615";
         assert_eq!(parse_stat_tpgid(stat), Some(380572));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_instance_start_time_is_part_of_foreground_identity() {
+        let mut cache = HashMap::new();
+        let first = cache_foreground_names(
+            &mut cache,
+            41,
+            72,
+            vec![(72, Some(100))],
+            vec!["agent".into()],
+        );
+        let replacement = cache_foreground_names(
+            &mut cache,
+            41,
+            72,
+            vec![(72, Some(200))],
+            vec!["agent".into()],
+        );
+        assert!(!Arc::ptr_eq(&first, &replacement));
     }
 
     #[cfg(target_os = "linux")]
@@ -945,12 +1166,75 @@ mod tests {
     fn running_then_idle() {
         let t0 = Instant::now();
         let mut d = Detector::new(Profile::generic(), t0);
-        assert_eq!(feed(&mut d, "⠋ Thinking…\n  esc to interrupt", t0, 0), State::Running);
-        // spinner marker still visible and screen frozen: still running
-        assert_eq!(feed(&mut d, "⠋ Thinking…\n  esc to interrupt", t0, 5000), State::Running);
+        assert_eq!(
+            feed(&mut d, "⠋ Thinking…\n  esc to interrupt", t0, 0),
+            State::Running
+        );
+        // A static generic spinner stops being evidence; silence cannot prove done.
+        assert_eq!(
+            feed(&mut d, "⠋ Thinking…\n  esc to interrupt", t0, 5000),
+            State::Idle
+        );
         // done: plain prompt, then it stays unchanged
         assert_eq!(feed(&mut d, "All done.\n> ", t0, 5100), State::Running);
         assert_eq!(feed(&mut d, "All done.\n> ", t0, 7000), State::Idle);
+    }
+
+    #[test]
+    fn stale_generic_spinner_expires_even_when_unrelated_output_changes() {
+        let t0 = Instant::now();
+        let mut d = Detector::new(Profile::generic(), t0);
+        assert_eq!(feed(&mut d, "⠋ Thinking…\nclock: 0", t0, 0), State::Running);
+        let screen = "⠋ Thinking…\nAll done.\nclock: 6\n> ";
+        let state = feed(&mut d, screen, t0, 6000);
+        assert_eq!(state, State::Idle);
+        let lines = screen.lines().map(str::to_owned).collect::<Vec<_>>();
+        let foreground = vec!["command-code".to_owned()];
+        let input = StatusInput {
+            lines: &lines,
+            title: None,
+            foreground: &foreground,
+            detector_state: Some(state),
+            osc_progress: "",
+        };
+        // Do not re-enable the expired spinner through a second regex path,
+        // and do not mistake the expiration for a completed turn.
+        assert_eq!(
+            evaluate(&input, SessionStatus::Working, false),
+            SessionStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn changing_spinner_refreshes_generic_working_evidence() {
+        let t0 = Instant::now();
+        let mut d = Detector::new(Profile::generic(), t0);
+        for ms in [0, 4000, 8000, 12000] {
+            let screen = if ms % 8000 == 0 {
+                "⠋ Thinking…"
+            } else {
+                "⠙ Thinking…"
+            };
+            assert_eq!(feed(&mut d, screen, t0, ms), State::Running);
+        }
+        assert_eq!(feed(&mut d, "⠙ Thinking…", t0, 18000), State::Idle);
+    }
+
+    #[test]
+    fn authoritative_agent_rule_survives_generic_evidence_expiration() {
+        let lines = vec!["✳ Baking… (2m 14s · esc to interrupt)".to_owned()];
+        let foreground = vec!["claude".to_owned()];
+        let input = StatusInput {
+            lines: &lines,
+            title: None,
+            foreground: &foreground,
+            detector_state: Some(State::Idle),
+            osc_progress: "",
+        };
+        assert_eq!(
+            evaluate(&input, SessionStatus::Working, false),
+            SessionStatus::Working
+        );
     }
 
     #[test]
@@ -961,7 +1245,10 @@ mod tests {
         assert_eq!(feed(&mut d, s, t0, 0), State::Running); // just appeared
         assert_eq!(feed(&mut d, s, t0, 600), State::AwaitingApproval);
         assert_eq!(feed(&mut d, "Continue? (y/n)", t0, 700), State::Running);
-        assert_eq!(feed(&mut d, "Continue? (y/n)", t0, 1200), State::AwaitingApproval);
+        assert_eq!(
+            feed(&mut d, "Continue? (y/n)", t0, 1200),
+            State::AwaitingApproval
+        );
     }
 
     #[test]
@@ -978,11 +1265,19 @@ mod tests {
     #[test]
     fn generic_agent_approval_patterns_are_blocked() {
         assert_eq!(
-            eval(&["Do you want to proceed?", "❯ 1. Yes", "  2. No"], &[], false),
+            eval(
+                &["Do you want to proceed?", "❯ 1. Yes", "  2. No"],
+                &[],
+                false
+            ),
             SessionStatus::Blocked
         );
         assert_eq!(
-            eval(&["Allow tool execution `git commit`? (y/n)"], &["python3"], false),
+            eval(
+                &["Allow tool execution `git commit`? (y/n)"],
+                &["python3"],
+                false
+            ),
             SessionStatus::Blocked
         );
         assert_eq!(
@@ -1001,10 +1296,7 @@ mod tests {
 
     #[test]
     fn generic_agent_running_markers_are_working() {
-        assert_eq!(
-            eval(&["⠋ Thinking…"], &[], false),
-            SessionStatus::Working
-        );
+        assert_eq!(eval(&["⠋ Thinking…"], &[], false), SessionStatus::Working);
         assert_eq!(
             eval(&["Generating response... (esc to interrupt)"], &[], false),
             SessionStatus::Working
@@ -1023,23 +1315,40 @@ mod tests {
             title: None,
             foreground: &[],
             detector_state: Some(State::Running),
+            osc_progress: "",
         };
-        assert_eq!(evaluate(&input_running, SessionStatus::Idle, false), SessionStatus::Working);
+        assert_eq!(
+            evaluate(&input_running, SessionStatus::Idle, false),
+            SessionStatus::Working
+        );
 
         let input_approval = StatusInput {
             lines: &lines,
             title: None,
             foreground: &[],
             detector_state: Some(State::AwaitingApproval),
+            osc_progress: "",
         };
-        assert_eq!(evaluate(&input_approval, SessionStatus::Idle, false), SessionStatus::Blocked);
+        assert_eq!(
+            evaluate(&input_approval, SessionStatus::Idle, false),
+            SessionStatus::Blocked
+        );
     }
     #[test]
-    fn focused_interaction_is_active_not_working() {
-        // When focused and typing or running plain commands, status is Active (not Working).
-        assert_eq!(eval(&["building..."], &["cargo"], true), SessionStatus::Active);
-        assert_eq!(eval(&["user@host ❯ git status"], &["git"], true), SessionStatus::Active);
-        assert_eq!(eval(&["user@host ❯ echo hello"], &[], true), SessionStatus::Active);
+    fn focus_does_not_turn_ambiguous_foreground_program_into_active() {
+        // A live process with no reliable state stays unknown, even when focused.
+        assert_eq!(
+            eval(&["building..."], &["cargo"], true),
+            SessionStatus::Unknown
+        );
+        assert_eq!(
+            eval(&["user@host ❯ git status"], &["git"], true),
+            SessionStatus::Unknown
+        );
+        assert_eq!(
+            eval(&["user@host ❯ echo hello"], &[], true),
+            SessionStatus::Active
+        );
     }
 
     #[test]
@@ -1048,7 +1357,10 @@ mod tests {
         assert_eq!(eval(&["⠋ Thinking…"], &[], true), SessionStatus::Working);
         assert_eq!(
             eval(
-                &["⏺ Read(src/main.rs)", "✳ Baking… (2m 14s · esc to interrupt)"],
+                &[
+                    "⏺ Read(src/main.rs)",
+                    "✳ Baking… (2m 14s · esc to interrupt)"
+                ],
                 &["claude"],
                 true
             ),

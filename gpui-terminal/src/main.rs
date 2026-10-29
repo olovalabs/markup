@@ -27,7 +27,6 @@ impl TerminalApp {
             });
             cx.stop_propagation();
         } else if keystroke.modifiers.control && keystroke.key == "-" {
-
             self.terminal.update(cx, |terminal, cx| {
                 let mut config = terminal.config().clone();
 
@@ -54,7 +53,6 @@ fn main() -> Result<()> {
     let app = gpui::Application::new();
 
     app.run(move |cx| {
-
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
 
         let pty_system = native_pty_system();
@@ -93,7 +91,6 @@ fn main() -> Result<()> {
                 .background(0x16, 0x16, 0x17)
                 .foreground(0xC9, 0xC7, 0xCD)
                 .cursor(0xC9, 0xC7, 0xCD)
-
                 .black(0x10, 0x10, 0x10)
                 .red(0xEF, 0xA6, 0xA2)
                 .green(0x80, 0xC9, 0x90)
@@ -102,7 +99,6 @@ fn main() -> Result<()> {
                 .magenta(0xE6, 0xA3, 0xDC)
                 .cyan(0x50, 0xCA, 0xCD)
                 .white(0x80, 0x80, 0x80)
-
                 .bright_black(0x39, 0x41, 0x4E)
                 .bright_red(0xE0, 0xAF, 0x85)
                 .bright_green(0x5A, 0xCC, 0xAF)
@@ -147,7 +143,6 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
-
                     let terminal = cx.new(|cx| {
                         TerminalView::new(writer, reader, config, cx)
                             .with_resize_callback(resize_callback)

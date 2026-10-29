@@ -1,35 +1,61 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use anyhow::Result;
-use gpui::{
-    px, size, App, AppContext, Application, Bounds, Context, CursorStyle, Edges, Entity,
-    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
-    SharedString, Styled, Window, WindowBounds, WindowDecorations,
-    WindowOptions, div, rgba, svg, MouseDownEvent, MouseMoveEvent, Pixels, Point, WindowControlArea,
-};
 use gpui::prelude::FluentBuilder as _;
+use gpui::{
+    Animation, AnimationExt as _, App, AppContext, Application, Bounds, Context, CursorStyle,
+    Edges, Entity, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ParentElement, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Transformation, Window, WindowBounds,
+    WindowControlArea, WindowDecorations, WindowOptions, div, linear_color_stop, linear_gradient,
+    percentage, px, rgba, size, svg,
+};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Root, TitleBar};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod agent_rules;
 mod assets;
+mod cli;
 mod diagnostics;
+#[cfg(unix)]
+mod herdr_compat;
+mod integrations;
 mod logos;
 mod status;
+#[cfg(unix)]
+mod status_bus;
 mod workspace_state;
 
-use assets::{load_embedded_fonts, sync_component_fonts, CombinedAssets, MONO_FONT};
+use assets::{CombinedAssets, MONO_FONT, load_embedded_fonts, sync_component_fonts};
 use status::{SessionStatus, StatusInput};
 pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/logo/markup.png");
 
+#[cfg(unix)]
+static STATUS_BUS: std::sync::LazyLock<Option<status_bus::BusIdentity>> =
+    std::sync::LazyLock::new(|| status_bus::start().ok());
+#[cfg(unix)]
+static LAST_STATUS_SNAPSHOT_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+fn status_snapshot_due() -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let previous = LAST_STATUS_SNAPSHOT_MS.load(Ordering::Relaxed);
+    now.saturating_sub(previous) >= 1000
+        && LAST_STATUS_SNAPSHOT_MS
+            .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
 
 struct SharedWriter {
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
@@ -56,8 +82,19 @@ impl std::io::Write for SharedWriter {
 /// keeps running while another session's screen is shown.
 pub struct TerminalPane {
     pub id: usize,
+    pub generation: String,
+    pub native_session_id: Option<String>,
+    pub native_session_reporter: Option<String>,
+    pub native_turn_id: Option<String>,
+    pub native_sequence: HashMap<String, u64>,
+    pub native_reporter_generation: HashMap<String, String>,
+    pub pending_approvals: std::collections::HashSet<String>,
+    pub native_status: Option<SessionStatus>,
+    pub native_acknowledged: bool,
+    pub osc_report_active: bool,
     pub terminal: Entity<TerminalView>,
     pub status: SessionStatus,
+    pub detection: status::DetectionResult,
     pub title: String,
     /// Title as shown in the pane header (truncated to 160 chars), cached so
     /// the render pass does not re-scan and re-allocate it every frame.
@@ -80,10 +117,14 @@ pub struct TerminalPane {
     /// A recognized agent CLI was the foreground process on the previous tick.
     /// Its disappearance means the agent finished (Done), like herdr.
     pub agent_active: bool,
-    /// When the terminal first showed an unacknowledged Done, for the short
-    /// auto-clear timeout in the spec.
-    pub done_since: Option<std::time::Instant>,
     pub detector: status::Detector,
+}
+
+impl Drop for TerminalPane {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        herdr_compat::unregister(&self.generation);
+    }
 }
 
 /// One sidebar tab: an isolated screen with its own split-layout tree of
@@ -104,13 +145,52 @@ pub struct Session {
     pub status: SessionStatus,
 }
 
-/// How long an unacknowledged Done badge lingers before it falls back to Idle.
-const DONE_LINGER: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Status poll period. Process status cannot be evented portably across the
 /// platforms this app supports, so this bounded timer is the change detector;
 /// the work it triggers is small (`/proc` reads now happen off the UI thread).
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(unix)]
+static FANOUT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn latch_completion(previous: SessionStatus, next: SessionStatus) -> SessionStatus {
+    // Completion persistence is owned by the lifecycle reducer: idle/focus
+    // observations cannot clear it, while fresh work always can.
+    if matches!(previous, SessionStatus::Done | SessionStatus::Error)
+        && matches!(
+            next,
+            SessionStatus::Idle | SessionStatus::Active | SessionStatus::Unknown
+        )
+    {
+        previous
+    } else {
+        next
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn completed_status_survives_idle_and_focus_but_new_work_replaces_it() {
+    assert_eq!(
+        latch_completion(SessionStatus::Done, SessionStatus::Idle),
+        SessionStatus::Done
+    );
+    assert_eq!(
+        latch_completion(SessionStatus::Done, SessionStatus::Active),
+        SessionStatus::Done
+    );
+    assert_eq!(
+        latch_completion(SessionStatus::Error, SessionStatus::Unknown),
+        SessionStatus::Error
+    );
+    assert_eq!(
+        latch_completion(SessionStatus::Done, SessionStatus::Working),
+        SessionStatus::Working
+    );
+    assert_eq!(
+        latch_completion(SessionStatus::Done, SessionStatus::Blocked),
+        SessionStatus::Blocked
+    );
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaneNode {
@@ -131,7 +211,13 @@ impl PaneNode {
         }
     }
 
-    pub fn split(&mut self, target_id: usize, new_id: usize, split_id: usize, axis: gpui::Axis) -> bool {
+    pub fn split(
+        &mut self,
+        target_id: usize,
+        new_id: usize,
+        split_id: usize,
+        axis: gpui::Axis,
+    ) -> bool {
         match self {
             PaneNode::Leaf(id) => {
                 if *id == target_id {
@@ -147,7 +233,8 @@ impl PaneNode {
                 }
             }
             PaneNode::Split { left, right, .. } => {
-                left.split(target_id, new_id, split_id, axis) || right.split(target_id, new_id, split_id, axis)
+                left.split(target_id, new_id, split_id, axis)
+                    || right.split(target_id, new_id, split_id, axis)
             }
         }
     }
@@ -161,7 +248,12 @@ impl PaneNode {
                     Some(PaneNode::Leaf(id))
                 }
             }
-            PaneNode::Split { id, axis, left, right } => {
+            PaneNode::Split {
+                id,
+                axis,
+                left,
+                right,
+            } => {
                 let left = left.remove(target_id);
                 let right = right.remove(target_id);
                 match (left, right) {
@@ -213,6 +305,8 @@ struct AppState {
     /// and consumed by the status poller (Active state, sticky-state clearing).
     focused_pane_id: Option<usize>,
     pub sidebar_visible: bool,
+    integration_panel_visible: bool,
+    integration_feedback: SharedString,
     pub sidebar_width: Pixels,
     drag_start_pos: Option<Point<Pixels>>,
     persistence_path: Option<PathBuf>,
@@ -224,9 +318,15 @@ struct AppState {
 impl AppState {
     fn saved_workspace(&self) -> workspace_state::SavedWorkspace {
         workspace_state::SavedWorkspace {
-            projects: self.projects.iter().map(|p| workspace_state::SavedProject {
-                path: p.path.clone(), name: p.name.to_string(), expanded: p.expanded,
-            }).collect(),
+            projects: self
+                .projects
+                .iter()
+                .map(|p| workspace_state::SavedProject {
+                    path: p.path.clone(),
+                    name: p.name.to_string(),
+                    expanded: p.expanded,
+                })
+                .collect(),
             active_project: self.active_project().map(|p| p.path.clone()),
             sidebar_visible: self.sidebar_visible,
             sidebar_width: f32::from(self.sidebar_width),
@@ -235,39 +335,115 @@ impl AppState {
 
     fn schedule_workspace_save(&mut self, cx: &Context<Self>) {
         self.startup_loaded = true;
-        let (Some(path), Some(snapshot)) = (self.persistence_path.clone(), Some(self.saved_workspace())) else { return; };
+        let (Some(path), Some(snapshot)) =
+            (self.persistence_path.clone(), Some(self.saved_workspace()))
+        else {
+            return;
+        };
         let generation = self.save_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let generation_counter = self.save_generation.clone();
         let executor = cx.background_executor().clone();
-        executor.clone().spawn(async move {
-            executor.timer(std::time::Duration::from_millis(300)).await;
-            if let Err(error) = workspace_state::save_if_current(&path, &snapshot, &generation_counter, generation) {
-                eprintln!("failed to save workspace state: {error}");
-            }
-        }).detach();
+        executor
+            .clone()
+            .spawn(async move {
+                executor.timer(std::time::Duration::from_millis(300)).await;
+                if let Err(error) = workspace_state::save_if_current(
+                    &path,
+                    &snapshot,
+                    &generation_counter,
+                    generation,
+                ) {
+                    eprintln!("failed to save workspace state: {error}");
+                }
+            })
+            .detach();
     }
 
-    fn apply_saved_workspace(&mut self, saved: workspace_state::SavedWorkspace, cx: &mut Context<Self>) {
-        if self.startup_loaded { return; }
+    fn apply_saved_workspace(
+        &mut self,
+        saved: workspace_state::SavedWorkspace,
+        cx: &mut Context<Self>,
+    ) {
+        if self.startup_loaded {
+            return;
+        }
         self.startup_loaded = true;
         self.sidebar_visible = saved.sidebar_visible;
         self.sidebar_width = px(saved.sidebar_width.clamp(200.0, 500.0));
         self.projects.clear();
         self.active_project_idx = 0;
         for project in saved.projects {
-            if !project.path.is_dir() || self.projects.iter().any(|p| p.path == project.path) { continue; }
+            if !project.path.is_dir() || self.projects.iter().any(|p| p.path == project.path) {
+                continue;
+            }
             let id = self.next_id;
             self.next_id += 1;
             let weak = cx.entity().downgrade();
-            let Ok((terminal, pid)) = Self::spawn_terminal_view(Some(&project.path), self.palette.clone(), weak, id, cx) else { continue; };
+            let Ok((terminal, pid, generation)) =
+                Self::spawn_terminal_view(Some(&project.path), self.palette.clone(), weak, id, cx)
+            else {
+                continue;
+            };
             let title = SharedString::from("terminal 1");
-            let pane = TerminalPane { id, terminal, status: SessionStatus::Idle, title: title.to_string(), display_title: title.clone(), pid,
-                screen_scratch: Vec::new(), poll_cache: None, ack_screen: None, agent_active: false, done_since: None, detector: status::Detector::default() };
-            let session = Session { id, title: title.clone(), display_title: title, logo: logos::default_logo(), pane_tree: Some(PaneNode::Leaf(id)), maximized_pane_id: None, panes: vec![pane], status: SessionStatus::Idle };
-            self.projects.push(Project { id, name: SharedString::from(project.name), path: project.path, sessions: vec![session], active_session_idx: 0, expanded: project.expanded });
+            let pane = TerminalPane {
+                id,
+                generation,
+                native_session_id: None,
+                native_session_reporter: None,
+                native_turn_id: None,
+                native_sequence: HashMap::new(),
+                native_reporter_generation: HashMap::new(),
+                pending_approvals: std::collections::HashSet::new(),
+                native_status: None,
+                native_acknowledged: false,
+                osc_report_active: false,
+                terminal,
+                status: SessionStatus::Idle,
+                detection: status::DetectionResult::new(
+                    SessionStatus::Idle,
+                    status::EvidenceSource::NoSignal,
+                    status::Confidence::None,
+                ),
+                title: title.to_string(),
+                display_title: title.clone(),
+                pid,
+                screen_scratch: Vec::new(),
+                poll_cache: None,
+                ack_screen: None,
+                agent_active: false,
+                detector: status::Detector::default(),
+            };
+            let session = Session {
+                id,
+                title: title.clone(),
+                display_title: title,
+                logo: logos::default_logo(),
+                pane_tree: Some(PaneNode::Leaf(id)),
+                maximized_pane_id: None,
+                panes: vec![pane],
+                status: SessionStatus::Idle,
+            };
+            self.projects.push(Project {
+                id,
+                name: SharedString::from(project.name),
+                path: project.path,
+                sessions: vec![session],
+                active_session_idx: 0,
+                expanded: project.expanded,
+            });
         }
-        self.active_project_idx = saved.active_project.as_ref().and_then(|path| self.projects.iter().position(|p| &p.path == path)).unwrap_or(0);
-        if !self.projects.is_empty() { self.focused_pane_id = self.projects[self.active_project_idx].sessions.first().and_then(|s| s.panes.first()).map(|p| p.id); }
+        self.active_project_idx = saved
+            .active_project
+            .as_ref()
+            .and_then(|path| self.projects.iter().position(|p| &p.path == path))
+            .unwrap_or(0);
+        if !self.projects.is_empty() {
+            self.focused_pane_id = self.projects[self.active_project_idx]
+                .sessions
+                .first()
+                .and_then(|s| s.panes.first())
+                .map(|p| p.id);
+        }
         self.rebuild_session_index();
         cx.notify();
     }
@@ -292,22 +468,20 @@ impl AppState {
                     this.drag_start_pos = None;
                 }),
             )
-            .on_mouse_move(
-                cx.listener(|this, ev: &MouseMoveEvent, window, _| {
-                    if ev.pressed_button != Some(MouseButton::Left) {
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, _| {
+                if ev.pressed_button != Some(MouseButton::Left) {
+                    this.drag_start_pos = None;
+                    return;
+                }
+                if let Some(start_pos) = this.drag_start_pos {
+                    let dx = (ev.position.x - start_pos.x).to_f64();
+                    let dy = (ev.position.y - start_pos.y).to_f64();
+                    if dx * dx + dy * dy >= 64.0 {
                         this.drag_start_pos = None;
-                        return;
+                        window.start_window_move();
                     }
-                    if let Some(start_pos) = this.drag_start_pos {
-                        let dx = (ev.position.x - start_pos.x).to_f64();
-                        let dy = (ev.position.y - start_pos.y).to_f64();
-                        if dx * dx + dy * dy >= 64.0 {
-                            this.drag_start_pos = None;
-                            window.start_window_move();
-                        }
-                    }
-                }),
-            )
+                }
+            }))
     }
 
     fn active_project(&self) -> Option<&Project> {
@@ -330,8 +504,12 @@ impl AppState {
         window_title_target: gpui::WeakEntity<Self>,
         pane_id: usize,
         cx: &mut Context<Self>,
-    ) -> Result<(Entity<TerminalView>, Option<u32>)> {
+    ) -> Result<(Entity<TerminalView>, Option<u32>, String)> {
         let (shell_cmd, _) = detect_shell();
+        #[cfg(unix)]
+        let generation = status_bus::new_generation();
+        #[cfg(not(unix))]
+        let generation = format!("pane-{pane_id}-{}", std::process::id());
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -352,14 +530,49 @@ impl AppState {
         cmd.env("TERM_PROGRAM_VERSION", "0.1.0");
         cmd.env("LANG", "en_US.UTF-8");
         cmd.env("LC_ALL", "en_US.UTF-8");
+        if let Ok(executable) = std::env::current_exe() {
+            cmd.env("MARKUP_EXECUTABLE", executable);
+        }
+        #[cfg(unix)]
+        if let Some(bus) = STATUS_BUS.as_ref() {
+            herdr_compat::register(&bus.app_id, pane_id, &generation);
+            cmd.env("MARKUP_STATUS_SOCKET", &bus.socket);
+            cmd.env("MARKUP_APP_ID", &bus.app_id);
+            cmd.env("MARKUP_PANE_ID", pane_id.to_string());
+            cmd.env("MARKUP_PANE_GENERATION", &generation);
+            // Native Herdr reporters (including Command Code) can use the
+            // scoped reporting API. The opaque ID is bound to this generation.
+            cmd.env("HERDR_ENV", "1");
+            cmd.env("HERDR_SOCKET_PATH", &bus.socket);
+            cmd.env("HERDR_PANE_ID", &generation);
+            // A new pane is independent of a Command Code process that may
+            // have launched Markup; its inherited child-owner guard must not
+            // disable the vendor reporter for the new foreground agent.
+            cmd.env_remove("CMD_HERDR_PANE_OWNER");
+            if let Ok(executable) = std::env::current_exe() {
+                cmd.env("HERDR_BIN_PATH", executable);
+            }
+            cmd.env(
+                "MARKUP_STATUS_SNAPSHOT",
+                status_bus::snapshot_path(bus, pane_id, &generation),
+            );
+        }
+        #[cfg(unix)]
+        if let Some(tty) = pair.master.tty_name() {
+            cmd.env("MARKUP_STATUS_TTY", tty);
+        }
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| anyhow::anyhow!("Spawn shell error: {e}"))?;
+        let child = pair.slave.spawn_command(cmd).map_err(|e| {
+            #[cfg(unix)]
+            herdr_compat::unregister(&generation);
+            anyhow::anyhow!("Spawn shell error: {e}")
+        })?;
         let pid = child.process_id();
 
-        let writer = pair.master.take_writer().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let reader = pair
             .master
             .try_clone_reader()
@@ -416,7 +629,7 @@ impl AppState {
             // Exit status is intentionally not set here: the status poller
             // derives Done/Error from the real exit code (see poll_sessions_status).
         });
-        Ok((terminal, pid))
+        Ok((terminal, pid, generation))
     }
 
     fn update_pane_title(&mut self, pane_id: usize, title: &str, cx: &mut Context<Self>) {
@@ -497,6 +710,227 @@ impl AppState {
         pids
     }
 
+    #[cfg(unix)]
+    fn apply_status_events(
+        &mut self,
+        events: Vec<status_bus::StatusEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bus) = STATUS_BUS.as_ref() else {
+            return;
+        };
+        let mut routed = Vec::new();
+        for event in events {
+            if event.app_id != bus.app_id {
+                continue;
+            }
+            let Some(source) = self
+                .projects
+                .iter()
+                .flat_map(|project| &project.sessions)
+                .flat_map(|session| &session.panes)
+                .find(|pane| {
+                    pane.id as u64 == event.pane_id && pane.generation == event.pane_generation
+                })
+            else {
+                continue;
+            };
+            if let Some(session_id) = event.session_id.as_ref() {
+                for target in self
+                    .projects
+                    .iter()
+                    .flat_map(|project| &project.sessions)
+                    .flat_map(|session| &session.panes)
+                    .filter(|pane| {
+                        pane.id != source.id
+                            && pane.native_session_id.as_ref() == Some(session_id)
+                            && pane.native_session_reporter.as_deref()
+                                == Some(event.reporter.as_str())
+                    })
+                {
+                    let mut fanout = event.clone();
+                    fanout.pane_id = target.id as u64;
+                    fanout.pane_generation = target.generation.clone();
+                    fanout.reporter_generation = format!("session-route:{session_id}");
+                    fanout.sequence = FANOUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                    routed.push((fanout, true));
+                }
+            }
+            routed.push((event, false));
+        }
+        for (event, is_routed) in routed {
+            if event.app_id != bus.app_id {
+                continue;
+            }
+            let Some(&(project_idx, session_idx, pane_idx)) =
+                self.pane_index.get(&(event.pane_id as usize))
+            else {
+                continue;
+            };
+            let Some(pane) = self
+                .projects
+                .get_mut(project_idx)
+                .and_then(|p| p.sessions.get_mut(session_idx))
+                .and_then(|s| s.panes.get_mut(pane_idx))
+            else {
+                continue;
+            };
+            if pane.generation != event.pane_generation {
+                continue;
+            }
+            if event.event == "register" {
+                if let Some(session_id) = event.session_id.as_ref() {
+                    if pane
+                        .native_session_id
+                        .as_ref()
+                        .is_some_and(|old| old != session_id)
+                    {
+                        pane.native_status = None;
+                        pane.native_acknowledged = false;
+                        pane.pending_approvals.clear();
+                        pane.native_turn_id = None;
+                        pane.ack_screen = None;
+                        pane.poll_cache = None;
+                        pane.status = SessionStatus::Unknown;
+                    }
+                    pane.native_session_id = Some(session_id.clone());
+                    pane.native_session_reporter = Some(event.reporter.clone());
+                }
+            } else if let Some(session_id) = event.session_id.as_ref() {
+                match (
+                    pane.native_session_reporter.as_deref(),
+                    pane.native_session_id.as_ref(),
+                ) {
+                    (Some(reporter), _) if reporter != event.reporter => continue,
+                    (_, Some(current)) if current != session_id => continue,
+                    _ => {
+                        pane.native_session_id = Some(session_id.clone());
+                        pane.native_session_reporter = Some(event.reporter.clone());
+                    }
+                }
+            }
+
+            let source = if is_routed {
+                format!(
+                    "route:{}:{}",
+                    event.reporter,
+                    event.session_id.as_deref().unwrap_or("")
+                )
+            } else {
+                format!("{}:{}", event.reporter, event.reporter_generation)
+            };
+            if !is_routed {
+                let active_generation = pane.native_reporter_generation.get(&event.reporter);
+                if active_generation.is_some_and(|active| active != &event.reporter_generation) {
+                    if event.event != "register" {
+                        continue;
+                    }
+                    let prefix = format!("{}:", event.reporter);
+                    pane.native_sequence
+                        .retain(|key, _| !key.starts_with(&prefix));
+                }
+                pane.native_reporter_generation
+                    .insert(event.reporter.clone(), event.reporter_generation.clone());
+            }
+            if pane
+                .native_sequence
+                .get(&source)
+                .is_some_and(|previous| event.sequence <= *previous)
+            {
+                continue;
+            }
+            pane.native_sequence.insert(source, event.sequence);
+            let reporter_name = event.reporter.clone();
+            let event_name = event.event.clone();
+            if pane.native_acknowledged && matches!(event.event.as_str(), "done" | "error") {
+                continue;
+            }
+            if let Some(turn_id) = event.turn_id.as_ref() {
+                if pane
+                    .native_turn_id
+                    .as_ref()
+                    .is_some_and(|old| old != turn_id)
+                    && matches!(event.event.as_str(), "working" | "blocked")
+                {
+                    pane.pending_approvals.clear();
+                    pane.native_status = None;
+                    pane.ack_screen = None;
+                }
+                pane.native_turn_id = Some(turn_id.clone());
+            }
+            let next = match event.event.as_str() {
+                "register" | "heartbeat" => None,
+                "idle" => Some(latch_completion(
+                    pane.native_status.unwrap_or(pane.status),
+                    SessionStatus::Idle,
+                )),
+                "working" => {
+                    pane.native_acknowledged = false;
+                    pane.pending_approvals.clear();
+                    Some(SessionStatus::Working)
+                }
+                "blocked" => {
+                    pane.native_acknowledged = false;
+                    pane.pending_approvals
+                        .insert(event.approval_id.unwrap_or_else(|| "__single__".into()));
+                    Some(SessionStatus::Blocked)
+                }
+                "approval_resolved" => {
+                    if let Some(id) = event.approval_id {
+                        if !pane.pending_approvals.remove(&id) && pane.pending_approvals.len() == 1
+                        {
+                            pane.pending_approvals.clear();
+                        }
+                    } else if pane.pending_approvals.len() == 1 {
+                        pane.pending_approvals.clear();
+                    }
+                    Some(if pane.pending_approvals.is_empty() {
+                        SessionStatus::Working
+                    } else {
+                        SessionStatus::Blocked
+                    })
+                }
+                "done" => {
+                    pane.pending_approvals.clear();
+                    Some(SessionStatus::Done)
+                }
+                "error" => {
+                    pane.pending_approvals.clear();
+                    Some(SessionStatus::Error)
+                }
+                "clear" | "cancelled" => {
+                    pane.pending_approvals.clear();
+                    pane.native_status = None;
+                    pane.native_acknowledged = true;
+                    pane.osc_report_active = false;
+                    pane.terminal
+                        .update(cx, |terminal, _| terminal.clear_agent_status_reports());
+                    pane.status = SessionStatus::Unknown;
+                    pane.ack_screen = None;
+                    pane.poll_cache = None;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(next) = next {
+                pane.native_status = Some(next);
+                pane.status = next;
+                pane.detection = status::DetectionResult::new(
+                    next,
+                    status::EvidenceSource::AgentReport,
+                    status::Confidence::High,
+                );
+                if matches!(next, SessionStatus::Working | SessionStatus::Blocked) {
+                    pane.ack_screen = None;
+                }
+                pane.poll_cache = None;
+            }
+            self.integration_feedback =
+                SharedString::from(format!("Live reporting from {reporter_name}: {event_name}"));
+        }
+        cx.notify();
+    }
+
     /// Read `/proc` for every pane on the calling thread. The app loop uses
     /// [`Self::poll_sessions_status_with`] and gathers these on the background
     /// executor instead, so the blocking reads never sit in a frame.
@@ -516,6 +950,8 @@ impl AppState {
         foregrounds: &HashMap<u32, Arc<[String]>>,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(unix)]
+        self.apply_status_events(status_bus::drain(), cx);
         let diag_poll = diagnostics::poll_start();
         let mut changed = false;
         let mut panes_polled = 0u64;
@@ -523,6 +959,7 @@ impl AppState {
         // `T3_STATUS_DEBUG=1` dumps every detection pass: the facts that went in
         // and the badge that came out. Without this the poller is invisible.
         let debug = status::debug_enabled();
+        let trace = status::trace_enabled();
         for project in &mut self.projects {
             for session in &mut project.sessions {
                 let default_primary_id = session.pane_tree.as_ref().map(|t| t.first_leaf());
@@ -541,12 +978,11 @@ impl AppState {
                         .pid
                         .and_then(|pid| foregrounds.get(&pid))
                         .cloned()
-                        .unwrap_or_else(status::empty_foreground_names);
+                        .unwrap_or_else(status::unknown_foreground_names);
 
                     // The pane the session badge/title follows: the focused
                     // pane, else the first pane of the screen.
-                    let is_default_primary =
-                        Some(pane.id) == default_primary_id || pane_count == 1;
+                    let is_default_primary = Some(pane.id) == default_primary_id || pane_count == 1;
                     if focused || (is_default_primary && !primary_focused) {
                         primary_focused = focused;
                         primary_idx = Some(pane_idx);
@@ -589,10 +1025,72 @@ impl AppState {
                     // The foreground snapshot is compared by pointer: the /proc
                     // cache returns the same allocation while the group is
                     // unchanged, so this is a load and a compare.
-                    let (screen_revision, exited) = {
+                    let (screen_revision, exited, mut agent_report, osc_progress) = {
                         let terminal = pane.terminal.read(cx);
-                        (terminal.screen_revision(), terminal.has_exited())
+                        (
+                            terminal.screen_revision(),
+                            terminal.has_exited(),
+                            terminal.agent_status_report(),
+                            terminal.osc_progress().to_owned(),
+                        )
                     };
+                    let report_was_cleared = agent_report.is_none() && pane.osc_report_active;
+                    pane.osc_report_active = agent_report.is_some();
+                    if report_was_cleared {
+                        pane.status = SessionStatus::Idle;
+                        pane.detection = status::DetectionResult::new(
+                            SessionStatus::Idle,
+                            status::EvidenceSource::NoSignal,
+                            status::Confidence::None,
+                        );
+                        pane.ack_screen = None;
+                        pane.native_status = None;
+                        pane.native_acknowledged = true;
+                        pane.pending_approvals.clear();
+                        pane.osc_report_active = false;
+                    }
+                    let foreground_changed =
+                        pane.poll_cache
+                            .as_ref()
+                            .is_some_and(|(_, _, _, old_foreground)| {
+                                !Arc::ptr_eq(old_foreground, &foreground)
+                            });
+                    let new_foreground_job =
+                        pane.poll_cache.as_ref().is_some_and(|(_, _, _, old)| {
+                            foreground_changed
+                                && !foreground.is_empty()
+                                && !Arc::ptr_eq(&foreground, &status::unknown_foreground_names())
+                                && !Arc::ptr_eq(old, &status::unknown_foreground_names())
+                        });
+                    if foreground_changed && new_foreground_job && !foreground.is_empty() {
+                        pane.native_acknowledged = false;
+                        pane.ack_screen = None;
+                        if matches!(pane.status, SessionStatus::Done | SessionStatus::Error) {
+                            // A new command invalidates a completed job's badge.
+                            pane.status = SessionStatus::Idle;
+                            pane.detection = status::DetectionResult::new(
+                                SessionStatus::Idle,
+                                status::EvidenceSource::NoSignal,
+                                status::Confidence::None,
+                            );
+                            pane.native_status = None;
+                            pane.pending_approvals.clear();
+                            if agent_report.as_ref().is_some_and(|report| {
+                                matches!(
+                                    report.state,
+                                    gpui_terminal::AgentReportState::Done
+                                        | gpui_terminal::AgentReportState::Error
+                                        | gpui_terminal::AgentReportState::Idle
+                                )
+                            }) {
+                                pane.terminal.update(cx, |terminal, _| {
+                                    terminal.clear_agent_status_reports()
+                                });
+                                agent_report = None;
+                            }
+                            changed = true;
+                        }
+                    }
                     let unchanged = pane.poll_cache.as_ref().is_some_and(
                         |(revision, was_focused, was_exited, old_foreground)| {
                             *revision == screen_revision
@@ -604,31 +1102,19 @@ impl AppState {
                     // The grid only moved if the revision did; a focus or
                     // process-group change still needs a fresh verdict but can
                     // reuse the rows already in the scratch buffer.
-                    let screen_unchanged = pane.poll_cache.as_ref().is_some_and(
-                        |(revision, ..)| *revision == screen_revision,
-                    );
+                    let screen_unchanged = pane
+                        .poll_cache
+                        .as_ref()
+                        .is_some_and(|(revision, ..)| *revision == screen_revision);
                     if unchanged {
                         match pane.status {
-                            // A finished pane's badge only changes when it is
-                            // focused (in the cache key) or when the linger
-                            // timeout expires. Re-scraping the screen every
-                            // 500 ms for 30 s cannot change either.
-                            SessionStatus::Done => {
-                                let since = *pane
-                                    .done_since
-                                    .get_or_insert_with(std::time::Instant::now);
-                                if since.elapsed() >= DONE_LINGER {
-                                    pane.done_since = None;
-                                    pane.status = SessionStatus::Idle;
-                                    changed = true;
-                                }
-                                continue;
-                            }
+                            // A finished pane stays latched until new evidence.
+                            SessionStatus::Done => continue,
                             // Working panes still need the detector's idle
                             // transition, but the grid did not move since the
                             // last scrape: reuse the cached rows instead of
                             // re-extracting and re-allocating the screen.
-                            SessionStatus::Working => {}
+                            SessionStatus::Working | SessionStatus::Unknown => {}
                             _ => continue,
                         }
                     }
@@ -647,13 +1133,13 @@ impl AppState {
 
                     let screen_fp = {
                         let terminal = pane.terminal.read(cx);
-                        screen_fingerprint(
-                            &pane.screen_scratch,
-                            terminal.title().unwrap_or(""),
-                        )
+                        screen_fingerprint(&pane.screen_scratch, terminal.title().unwrap_or(""))
                     };
                     let poll_key = (screen_revision, focused, exited, Arc::clone(&foreground));
 
+                    let mut matched_agent_rule = false;
+                    let mut matched_agent_idle = false;
+                    let mut reported_agent_state = false;
                     let (next, ack) = {
                         let diag_detect = diagnostics::detect_start();
                         let terminal = pane.terminal.read(cx);
@@ -667,15 +1153,8 @@ impl AppState {
                         );
                         // while the screen is unchanged the sticky badge stays
                         // cleared; new output re-arms it.
-                        let ack = if focused
-                            && (terminal.has_exited()
-                                || matches!(pane.status, SessionStatus::Done | SessionStatus::Error))
-                        {
-                            Some(screen_fp)
-                        } else {
-                            pane.ack_screen
-                        };
-                        let acknowledged = ack == Some(screen_fp);
+                        let ack = pane.ack_screen;
+                        let acknowledged = ack == Some(screen_fp) || pane.native_acknowledged;
 
                         // The agent rule match behind this tick's verdict, for the
                         // debug dump. The live path below captures it for free;
@@ -691,6 +1170,7 @@ impl AppState {
                                     title: Some(title),
                                     foreground: &foreground,
                                     detector_state: Some(detector_state),
+                                    osc_progress: &osc_progress,
                                 });
                             }
                             if acknowledged {
@@ -701,12 +1181,31 @@ impl AppState {
                                     Some(_) => SessionStatus::Error,
                                 }
                             }
+                        } else if let Some(native) = pane.native_status {
+                            reported_agent_state = true;
+                            native
+                        } else if let Some(report) = &agent_report {
+                            reported_agent_state = true;
+                            match report.state {
+                                gpui_terminal::AgentReportState::Idle => {
+                                    if focused {
+                                        SessionStatus::Active
+                                    } else {
+                                        SessionStatus::Idle
+                                    }
+                                }
+                                gpui_terminal::AgentReportState::Working => SessionStatus::Working,
+                                gpui_terminal::AgentReportState::Done => SessionStatus::Done,
+                                gpui_terminal::AgentReportState::Blocked => SessionStatus::Blocked,
+                                gpui_terminal::AgentReportState::Error => SessionStatus::Error,
+                            }
                         } else {
                             let input = StatusInput {
                                 lines: bottom_lines,
                                 title: Some(title),
                                 foreground: &foreground,
                                 detector_state: Some(detector_state),
+                                osc_progress: &osc_progress,
                             };
                             // The match is already computed by detection, so the
                             // debug dump can use it without a second evaluation.
@@ -716,6 +1215,11 @@ impl AppState {
                                 pane.status,
                                 focused,
                             );
+                            matched_agent_rule = rule_match.is_some();
+                            matched_agent_idle = rule_match.as_ref().is_some_and(|matched| {
+                                matched.state == agent_rules::RuleState::Idle
+                                    && !matched.skip_state_update
+                            });
                             if !debug {
                                 debug_match = None;
                             } else {
@@ -735,17 +1239,16 @@ impl AppState {
                         };
 
                         if debug {
-                            let rule = debug_match
-                                .as_ref()
-                                .map_or_else(
+                            let rule = debug_match.as_ref().map_or_else(
                                 || "(no rule)".to_string(),
                                 |m| {
                                     format!(
-                                        "{}/{} v{} state={} priority={} region={} \
+                                        "{}/{} v{} source={} state={} priority={} region={} \
                                          visible(working/blocker/idle)={}/{}/{} skip_update={}",
                                         m.pack,
                                         m.rule,
                                         m.pack_version.as_deref().unwrap_or("?"),
+                                        m.source,
                                         m.state.label(),
                                         m.priority,
                                         m.region,
@@ -756,10 +1259,32 @@ impl AppState {
                                     )
                                 },
                             );
+                            let evidence = if terminal.has_exited() {
+                                "process-exit"
+                            } else if reported_agent_state {
+                                "agent-report"
+                            } else if matched_agent_rule {
+                                "agent-rule"
+                            } else if matches!(
+                                next,
+                                SessionStatus::Blocked
+                                    | SessionStatus::Error
+                                    | SessionStatus::Working
+                            ) {
+                                "screen-heuristic"
+                            } else if !foreground.is_empty() {
+                                "foreground-process"
+                            } else {
+                                "no-signal"
+                            };
+                            let report_state = agent_report
+                                .as_ref()
+                                .map(|report| format!("{:?}", report.state));
                             eprintln!(
                                 "[status] pane={} focused={focused} exited={} exit={:?} \
                                  pid={:?} fg={foreground:?} pack={:?} title={title:?} \
-                                 prev={} next={} detector={detector_state:?} rule={rule}",
+                                 prev={} next={} detector={detector_state:?} evidence={evidence} \
+                                 report_state={report_state:?} rule={rule}",
                                 pane.id,
                                 terminal.has_exited(),
                                 terminal.exit_status(),
@@ -783,54 +1308,88 @@ impl AppState {
                         (next, ack)
                     };
 
-                    // Agent lifecycle. Two ways a task counts as finished, because
-                    // an agent CLI keeps running after it answers:
-                    //
-                    //  * the CLI itself exited (agent gone), or
-                    //  * it stopped working and is back at rest (the response is
-                    //    complete) — the usual case, and the one exit codes can
-                    //    never catch, since the PTY child is the persistent shell.
-                    //
-                    // Either way the completion is reported as Done: herdr's "the
-                    // agent finished and you have not looked at it yet". Reporting
-                    // it only while unfocused is deliberate — a badge is for the
-                    // tab you are *not* on.
+                    // A done badge needs a recognized agent to have been working
+                    // and then either exit or return to its explicit idle rule.
+                    // Merely having a quiet foreground process is not completion.
                     let agent_now = foreground.iter().any(|name| status::is_agent_process(name));
-                    let agent_exited = pane.agent_active && !agent_now;
-                    pane.agent_active = agent_now;
+                    let process_state_unavailable = foreground
+                        .iter()
+                        .any(|name| name == "<process-state-unavailable>");
+                    let agent_exited =
+                        pane.agent_active && !agent_now && !process_state_unavailable;
+                    if !process_state_unavailable {
+                        pane.agent_active = agent_now;
+                    }
 
-                    let turn_finished = matches!(
-                        pane.status,
-                        SessionStatus::Working | SessionStatus::Blocked
-                    ) && next == SessionStatus::Idle;
-
-                    let just_finished = agent_exited || turn_finished;
+                    let turn_finished = !reported_agent_state
+                        && pane.status == SessionStatus::Working
+                        && (matched_agent_idle || agent_exited)
+                        && matches!(next, SessionStatus::Idle | SessionStatus::Active)
+                        && (agent_now || agent_exited);
+                    let just_finished = turn_finished;
                     let next = if just_finished
-                        && next == SessionStatus::Idle
+                        && matches!(next, SessionStatus::Idle | SessionStatus::Active)
                         && ack != Some(screen_fp)
-                        && !focused
                     {
                         SessionStatus::Done
                     } else {
                         next
                     };
+                    if matches!(next, SessionStatus::Working | SessionStatus::Blocked) {
+                        pane.native_acknowledged = false;
+                    }
 
-                    // Spec: Done also drops back to Idle after a short timeout even
-                    // if the user never focuses the terminal.
-                    let next = if next == SessionStatus::Done {
-                        let since = *pane.done_since.get_or_insert_with(std::time::Instant::now);
-                        if since.elapsed() >= DONE_LINGER {
-                            pane.done_since = None;
-                            SessionStatus::Idle
-                        } else {
-                            next
-                        }
-                    } else {
-                        pane.done_since = None;
-                        next
-                    };
+                    // Keep the result visible across focus changes and trailing
+                    // idle reports. A new working/blocked state, foreground job,
+                    // or explicit clear starts a new lifecycle.
+                    let next = latch_completion(pane.status, next);
 
                     pane.ack_screen = ack;
+                    let evidence = if exited {
+                        (
+                            status::EvidenceSource::ProcessExit,
+                            status::Confidence::High,
+                        )
+                    } else if reported_agent_state {
+                        (
+                            status::EvidenceSource::AgentReport,
+                            status::Confidence::High,
+                        )
+                    } else if matched_agent_rule {
+                        (status::EvidenceSource::AgentRule, status::Confidence::High)
+                    } else if agent_exited {
+                        (
+                            status::EvidenceSource::AgentLifecycle,
+                            status::Confidence::High,
+                        )
+                    } else if matches!(
+                        next,
+                        SessionStatus::Blocked | SessionStatus::Error | SessionStatus::Working
+                    ) {
+                        (
+                            status::EvidenceSource::ScreenHeuristic,
+                            status::Confidence::Low,
+                        )
+                    } else if next == SessionStatus::Unknown && !foreground.is_empty() {
+                        (
+                            status::EvidenceSource::ForegroundProcess,
+                            status::Confidence::Low,
+                        )
+                    } else {
+                        (status::EvidenceSource::NoSignal, status::Confidence::None)
+                    };
+                    let previous_status = pane.status;
+                    pane.detection = status::DetectionResult::new(next, evidence.0, evidence.1);
+                    if trace && previous_status != next {
+                        eprintln!(
+                            "[status-trace] pane={} {} -> {} evidence={:?} confidence={:?}",
+                            pane.id,
+                            previous_status.label(),
+                            next.label(),
+                            evidence.0,
+                            evidence.1
+                        );
+                    }
                     if pane.status != next {
                         pane.status = next;
                         changed = true;
@@ -876,6 +1435,75 @@ impl AppState {
                     }
                 }
             }
+        }
+        #[cfg(unix)]
+        if let Some(bus) = STATUS_BUS.as_ref()
+            && status_snapshot_due()
+        {
+            let paths: Vec<_> = self
+                .projects
+                .iter()
+                .flat_map(|project| &project.sessions)
+                .flat_map(|session| &session.panes)
+                .map(|pane| {
+                    let (evidence, confidence) =
+                        match (pane.detection.evidence, pane.detection.confidence) {
+                            (status::EvidenceSource::ProcessExit, status::Confidence::High) => {
+                                ("process-exit", "high")
+                            }
+                            (status::EvidenceSource::AgentReport, status::Confidence::High) => {
+                                ("agent-report", "high")
+                            }
+                            (status::EvidenceSource::AgentRule, status::Confidence::High) => {
+                                ("agent-rule", "high")
+                            }
+                            (status::EvidenceSource::AgentLifecycle, status::Confidence::High) => {
+                                ("agent-lifecycle", "high")
+                            }
+                            (status::EvidenceSource::TerminalProgress, _) => {
+                                ("terminal-progress", "medium")
+                            }
+                            (status::EvidenceSource::ScreenHeuristic, _) => {
+                                ("screen-heuristic", "low")
+                            }
+                            (status::EvidenceSource::ForegroundProcess, _) => {
+                                ("foreground-process", "low")
+                            }
+                            _ => ("no-signal", "none"),
+                        };
+                    let snapshot = status_bus::StatusSnapshot {
+                        version: 1,
+                        app_id: bus.app_id.clone(),
+                        pane_id: pane.id as u64,
+                        pane_generation: pane.generation.clone(),
+                        state: pane.status.label().into(),
+                        evidence: evidence.into(),
+                        confidence: confidence.into(),
+                        reporter: pane.native_session_reporter.clone(),
+                        updated_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis(),
+                    };
+                    (
+                        status_bus::snapshot_path(bus, pane.id, &pane.generation),
+                        snapshot,
+                    )
+                })
+                .collect();
+            cx.background_executor()
+                .spawn(async move {
+                    for (path, snapshot) in paths {
+                        let Ok(bytes) = serde_json::to_vec(&snapshot) else {
+                            continue;
+                        };
+                        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+                        if std::fs::write(&temp, bytes).is_ok() {
+                            let _ = std::fs::rename(temp, path);
+                        }
+                    }
+                })
+                .detach();
         }
         diagnostics::panes_polled(panes_polled);
         diagnostics::poll_end(diag_poll);
@@ -938,13 +1566,9 @@ impl AppState {
         let Some(dir) = self.projects.get(project_idx).map(|p| p.path.clone()) else {
             return;
         };
-        if let Ok((terminal, pid)) = Self::spawn_terminal_view(
-            Some(&dir),
-            self.palette.clone(),
-            self_weak,
-            next_id,
-            cx,
-        ) {
+        if let Ok((terminal, pid, generation)) =
+            Self::spawn_terminal_view(Some(&dir), self.palette.clone(), self_weak, next_id, cx)
+        {
             terminal.read(cx).focus_handle().focus(window);
             let session_count = self
                 .projects
@@ -954,8 +1578,23 @@ impl AppState {
             let title = SharedString::from(format!("terminal {}", session_count + 1));
             let pane = TerminalPane {
                 id: next_id,
+                generation,
+                native_session_id: None,
+                native_session_reporter: None,
+                native_turn_id: None,
+                native_sequence: HashMap::new(),
+                native_reporter_generation: HashMap::new(),
+                pending_approvals: std::collections::HashSet::new(),
+                native_status: None,
+                native_acknowledged: false,
+                osc_report_active: false,
                 terminal,
                 status: SessionStatus::Idle,
+                detection: status::DetectionResult::new(
+                    SessionStatus::Idle,
+                    status::EvidenceSource::NoSignal,
+                    status::Confidence::None,
+                ),
                 title: title.to_string(),
                 display_title: truncate_title(&title),
                 pid,
@@ -963,7 +1602,6 @@ impl AppState {
                 poll_cache: None,
                 ack_screen: None,
                 agent_active: false,
-                done_since: None,
                 detector: status::Detector::default(),
             };
             let session = Session {
@@ -1057,12 +1695,7 @@ impl AppState {
 
     /// Close a whole project. Its sessions and PTYs go away; the remaining
     /// projects (and their sessions) are left exactly as they were.
-    fn close_project(
-        &mut self,
-        project_idx: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn close_project(&mut self, project_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if project_idx >= self.projects.len() {
             return;
         }
@@ -1093,12 +1726,7 @@ impl AppState {
     /// Open a folder as a project. Opening a folder that is already in the
     /// sidebar focuses that project (and revives it if it has no sessions)
     /// rather than creating a duplicate.
-    fn open_project_path(
-        &mut self,
-        folder: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_project_path(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(existing) = self.projects.iter().position(|p| p.path == folder) {
             if self.projects[existing].sessions.is_empty() {
                 self.create_new_session_in_project(existing, window, cx);
@@ -1117,19 +1745,30 @@ impl AppState {
         let next_id = self.next_id;
         self.next_id += 1;
 
-        if let Ok((terminal, pid)) = Self::spawn_terminal_view(
-            Some(&folder),
-            self.palette.clone(),
-            self_weak,
-            next_id,
-            cx,
-        ) {
+        if let Ok((terminal, pid, generation)) =
+            Self::spawn_terminal_view(Some(&folder), self.palette.clone(), self_weak, next_id, cx)
+        {
             terminal.read(cx).focus_handle().focus(window);
             let title = SharedString::from("terminal 1");
             let pane = TerminalPane {
                 id: next_id,
+                generation,
+                native_session_id: None,
+                native_session_reporter: None,
+                native_turn_id: None,
+                native_sequence: HashMap::new(),
+                native_reporter_generation: HashMap::new(),
+                pending_approvals: std::collections::HashSet::new(),
+                native_status: None,
+                native_acknowledged: false,
+                osc_report_active: false,
                 terminal,
                 status: SessionStatus::Idle,
+                detection: status::DetectionResult::new(
+                    SessionStatus::Idle,
+                    status::EvidenceSource::NoSignal,
+                    status::Confidence::None,
+                ),
                 title: title.to_string(),
                 display_title: title.clone(),
                 pid,
@@ -1137,7 +1776,6 @@ impl AppState {
                 poll_cache: None,
                 ack_screen: None,
                 agent_active: false,
-                done_since: None,
                 detector: status::Detector::default(),
             };
             let session = Session {
@@ -1213,19 +1851,30 @@ impl AppState {
             .and_then(|p| p.sessions.get(s_idx))
             .map(|s| s.panes.len())
             .unwrap_or(0);
-        if let Ok((terminal, pid)) = Self::spawn_terminal_view(
-            dir.as_ref(),
-            self.palette.clone(),
-            self_weak,
-            next_id,
-            cx,
-        ) {
+        if let Ok((terminal, pid, generation)) =
+            Self::spawn_terminal_view(dir.as_ref(), self.palette.clone(), self_weak, next_id, cx)
+        {
             terminal.read(cx).focus_handle().focus(window);
             let title = SharedString::from(format!("terminal {}", pane_count + 1));
             let pane = TerminalPane {
                 id: next_id,
+                generation,
+                native_session_id: None,
+                native_session_reporter: None,
+                native_turn_id: None,
+                native_sequence: HashMap::new(),
+                native_reporter_generation: HashMap::new(),
+                pending_approvals: std::collections::HashSet::new(),
+                native_status: None,
+                native_acknowledged: false,
+                osc_report_active: false,
                 terminal,
                 status: SessionStatus::Idle,
+                detection: status::DetectionResult::new(
+                    SessionStatus::Idle,
+                    status::EvidenceSource::NoSignal,
+                    status::Confidence::None,
+                ),
                 title: title.to_string(),
                 display_title: truncate_title(&title),
                 pid,
@@ -1233,7 +1882,6 @@ impl AppState {
                 poll_cache: None,
                 ack_screen: None,
                 agent_active: false,
-                done_since: None,
                 detector: status::Detector::default(),
             };
 
@@ -1302,9 +1950,8 @@ impl AppState {
                 if project.sessions.is_empty() {
                     needs_new_session = true;
                 } else {
-                    project.active_session_idx = project
-                        .active_session_idx
-                        .min(project.sessions.len() - 1);
+                    project.active_session_idx =
+                        project.active_session_idx.min(project.sessions.len() - 1);
                 }
             } else if let Some(session) = project.sessions.get(s_idx) {
                 // Focus the surviving first pane of this screen.
@@ -1386,7 +2033,7 @@ impl AppState {
                     .child(
                         div()
                             .text_size(px(11.5))
-                            .text_color(rgba(0x656679ff))
+                            .text_color(rgba(0x918995ff))
                             .child(pane.display_title.clone()),
                     )
                     .child(
@@ -1408,14 +2055,19 @@ impl AppState {
                                         svg()
                                             .path("icons/split-vertical.svg")
                                             .size(px(13.0))
-                                            .text_color(rgba(0x8788a5ff))
+                                            .text_color(rgba(0x817987ff))
                                             .hover(|s| s.text_color(rgba(0xf0f6fcff))),
                                     )
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.split_pane(pane_id, gpui::Axis::Horizontal, window, cx);
+                                            this.split_pane(
+                                                pane_id,
+                                                gpui::Axis::Horizontal,
+                                                window,
+                                                cx,
+                                            );
                                         }),
                                     ),
                             )
@@ -1433,14 +2085,19 @@ impl AppState {
                                         svg()
                                             .path("icons/split-horizontal.svg")
                                             .size(px(13.0))
-                                            .text_color(rgba(0x8788a5ff))
+                                            .text_color(rgba(0x817987ff))
                                             .hover(|s| s.text_color(rgba(0xf0f6fcff))),
                                     )
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.split_pane(pane_id, gpui::Axis::Vertical, window, cx);
+                                            this.split_pane(
+                                                pane_id,
+                                                gpui::Axis::Vertical,
+                                                window,
+                                                cx,
+                                            );
                                         }),
                                     ),
                             )
@@ -1462,7 +2119,7 @@ impl AppState {
                                                 "icons/pane-maximize.svg"
                                             })
                                             .size(px(13.0))
-                                            .text_color(rgba(0x8788a5ff))
+                                            .text_color(rgba(0x817987ff))
                                             .hover(|s| s.text_color(rgba(0xf0f6fcff))),
                                     )
                                     .on_mouse_down(
@@ -1487,7 +2144,7 @@ impl AppState {
                                         svg()
                                             .path("icons/pane-close.svg")
                                             .size(px(13.0))
-                                            .text_color(rgba(0x8788a5ff))
+                                            .text_color(rgba(0x817987ff))
                                             .hover(|s| s.text_color(rgba(0xf87171ff))),
                                     )
                                     .on_mouse_down(
@@ -1525,7 +2182,12 @@ impl AppState {
                     div().into_any_element()
                 }
             }
-            PaneNode::Split { id, axis, left, right } => {
+            PaneNode::Split {
+                id,
+                axis,
+                left,
+                right,
+            } => {
                 let left_el = self.render_pane_node(left, session, is_maximized, cx);
                 let right_el = self.render_pane_node(right, session, is_maximized, cx);
                 let is_horizontal = *axis == gpui::Axis::Horizontal;
@@ -1534,27 +2196,47 @@ impl AppState {
                 if is_horizontal {
                     h_resizable(split_id)
                         .child(
-                            resizable_panel()
-                                .size_range(px(100.0)..px(3000.0))
-                                .child(div().flex().flex_col().size_full().p(px(2.0)).child(div().flex_1().size_full().child(left_el))),
+                            resizable_panel().size_range(px(100.0)..px(3000.0)).child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .size_full()
+                                    .p(px(2.0))
+                                    .child(div().flex_1().size_full().child(left_el)),
+                            ),
                         )
                         .child(
-                            resizable_panel()
-                                .size_range(px(100.0)..px(3000.0))
-                                .child(div().flex().flex_col().size_full().p(px(2.0)).child(div().flex_1().size_full().child(right_el))),
+                            resizable_panel().size_range(px(100.0)..px(3000.0)).child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .size_full()
+                                    .p(px(2.0))
+                                    .child(div().flex_1().size_full().child(right_el)),
+                            ),
                         )
                         .into_any_element()
                 } else {
                     v_resizable(split_id)
                         .child(
-                            resizable_panel()
-                                .size_range(px(70.0)..px(3000.0))
-                                .child(div().flex().flex_col().size_full().p(px(2.0)).child(div().flex_1().size_full().child(left_el))),
+                            resizable_panel().size_range(px(70.0)..px(3000.0)).child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .size_full()
+                                    .p(px(2.0))
+                                    .child(div().flex_1().size_full().child(left_el)),
+                            ),
                         )
                         .child(
-                            resizable_panel()
-                                .size_range(px(70.0)..px(3000.0))
-                                .child(div().flex().flex_col().size_full().p(px(2.0)).child(div().flex_1().size_full().child(right_el))),
+                            resizable_panel().size_range(px(70.0)..px(3000.0)).child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .size_full()
+                                    .p(px(2.0))
+                                    .child(div().flex_1().size_full().child(right_el)),
+                            ),
                         )
                         .into_any_element()
                 }
@@ -1626,11 +2308,14 @@ impl AppState {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgba(0x1b1c22ff))
+            .bg(linear_gradient(
+                180.0,
+                linear_color_stop(rgba(0xe5def4ff), 0.0),
+                linear_color_stop(rgba(0xfbe3d1ff), 1.0),
+            ))
             .border_r_1()
-            .border_color(rgba(0x26272fff))
+            .border_color(rgba(0xd8cbd8ff))
             .child(self.render_sidebar_toolbar(cx))
-            .child(self.render_sidebar_projects_header(cx))
             .child(
                 div()
                     .flex_1()
@@ -1643,6 +2328,9 @@ impl AppState {
                         this.child(self.render_sidebar_empty_state(cx))
                     }),
             )
+            .when(self.integration_panel_visible, |this| {
+                this.child(self.render_integrations_panel(cx))
+            })
             .into_any_element()
     }
 
@@ -1686,35 +2374,60 @@ impl AppState {
                         cx.listener::<MouseDownEvent>(|this, _, window, cx| {
                             this.create_new_session_for_active_project(window, cx);
                         }),
+                    ))
+                    .child(sidebar_icon_button(
+                        "sidebar-integrations-btn",
+                        "icons/command.svg",
+                        15.0,
+                        cx.listener::<MouseDownEvent>(|this, _, _, cx| {
+                            this.integration_panel_visible = !this.integration_panel_visible;
+                            cx.notify();
+                        }),
                     )),
             )
     }
 
-    fn render_sidebar_projects_header(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_integrations_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let weak = cx.entity().downgrade();
         div()
             .w_full()
-            .h(px(28.0))
+            .px(px(12.0))
+            .py(px(10.0))
+            .border_t_1()
+            .border_color(rgba(0xd8cbd8ff))
             .flex()
-            .items_center()
-            .justify_between()
-            .pl(px(16.0))
-            .pr(px(10.0))
+            .flex_col()
+            .gap(px(7.0))
+            .child(div().text_size(px(12.0)).font_weight(gpui::FontWeight::BOLD).text_color(rgba(0x38333fff)).child("Agent integrations"))
+            .child(div().text_size(px(10.5)).text_color(rgba(0x746d7aff)).child("Claude Code · Codex · OpenCode · Pi · OMP · Command Code"))
+            .child(div().text_size(px(10.0)).text_color(rgba(0x746d7aff)).child("Versions and hook trust: markup integration doctor"))
+            .child(div().text_size(px(10.0)).text_color(rgba(0x746d7aff)).child(self.integration_feedback.clone()))
             .child(
                 div()
-                    .text_size(px(10.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgba(0x656679ff))
-                    .child("PROJECTS"),
+                    .id("enable-agent-integrations")
+                    .w_full().py(px(6.0)).rounded(px(6.0))
+                    .bg(rgba(0xffffffff)).hover(|s| s.bg(rgba(0xf4eff8ff)))
+                    .cursor(CursorStyle::PointingHand)
+                    .text_size(px(11.0)).text_color(rgba(0x38333fff))
+                    .flex().items_center().justify_center()
+                    .child("Enable local integrations")
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        let target = weak.clone();
+                        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                            let result = cx.background_executor().spawn(async move {
+                                std::env::current_exe().map_err(anyhow::Error::from).and_then(|exe| {
+                                    std::process::Command::new(exe).args(["integration", "setup"]).output().map_err(anyhow::Error::from)
+                                })
+                            }).await;
+                            let message = match result {
+                                Ok(output) if output.status.success() => "Installed. Restart each agent; Codex may also ask you to trust its hooks.".to_string(),
+                                Ok(output) => format!("Setup failed: {}", String::from_utf8_lossy(&output.stderr).trim()),
+                                Err(error) => format!("Setup failed: {error}"),
+                            };
+                            let _ = target.update(cx, |this, cx| { this.integration_feedback = SharedString::from(message); cx.notify(); });
+                        }).detach();
+                    }),
             )
-            .child(sidebar_text_button(
-                "sidebar-open-project-text-btn",
-                "Open project",
-                "icons/folder-plus.svg",
-                false,
-                cx.listener::<MouseDownEvent>(|this, _, window, cx| {
-                    this.select_folder_and_add_project(window, cx);
-                }),
-            ))
     }
 
     /// One collapsible project block: the project header (activate, expand,
@@ -1727,6 +2440,11 @@ impl AppState {
     ) -> gpui::AnyElement {
         let is_active_project = project_idx == self.active_project_idx;
         let session_count = project.sessions.len();
+        let needs_attention = project
+            .sessions
+            .iter()
+            .filter(|s| matches!(s.status, SessionStatus::Blocked | SessionStatus::Error))
+            .count();
         let chevron = if project.expanded {
             "icons/chevron-down.svg"
         } else {
@@ -1742,7 +2460,7 @@ impl AppState {
                         .pr(px(16.0))
                         .py(px(6.0))
                         .text_size(px(11.5))
-                        .text_color(rgba(0x656679ff))
+                        .text_color(rgba(0x918995ff))
                         .child("No sessions yet")
                         .into_any_element(),
                 );
@@ -1757,12 +2475,12 @@ impl AppState {
                     cx,
                 ));
             }
-            rows.push(self.render_new_session_row(project_idx, project.id, cx));
         }
 
         div()
             .flex()
             .flex_col()
+            .mb(px(18.0))
             .child(
                 div()
                     .id(("project-row", project.id))
@@ -1777,12 +2495,8 @@ impl AppState {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .bg(if is_active_project {
-                        rgba(0x26272fff)
-                    } else {
-                        rgba(0x00000000)
-                    })
-                    .hover(|s| s.bg(rgba(0x23242cff)))
+                    .bg(rgba(0x00000000))
+                    .hover(|s| s.bg(rgba(0xffffff55)))
                     .child(
                         div()
                             .id(("project-chevron", project.id))
@@ -1791,12 +2505,12 @@ impl AppState {
                             .items_center()
                             .justify_center()
                             .rounded(px(3.0))
-                            .hover(|s| s.bg(rgba(0x32333eff)))
+                            .hover(|s| s.bg(rgba(0xffffff66)))
                             .child(
                                 svg()
                                     .path(chevron)
                                     .size(px(12.0))
-                                    .text_color(rgba(0x8788a5ff)),
+                                    .text_color(rgba(0x817987ff)),
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -1807,26 +2521,15 @@ impl AppState {
                             ),
                     )
                     .child(
-                        svg()
-                            .path("icons/folder.svg")
-                            .size(px(14.0))
-                            .text_color(if is_active_project {
-                                rgba(0xc3c1eeff)
-                            } else {
-                                rgba(0x8788a5ff)
-                            }),
-                    )
-                    .child(
                         div()
-                            .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_size(px(12.5))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(if is_active_project {
-                                rgba(0xe6edf3ff)
+                                rgba(0x625b69ff)
                             } else {
-                                rgba(0xb9bac9ff)
+                                rgba(0x77707dff)
                             })
                             .child(project.name.clone()),
                     )
@@ -1834,9 +2537,19 @@ impl AppState {
                         div()
                             .flex_shrink_0()
                             .text_size(px(10.5))
-                            .text_color(rgba(0x656679ff))
+                            .text_color(rgba(0x918995ff))
                             .child(format!("{session_count}")),
                     )
+                    .child(div().flex_1())
+                    .when(needs_attention > 0, |this| {
+                        this.child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgba(0xb7782fff))
+                                .child(format!("{needs_attention} needs you")),
+                        )
+                    })
                     .child(sidebar_icon_button(
                         ("project-new-session", project.id),
                         "icons/plus.svg",
@@ -1876,132 +2589,234 @@ impl AppState {
         is_active_session: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let (dot_color, text_color, badge_bg) = session.status.colors();
-        let display_status = match session.status {
-            SessionStatus::Active => "Active",
-            SessionStatus::Idle => "Idle",
-            SessionStatus::Working => "Working",
-            SessionStatus::Blocked => "Blocked",
-            SessionStatus::Error => "Error",
-            SessionStatus::Done => "Done",
+        let selected_evidence = session
+            .panes
+            .iter()
+            .max_by_key(|pane| pane.status.rank())
+            .map(|pane| {
+                format!(
+                    "{} — {:?} evidence, {:?} confidence",
+                    pane.status.label(),
+                    pane.detection.evidence,
+                    pane.detection.confidence
+                )
+            })
+            .unwrap_or_else(|| format!("{} — no pane evidence", session.status.label()));
+        let indicator = match session.status {
+            SessionStatus::Working => gpui_component::Icon::new(gpui_component::IconName::Loader)
+                .size(px(16.0))
+                .text_color(rgba(0x625b69ff))
+                .with_animation(
+                    ("session-spinner", session.id),
+                    Animation::new(std::time::Duration::from_millis(900)).repeat(),
+                    |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+                )
+                .into_any_element(),
+            SessionStatus::Done => div()
+                .id(("session-status-ack", session.id))
+                .size(px(19.0))
+                .rounded_full()
+                .bg(rgba(0x43b976dd))
+                .border_1()
+                .border_color(rgba(0xc1f7d8ff))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor(CursorStyle::PointingHand)
+                .tooltip(|_, cx| {
+                    cx.new(|_| {
+                        gpui_component::tooltip::Tooltip::new(SharedString::from(
+                            "Clear completed status",
+                        ))
+                    })
+                    .into()
+                })
+                .child(
+                    svg()
+                        .path("icons/status-check.svg")
+                        .size(px(12.0))
+                        .text_color(rgba(0xffffffff)),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(session) = this
+                            .projects
+                            .get_mut(project_idx)
+                            .and_then(|project| project.sessions.get_mut(session_idx))
+                        {
+                            for pane in &mut session.panes {
+                                if matches!(pane.status, SessionStatus::Done | SessionStatus::Error)
+                                {
+                                    pane.status = SessionStatus::Idle;
+                                    pane.native_status = None;
+                                    pane.native_acknowledged = true;
+                                    pane.ack_screen =
+                                        Some(screen_fingerprint(&pane.screen_scratch, &pane.title));
+                                    pane.osc_report_active = false;
+                                    pane.pending_approvals.clear();
+                                    pane.poll_cache = None;
+                                    pane.detection = status::DetectionResult::new(
+                                        SessionStatus::Idle,
+                                        status::EvidenceSource::NoSignal,
+                                        status::Confidence::None,
+                                    );
+                                    pane.terminal.update(cx, |terminal, _| {
+                                        terminal.clear_agent_status_reports()
+                                    });
+                                }
+                            }
+                            session.status = session
+                                .panes
+                                .iter()
+                                .map(|pane| pane.status)
+                                .max_by_key(|status| status.rank())
+                                .unwrap_or(SessionStatus::Idle);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+            SessionStatus::Error => div()
+                .id(("session-error-ack", session.id))
+                .size(px(19.0))
+                .rounded_full()
+                .bg(rgba(0xf85149dd))
+                .border_1()
+                .border_color(rgba(0xffc7c4ff))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor(CursorStyle::PointingHand)
+                .tooltip(|_, cx| {
+                    cx.new(|_| {
+                        gpui_component::tooltip::Tooltip::new(SharedString::from(
+                            "Clear failed status",
+                        ))
+                    })
+                    .into()
+                })
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(rgba(0xffffffff))
+                        .child("!"),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(session) = this
+                            .projects
+                            .get_mut(project_idx)
+                            .and_then(|project| project.sessions.get_mut(session_idx))
+                        {
+                            for pane in &mut session.panes {
+                                if matches!(pane.status, SessionStatus::Done | SessionStatus::Error)
+                                {
+                                    pane.status = SessionStatus::Idle;
+                                    pane.native_status = None;
+                                    pane.native_acknowledged = true;
+                                    pane.ack_screen =
+                                        Some(screen_fingerprint(&pane.screen_scratch, &pane.title));
+                                    pane.osc_report_active = false;
+                                    pane.pending_approvals.clear();
+                                    pane.poll_cache = None;
+                                    pane.detection = status::DetectionResult::new(
+                                        SessionStatus::Idle,
+                                        status::EvidenceSource::NoSignal,
+                                        status::Confidence::None,
+                                    );
+                                    pane.terminal.update(cx, |terminal, _| {
+                                        terminal.clear_agent_status_reports()
+                                    });
+                                }
+                            }
+                            session.status = session
+                                .panes
+                                .iter()
+                                .map(|pane| pane.status)
+                                .max_by_key(|status| status.rank())
+                                .unwrap_or(SessionStatus::Idle);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+            SessionStatus::Blocked => div()
+                .size(px(19.0))
+                .rounded_full()
+                .bg(rgba(0xffedc9cc))
+                .border_1()
+                .border_color(rgba(0xc8873cff))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(div().size(px(7.0)).rounded_full().bg(rgba(0xc8873cff)))
+                .into_any_element(),
+            SessionStatus::Unknown => div()
+                .flex()
+                .items_center()
+                .text_size(px(10.0))
+                .text_color(rgba(0x777781ff))
+                .child("Unknown")
+                .into_any_element(),
+            SessionStatus::Active | SessionStatus::Idle => div().size(px(19.0)).into_any_element(),
         };
 
         div()
             .id(("session-item", session.id))
-            .ml(px(6.0))
-            .mr(px(6.0))
-            .h(px(34.0))
-            .pl(px(16.0))
-            .pr(px(5.0))
-            .rounded(px(6.0))
+            .mx(px(8.0))
+            .h(px(38.0))
+            .px(px(12.0))
+            .rounded(px(9.0))
             .cursor(CursorStyle::PointingHand)
+            .tooltip(move |_, cx| {
+                let text = selected_evidence.clone();
+                cx.new(|_| gpui_component::tooltip::Tooltip::new(SharedString::from(text)))
+                    .into()
+            })
             .flex()
             .items_center()
             .gap(px(8.0))
             .bg(if is_active_session {
-                rgba(0x2b2c37ff)
-            } else {
-                rgba(0x00000000)
-            })
-            .border_1()
-            .border_color(if is_active_session {
-                rgba(0x353645ff)
+                rgba(0xffffffed)
             } else {
                 rgba(0x00000000)
             })
             .hover(|s| {
-                if !is_active_session {
-                    s.bg(rgba(0x23242c88))
-                } else {
+                if is_active_session {
                     s
+                } else {
+                    s.bg(rgba(0xffffff66))
                 }
             })
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(9.0))
-                    .min_w_0()
                     .flex_1()
-                    .child(
-                        // AI Agent / Command logo with status indicator
-                        div()
-                            .relative()
-                            .size(px(20.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .flex_shrink_0()
-                            .child(
-                                gpui::img(session.logo.clone())
-                                    .size(px(18.0))
-                                    .rounded(px(3.5)),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .bottom(-px(1.0))
-                                    .right(-px(1.0))
-                                    .size(px(7.0))
-                                    .rounded_full()
-                                    .bg(rgba(dot_color))
-                                    .border_1()
-                                    .border_color(if is_active_session {
-                                        rgba(0x2b2c37ff)
-                                    } else {
-                                        rgba(0x1b1c22ff)
-                                    }),
-                            ),
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .font_weight(
+                        if matches!(
+                            session.status,
+                            SessionStatus::Blocked | SessionStatus::Error
+                        ) {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::MEDIUM
+                        },
                     )
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .truncate()
-                            .text_color(if is_active_session {
-                                rgba(0xd7d5f4ff)
-                            } else {
-                                rgba(0x8788a5ff)
-                            })
-                            .hover(|s| {
-                                if !is_active_session {
-                                    s.text_color(rgba(0xc3c1eeff))
-                                } else {
-                                    s
-                                }
-                            })
-                            .child(session.display_title.clone()),
-                    ),
+                    .text_color(rgba(0x343039ff))
+                    .child(session.display_title.clone()),
             )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .h(px(18.0))
-                    .px(px(6.0))
-                    .rounded_full()
-                    .bg(rgba(badge_bg))
-                    .border_1()
-                    .border_color(rgba((dot_color & 0xffffff00) | 0x33))
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .size(px(5.0))
-                            .rounded_full()
-                            .bg(rgba(dot_color)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgba(text_color))
-                            .child(display_status),
-                    ),
-            )
+            .child(indicator)
             .child(sidebar_icon_button(
                 ("session-close", session.id),
                 "icons/x.svg",
-                11.0,
+                10.0,
                 cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
                     this.close_session(project_idx, session_idx, window, cx);
                 }),
@@ -2010,46 +2825,6 @@ impl AppState {
                 MouseButton::Left,
                 cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
                     this.select_session(project_idx, session_idx, window, cx);
-                }),
-            )
-            .into_any_element()
-    }
-
-    /// A quiet "+ New session" row under each expanded project, so creating a
-    /// session never requires guessing which project is active.
-    fn render_new_session_row(
-        &self,
-        project_idx: usize,
-        project_id: usize,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        div()
-            .id(("project-new-session-row", project_id))
-            .ml(px(6.0))
-            .mr(px(6.0))
-            .mb(px(4.0))
-            .h(px(26.0))
-            .pl(px(17.0))
-            .pr(px(6.0))
-            .rounded(px(6.0))
-            .cursor(CursorStyle::PointingHand)
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .text_size(px(11.5))
-            .text_color(rgba(0x656679ff))
-            .hover(|s| s.bg(rgba(0x23242cff)).text_color(rgba(0xc3c1eeff)))
-            .child(
-                svg()
-                    .path("icons/plus.svg")
-                    .size(px(11.0))
-                    .text_color(rgba(0x656679ff)),
-            )
-            .child("New session")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
-                    this.create_new_session_in_project(project_idx, window, cx);
                 }),
             )
             .into_any_element()
@@ -2075,20 +2850,20 @@ impl AppState {
                         svg()
                             .path("icons/folder.svg")
                             .size(px(20.0))
-                            .text_color(rgba(0x8788a5ff)),
+                            .text_color(rgba(0x817987ff)),
                     ),
             )
             .child(
                 div()
                     .text_size(px(12.5))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgba(0xc3c1eeff))
+                    .text_color(rgba(0x625b69ff))
                     .child("No projects open"),
             )
             .child(
                 div()
                     .text_size(px(11.5))
-                    .text_color(rgba(0x656679ff))
+                    .text_color(rgba(0x918995ff))
                     .text_center()
                     .child("Open any folder to start a project with its own sessions."),
             )
@@ -2224,7 +2999,7 @@ fn sidebar_icon_button(
         .justify_center()
         .flex_shrink_0()
         .cursor(CursorStyle::PointingHand)
-        .hover(|s| s.bg(rgba(0x32333eff)))
+        .hover(|s| s.bg(rgba(0xffffff66)))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
@@ -2233,8 +3008,8 @@ fn sidebar_icon_button(
             svg()
                 .path(icon)
                 .size(px(icon_size))
-                .text_color(rgba(0x8788a5ff))
-                .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                .text_color(rgba(0x817987ff))
+                .hover(|s| s.text_color(rgba(0x343039ff))),
         )
 }
 
@@ -2265,7 +3040,7 @@ fn sidebar_text_button(
         .border_color(if primary {
             rgba(0x1f6febff)
         } else {
-            rgba(0x32333eff)
+            rgba(0xffffff66)
         })
         .hover(move |s| {
             if primary {
@@ -2274,12 +3049,7 @@ fn sidebar_text_button(
                 s.bg(rgba(0x2d2e38ff))
             }
         })
-        .child(
-            svg()
-                .path(icon)
-                .size(px(13.0))
-                .text_color(rgba(0xffffffff)),
-        )
+        .child(svg().path(icon).size(px(13.0)).text_color(rgba(0xffffffff)))
         .child(
             div()
                 .text_size(px(12.0))
@@ -2340,7 +3110,8 @@ impl Render for AppState {
             } else if let Some(tree) = &session.pane_tree {
                 self.render_pane_node(tree, session, false, cx)
             } else if let Some(pane) = session.panes.first() {
-                self.render_terminal_pane(pane, false, cx).into_any_element()
+                self.render_terminal_pane(pane, false, cx)
+                    .into_any_element()
             } else {
                 div().into_any_element()
             }
@@ -2494,11 +3265,7 @@ impl Render for AppState {
                                     .items_center()
                                     .justify_center()
                                     .flex_shrink_0()
-                                    .child(
-                                        gpui::img(logo)
-                                            .size(px(14.0))
-                                            .rounded(px(2.0)),
-                                    )
+                                    .child(gpui::img(logo).size(px(14.0)).rounded(px(2.0)))
                             }))
                             .child(format!("{active_project_name} — {active_title}"))
                             .children(titlebar_status.map(|status| {
@@ -2512,12 +3279,7 @@ impl Render for AppState {
                                     .rounded_sm()
                                     .bg(rgba(badge_bg))
                                     .text_color(rgba(text_color))
-                                    .child(
-                                        div()
-                                            .size(px(6.0))
-                                            .rounded_full()
-                                            .bg(rgba(dot_color)),
-                                    )
+                                    .child(div().size(px(6.0)).rounded_full().bg(rgba(dot_color)))
                                     .child(status.label())
                             })),
                     )
@@ -2543,33 +3305,31 @@ impl Render for AppState {
             .bg(rgba(0x14151bff))
             .text_color(rgba(0xe6edf3ff))
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(
-                if self.sidebar_visible {
-                    h_resizable("workspace-layout-panels")
-                        .on_resize({
-                            let app_state = cx.entity().downgrade();
-                            move |resize_state, _, app| {
-                                let width = resize_state.read(app).sizes().first().copied();
-                                if let Some(width) = width {
-                                    let _ = app_state.update(app, |state, cx| {
-                                        state.sidebar_width = width;
-                                        state.schedule_workspace_save(cx);
-                                    });
-                                }
+            .child(if self.sidebar_visible {
+                h_resizable("workspace-layout-panels")
+                    .on_resize({
+                        let app_state = cx.entity().downgrade();
+                        move |resize_state, _, app| {
+                            let width = resize_state.read(app).sizes().first().copied();
+                            if let Some(width) = width {
+                                let _ = app_state.update(app, |state, cx| {
+                                    state.sidebar_width = width;
+                                    state.schedule_workspace_save(cx);
+                                });
                             }
-                        })
-                        .child(
-                            resizable_panel()
-                                .size(self.sidebar_width)
-                                .size_range(px(200.0)..px(500.0))
-                                .child(sidebar_content),
-                        )
-                        .child(resizable_panel().child(terminal_content))
-                        .into_any_element()
-                } else {
-                    terminal_content.into_any_element()
-                },
-            );
+                        }
+                    })
+                    .child(
+                        resizable_panel()
+                            .size(self.sidebar_width)
+                            .size_range(px(200.0)..px(500.0))
+                            .child(sidebar_content),
+                    )
+                    .child(resizable_panel().child(terminal_content))
+                    .into_any_element()
+            } else {
+                terminal_content.into_any_element()
+            });
         diagnostics::render_end(diag_render);
         root
     }
@@ -2622,9 +3382,10 @@ fn load_github_dark_palette() -> ColorPalette {
     let theme_data = assets::AppAssets::get("themes/github.json");
     if let Some(file) = theme_data {
         if let Ok(Value::Array(themes)) = serde_json::from_slice::<Value>(&file.data) {
-            if let Some(github_dark) = themes.iter().find(|t| {
-                t.get("name").and_then(Value::as_str) == Some("GitHub Dark")
-            }) {
+            if let Some(github_dark) = themes
+                .iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some("GitHub Dark"))
+            {
                 let mut builder = ColorPalette::builder();
                 let style = github_dark.get("style").and_then(Value::as_object);
 
@@ -2785,8 +3546,34 @@ fn ensure_linux_desktop_entry() {
     let _ = std::fs::write(apps_dir.join("t3code-terminal.desktop"), t3_content);
 }
 
-
 fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("report") => return cli::run_report(&args.collect::<Vec<_>>()),
+        Some("skill") => return cli::run_skill(&args.collect::<Vec<_>>()),
+        Some("integration") => return integrations::run(&args.collect::<Vec<_>>()),
+        Some("status-hook") => return integrations::run_hook(&args.collect::<Vec<_>>()),
+        Some("status-event") => return cli::run_status_event(),
+        Some("status") => return cli::run_status(&args.collect::<Vec<_>>()),
+        Some("pane") => {
+            #[cfg(unix)]
+            return herdr_compat::run_cli(&args.collect::<Vec<_>>());
+            #[cfg(not(unix))]
+            anyhow::bail!("native reporting compatibility requires a Unix socket");
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "Usage: markup [report|skill|integration|status|status-event|status-hook]\nNative compatibility: markup pane <report-agent|report-agent-session|release-agent> ..."
+            );
+            return Ok(());
+        }
+        Some("--version" | "-V") => {
+            println!("markup {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(command) => anyhow::bail!("unsupported Markup command: {command}"),
+        None => {}
+    }
     Application::new()
         .with_assets(CombinedAssets)
         .run(|cx: &mut App| {
@@ -2813,21 +3600,40 @@ fn main() -> Result<()> {
                 },
                 |window, cx| {
                     let app_state = cx.new(|_| AppState {
-                        projects: Vec::new(), active_project_idx: 0, next_id: 1,
-                        session_index: HashMap::new(), pane_index: HashMap::new(), palette: palette.clone(),
-                        focused_pane_id: None, sidebar_visible: true, sidebar_width: px(330.0), drag_start_pos: None,
-                        persistence_path: persistence_path.clone(), save_generation: Arc::new(AtomicU64::new(0)), startup_loaded: false,
+                        projects: Vec::new(),
+                        active_project_idx: 0,
+                        next_id: 1,
+                        session_index: HashMap::new(),
+                        pane_index: HashMap::new(),
+                        palette: palette.clone(),
+                        focused_pane_id: None,
+                        sidebar_visible: true,
+                        integration_panel_visible: false,
+                        integration_feedback: SharedString::from("Setup is opt-in. Status becomes Reporting only after a live event arrives."),
+                        sidebar_width: px(330.0),
+                        drag_start_pos: None,
+                        persistence_path: persistence_path.clone(),
+                        save_generation: Arc::new(AtomicU64::new(0)),
+                        startup_loaded: false,
                         quit_subscription: None,
                     });
 
                     let weak_state = app_state.downgrade();
                     let load_path = persistence_path.clone();
                     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
-                        let saved = cx.background_executor().spawn(async move {
-                            load_path.as_deref().map(workspace_state::load).unwrap_or_default()
-                        }).await;
-                        let _ = weak_state.update(cx, |state, cx| state.apply_saved_workspace(saved, cx));
-                    }).detach();
+                        let saved = cx
+                            .background_executor()
+                            .spawn(async move {
+                                load_path
+                                    .as_deref()
+                                    .map(workspace_state::load)
+                                    .unwrap_or_default()
+                            })
+                            .await;
+                        let _ = weak_state
+                            .update(cx, |state, cx| state.apply_saved_workspace(saved, cx));
+                    })
+                    .detach();
 
                     let quit_path = persistence_path.clone();
                     app_state.update(cx, |state, cx| {
@@ -2838,7 +3644,15 @@ fn main() -> Result<()> {
                             let path = quit_path.clone();
                             let snapshot = state.saved_workspace();
                             cx.background_executor().spawn(async move {
-                                if let Some(path) = path { if let Err(error) = workspace_state::save_atomic(&path, &snapshot) { eprintln!("failed to save workspace state on quit: {error}"); } }
+                                if let Some(path) = path {
+                                    if let Err(error) =
+                                        workspace_state::save_atomic(&path, &snapshot)
+                                    {
+                                        eprintln!(
+                                            "failed to save workspace state on quit: {error}"
+                                        );
+                                    }
+                                }
                             })
                         }));
                     });
@@ -2854,8 +3668,7 @@ fn main() -> Result<()> {
                             // the result back on the UI thread. Nothing in this
                             // loop reads files or waits on I/O while a frame
                             // could be building.
-                            let Ok(pids) =
-                                app_state_weak.update(cx, |state, _| state.pane_pids())
+                            let Ok(pids) = app_state_weak.update(cx, |state, _| state.pane_pids())
                             else {
                                 break;
                             };
@@ -2964,7 +3777,7 @@ mod resize_tests {
     //! after every resize step.
 
     use super::*;
-    use gpui::{point, size, Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, point, size};
     use std::ops::Deref as _;
 
     /// One project with one live session, built exactly like `main` does.
@@ -2972,15 +3785,30 @@ mod resize_tests {
         let palette = ColorPalette::default();
         let dir = std::env::current_dir().expect("current dir");
         let weak = cx.entity().downgrade();
-        let (terminal, pid) =
+        let (terminal, pid, generation) =
             AppState::spawn_terminal_view(Some(&dir), palette.clone(), weak, 1, cx)
                 .expect("terminal view");
         let title = SharedString::from("terminal 1");
 
         let pane = TerminalPane {
             id: 1,
+            generation,
+            native_session_id: None,
+            native_session_reporter: None,
+            native_turn_id: None,
+            native_sequence: HashMap::new(),
+            native_reporter_generation: HashMap::new(),
+            pending_approvals: std::collections::HashSet::new(),
+            native_status: None,
+            native_acknowledged: false,
+            osc_report_active: false,
             terminal,
             status: SessionStatus::Idle,
+            detection: status::DetectionResult::new(
+                SessionStatus::Idle,
+                status::EvidenceSource::NoSignal,
+                status::Confidence::None,
+            ),
             title: "terminal 1".to_string(),
             display_title: title.clone(),
             pid,
@@ -2988,7 +3816,6 @@ mod resize_tests {
             poll_cache: None,
             ack_screen: None,
             agent_active: false,
-            done_since: None,
             detector: status::Detector::default(),
         };
 
@@ -3017,6 +3844,10 @@ mod resize_tests {
             palette,
             focused_pane_id: Some(1),
             sidebar_visible: true,
+            integration_panel_visible: false,
+            integration_feedback: SharedString::from(
+                "Setup is opt-in. Status becomes Reporting only after a live event arrives.",
+            ),
             sidebar_width: px(330.0),
             drag_start_pos: None,
             persistence_path: None,
@@ -3064,7 +3895,9 @@ mod resize_tests {
             .expect("headless renderer");
         let (mut cx, app_state) = open_app(&mut cx);
         let terminal = app_state.read_with(&cx, |state, _| {
-            state.active_session().expect("a session").panes[0].terminal.clone()
+            state.active_session().expect("a session").panes[0]
+                .terminal
+                .clone()
         });
 
         let mut grid_sizes = Vec::new();
@@ -3274,14 +4107,17 @@ mod xtgettcap_tests {
             screen.contains("before  after"),
             "query text leaked into the grid: {screen:?}"
         );
-        assert!(!capture.0.lock().is_empty(), "the query should have been answered");
+        assert!(
+            !capture.0.lock().is_empty(),
+            "the query should have been answered"
+        );
     }
 }
 
 #[cfg(test)]
 mod pane_tests {
     use super::*;
-    use gpui::{point, Modifiers, TestAppContext, VisualContext};
+    use gpui::{Modifiers, TestAppContext, VisualContext, point};
     use resize_tests::open_app;
     #[test]
     fn pane_node_split_and_contains() {
@@ -3507,7 +4343,9 @@ mod pane_tests {
         });
         cx.draw_frame().expect("frame after switching tabs");
         let first_tree = app_state.read_with(&cx, |state, _| {
-            state.active_project().unwrap().sessions[0].pane_tree.clone()
+            state.active_project().unwrap().sessions[0]
+                .pane_tree
+                .clone()
         });
         assert!(first_tree.map_or(false, |t| t.contains(1) && t.contains(new_pane_id)));
     }
@@ -3532,8 +4370,8 @@ mod pane_tests {
         });
         cx.draw_frame().expect("frame with two projects");
 
-        let (project_count, active_idx, first_sessions, second_sessions, expanded) =
-            app_state.read_with(&cx, |state, _| {
+        let (project_count, active_idx, first_sessions, second_sessions, expanded) = app_state
+            .read_with(&cx, |state, _| {
                 (
                     state.projects.len(),
                     state.active_project_idx,
@@ -3596,7 +4434,8 @@ mod pane_tests {
         cx.update_window_entity(&app_state, |state, window, cx| {
             state.create_new_session_in_project(0, window, cx);
         });
-        cx.draw_frame().expect("frame with two projects and two sessions");
+        cx.draw_frame()
+            .expect("frame with two projects and two sessions");
 
         // Close the extra session in project 0. Project 1 must be untouched.
         cx.update_window_entity(&app_state, |state, window, cx| {
@@ -3604,7 +4443,10 @@ mod pane_tests {
         });
         cx.draw_frame().expect("frame after closing a session");
         let (first, second) = app_state.read_with(&cx, |state, _| {
-            (state.projects[0].sessions.len(), state.projects[1].sessions.len())
+            (
+                state.projects[0].sessions.len(),
+                state.projects[1].sessions.len(),
+            )
         });
         assert_eq!((first, second), (1, 1));
 
@@ -3660,5 +4502,4 @@ mod pane_tests {
         assert_eq!(active, 0);
         assert!(expanded);
     }
-
 }

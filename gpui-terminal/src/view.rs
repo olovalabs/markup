@@ -18,6 +18,7 @@
 //! * Blinking cursor with all cursor shapes, focus reporting (mode 1004).
 //! * Bracketed paste, `OSC 52` clipboard read/write, bell and title events.
 
+use crate::AgentStatusReport;
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, PtyWriter, TerminalEvent, TerminalNotifier};
 use crate::hyperlink::{HyperlinkMatch, RegexSearches};
@@ -31,7 +32,7 @@ use alacritty_terminal::index::{
     Column as GridColumn, Direction as GridDirection, Line as GridLine, Point as GridPoint,
     Side as GridSide,
 };
-use alacritty_terminal::selection::{SelectionType as GridSelectionType, SelectionRange};
+use alacritty_terminal::selection::{SelectionRange, SelectionType as GridSelectionType};
 use alacritty_terminal::term::search::Match as GridMatch;
 use alacritty_terminal::term::{TermMode, viewport_to_point};
 use alacritty_terminal::vi_mode::ViMotion;
@@ -258,8 +259,7 @@ impl TerminalView {
             &config.semantic_escape_chars,
             config.allow_osc52_paste,
         );
-        let state =
-            TerminalState::with_config(config.cols, config.rows, alac_config, event_proxy);
+        let state = TerminalState::with_config(config.cols, config.rows, alac_config, event_proxy);
 
         let renderer = TerminalRenderer::new(
             config.font_family.clone(),
@@ -915,12 +915,7 @@ impl TerminalView {
         }
     }
 
-    fn activate_link(
-        &mut self,
-        link: HyperlinkMatch,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn activate_link(&mut self, link: HyperlinkMatch, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(callback) = self.link_callback.take() {
             let handled = callback(window, cx, &link);
             self.link_callback = Some(callback);
@@ -1040,7 +1035,12 @@ impl TerminalView {
     // Mouse
     // -----------------------------------------------------------------------
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus_handle);
         self.last_mouse_position = event.position;
 
@@ -1159,7 +1159,12 @@ impl TerminalView {
         self.mouse_down_button = None;
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.last_mouse_position = event.position;
 
         let hovered_scrollbar = self.is_over_scrollbar(event.position);
@@ -1217,26 +1222,28 @@ impl TerminalView {
     }
 
     fn start_drag_scroll(&mut self, lines: i32, cx: &mut Context<Self>) {
-        self.drag_scroll_task = Some(cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            loop {
-                cx.background_executor().timer(DRAG_SCROLL_INTERVAL).await;
+        self.drag_scroll_task = Some(cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                loop {
+                    cx.background_executor().timer(DRAG_SCROLL_INTERVAL).await;
 
-                let keep_going = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
-                    if view.mouse_down_button != Some(MouseButton::Left) {
-                        return false;
+                    let keep_going = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
+                        if view.mouse_down_button != Some(MouseButton::Left) {
+                            return false;
+                        }
+                        view.state.scroll_lines(lines);
+                        let position = view.last_mouse_position;
+                        view.extend_selection_to(position, cx);
+                        true
+                    });
+
+                    match keep_going {
+                        Ok(true) => {}
+                        _ => break,
                     }
-                    view.state.scroll_lines(lines);
-                    let position = view.last_mouse_position;
-                    view.extend_selection_to(position, cx);
-                    true
-                });
-
-                match keep_going {
-                    Ok(true) => {}
-                    _ => break,
                 }
-            }
-        }));
+            },
+        ));
     }
 
     /// Mouse position as a *viewport* relative point, which is the coordinate
@@ -1258,7 +1265,12 @@ impl TerminalView {
         Some(GridPoint::new(GridLine(row as i32), GridColumn(col)))
     }
 
-    fn on_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cell_height = self.renderer.cell_height;
         let pixel_y = f32::from(event.delta.pixel_delta(cell_height).y)
             * self.config.scroll_sensitivity.max(0.05);
@@ -1321,7 +1333,9 @@ impl TerminalView {
             }
         }
 
-        if in_alt_screen && self.config.alternate_scroll && mode.contains(TermMode::ALTERNATE_SCROLL)
+        if in_alt_screen
+            && self.config.alternate_scroll
+            && mode.contains(TermMode::ALTERNATE_SCROLL)
         {
             if let Some(report) = crate::mouse::scroll_report(lines, cell_point, modifiers, mode) {
                 self.write_to_pty(&report);
@@ -1349,29 +1363,34 @@ impl TerminalView {
         }
 
         let interval = self.config.blink_interval;
-        self.blink_task = Some(cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            loop {
-                cx.background_executor().timer(interval).await;
-                // The cursor may have gone steady (or the view unfocused)
-                // since the task started; stop then instead of repainting
-                // twice a second for nothing. `restart_blink` relaunches us
-                // when blinking is wanted again.
-                let mut keep_going = false;
-                let alive = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
-                    if view.was_focused && view.config.cursor_blink && view.state.cursor_blinking() {
-                        view.cursor_visible = !view.cursor_visible;
-                        cx.notify();
-                        keep_going = true;
-                    } else {
-                        view.cursor_visible = true;
-                        view.blink_task = None;
+        self.blink_task = Some(
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                loop {
+                    cx.background_executor().timer(interval).await;
+                    // The cursor may have gone steady (or the view unfocused)
+                    // since the task started; stop then instead of repainting
+                    // twice a second for nothing. `restart_blink` relaunches us
+                    // when blinking is wanted again.
+                    let mut keep_going = false;
+                    let alive = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
+                        if view.was_focused
+                            && view.config.cursor_blink
+                            && view.state.cursor_blinking()
+                        {
+                            view.cursor_visible = !view.cursor_visible;
+                            cx.notify();
+                            keep_going = true;
+                        } else {
+                            view.cursor_visible = true;
+                            view.blink_task = None;
+                        }
+                    });
+                    if alive.is_err() || !keep_going {
+                        break;
                     }
-                });
-                if alive.is_err() || !keep_going {
-                    break;
                 }
-            }
-        }));
+            }),
+        );
     }
 
     /// Emit `CSI I` / `CSI O` when the application enabled focus reporting
@@ -1573,6 +1592,20 @@ impl TerminalView {
     /// Title reported by the application through `OSC 0 / 2`.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// Highest-priority status explicitly reported by a process in this pane.
+    pub fn agent_status_report(&self) -> Option<AgentStatusReport> {
+        self.state.agent_status_report()
+    }
+
+    pub fn clear_agent_status_reports(&mut self) {
+        self.state.clear_agent_status_reports();
+    }
+
+    /// Current OSC 9;4 progress value for agent-specific detection rules.
+    pub fn osc_progress(&self) -> &str {
+        self.state.osc_progress()
     }
 
     /// Read bottom N lines of visible terminal text

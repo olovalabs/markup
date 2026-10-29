@@ -1,4 +1,4 @@
-use gpui::{px, App};
+use gpui::{App, px};
 use rust_embed::RustEmbed;
 
 pub const SANS_FONT: &str = "IBM Plex Sans";

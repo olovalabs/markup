@@ -136,7 +136,8 @@ impl SearchState {
             return;
         };
         self.matches = state.all_matches(regex).into();
-        self.current = anchor.and_then(|point| self.matches.iter().position(|m| *m.start() == point));
+        self.current =
+            anchor.and_then(|point| self.matches.iter().position(|m| *m.start() == point));
     }
 
     /// Advance to the next/previous match and scroll it into view.
@@ -164,11 +165,13 @@ impl SearchState {
 
     /// Select the first match at or after `origin`.
     pub fn select_first_after(&mut self, origin: Point, state: &TerminalState) -> Option<Match> {
-        let index = self
-            .matches
-            .iter()
-            .position(|m| *m.start() >= origin)
-            .or(if self.matches.is_empty() { None } else { Some(0) })?;
+        let index = self.matches.iter().position(|m| *m.start() >= origin).or(
+            if self.matches.is_empty() {
+                None
+            } else {
+                Some(0)
+            },
+        )?;
         self.current = Some(index);
         let selected = self.matches[index].clone();
         state.scroll_to_point(*selected.start());

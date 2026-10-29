@@ -36,6 +36,9 @@ path = "src/main.rs"
 [dependencies.alacritty_terminal]
 version = "0.25.1"
 
+[dependencies.base64]
+version = "0.22"
+
 [dependencies.anyhow]
 version = "1"
 

@@ -4,8 +4,8 @@ The `*.toml` files in this directory are copied **unmodified** from the herdr
 project and are licensed under the Apache License, Version 2.0.
 
 - Upstream: <https://github.com/herdrdev/herdr>
-- Directory: `distribution/agent-detection/`
-- Revision: `fabcab108f9db383e3cd6889f254c8d0d66dcd7b` (2026-10-05)
+- Directory: `src/detect/manifests/`
+- Revision: `bc8c28988f75c538d4ca058b702f5adbea30566e` (2026-10-29)
 - License: Apache-2.0 — <https://github.com/herdrdev/herdr/blob/master/LICENSE>
 - Copyright: the herdr authors
 
@@ -15,8 +15,7 @@ semantics) so that the packs keep working exactly as upstream intends.
 
 ## Updating
 
-Drop in a newer pack (or a new agent's pack) and it is picked up with no Rust
-changes, as long as its `id`/`aliases` match the process name of the agent CLI.
+Use `markup integration update-rules` to download upstream packs into the per-user update cache. Markup validates each manifest and its `min_engine_version`, chooses only newer compatible remote packs, and keeps local overrides in `~/.config/markup/agent-detection/` as the highest-precedence source. New custom agent packs in that local directory can add aliases and screen rules without Rust changes.
 `index.toml` is upstream's registry; this crate instead auto-discovers every
 `agent-detection/*.toml` embedded under `assets/`.
 

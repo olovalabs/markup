@@ -88,6 +88,7 @@ pub struct RuleMatch {
     pub pack: String,
     /// The pack's own revision from its TOML `version` field.
     pub pack_version: Option<String>,
+    pub source: String,
     /// Rule id, e.g. `live_blocked_form`.
     pub rule: String,
     pub state: RuleState,
@@ -110,6 +111,8 @@ struct RawManifest {
     id: String,
     #[serde(default)]
     version: Option<String>,
+    #[serde(default)]
+    min_engine_version: Option<u32>,
     #[serde(default)]
     aliases: Vec<String>,
     #[serde(default)]
@@ -233,6 +236,7 @@ pub struct RulePack {
     /// Canonical id, e.g. `claude`, `agy`, `copilot`.
     pub id: String,
     pub version: Option<String>,
+    source: String,
     /// Every name this pack answers to, lowercased: its `id`, its `aliases`,
     /// and its file stem (which covers `antigravity` -> `agy`).
     names: Vec<String>,
@@ -240,8 +244,14 @@ pub struct RulePack {
 }
 
 impl RulePack {
-    fn parse(src: &str, path: &str) -> Result<RulePack, String> {
+    fn parse(src: &str, path: &str, source: &str) -> Result<RulePack, String> {
         let raw: RawManifest = toml::from_str(src).map_err(|err| err.to_string())?;
+        if raw.min_engine_version.unwrap_or(0) > 3 {
+            return Err(format!(
+                "manifest requires engine version {}, current engine is 3",
+                raw.min_engine_version.unwrap_or(0)
+            ));
+        }
         if raw.rules.len() > MAX_RULES_PER_PACK {
             return Err(format!(
                 "{} rules exceeds the {MAX_RULES_PER_PACK} rule limit",
@@ -268,7 +278,10 @@ impl RulePack {
                     .map_err(|err| format!("rule {} could not be compiled: {err}", rule.id))?;
                 Ok(CompiledRule {
                     id: rule.id.clone(),
-                    state: rule.state.map(RuleState::from).unwrap_or(RuleState::Unknown),
+                    state: rule
+                        .state
+                        .map(RuleState::from)
+                        .unwrap_or(RuleState::Unknown),
                     priority: rule.priority,
                     region: rule
                         .region
@@ -291,20 +304,17 @@ impl RulePack {
         Ok(RulePack {
             id: raw.id,
             version: raw.version,
+            source: source.to_owned(),
             names,
             rules,
         })
     }
-
 }
 
 /// Process names herdr's `identify_agent` accepts that the packs do not spell
 /// out themselves. Everything else (`claude-code`, `cursor-agent`, `ghcs`, …)
 /// is already an `alias` inside the pack that owns it.
-const EXTRA_PROCESS_ALIASES: &[(&str, &str)] = &[
-    ("opencode2", "opencode"),
-    (".cline", "cline"),
-];
+const EXTRA_PROCESS_ALIASES: &[(&str, &str)] = &[("opencode2", "opencode"), (".cline", "cline")];
 
 fn normalize_name(name: &str) -> String {
     name.rsplit('/')
@@ -328,11 +338,57 @@ pub struct RuleSet {
     by_name: HashMap<String, usize>,
 }
 
+fn load_manifest_directory(
+    directory: &std::path::Path,
+    source: &str,
+    packs: &mut Vec<RulePack>,
+    always_override: bool,
+) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("toml") {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let display = path.to_string_lossy();
+        let Ok(pack) = RulePack::parse(&src, &display, source) else {
+            continue;
+        };
+        if let Some(index) = packs.iter().position(|old| old.id == pack.id) {
+            if always_override
+                || version_key(pack.version.as_deref())
+                    > version_key(packs[index].version.as_deref())
+            {
+                packs[index] = pack;
+            }
+        } else {
+            packs.push(pack);
+        }
+    }
+}
+
+fn version_key(version: Option<&str>) -> Vec<u64> {
+    version
+        .unwrap_or("")
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
+}
+
 static EMBEDDED: LazyLock<RuleSet> = LazyLock::new(RuleSet::load_embedded);
 
 /// The process-wide pack set, parsed once on first use.
 pub fn embedded() -> &'static RuleSet {
     &EMBEDDED
+}
+
+pub fn validate_manifest(src: &str, path: &str) -> Result<(String, Option<String>), String> {
+    RulePack::parse(src, path, "validation").map(|pack| (pack.id, pack.version))
 }
 
 impl RuleSet {
@@ -350,11 +406,30 @@ impl RuleSet {
                 continue;
             };
             let src = String::from_utf8_lossy(&file.data);
-            match RulePack::parse(&src, path) {
+            match RulePack::parse(&src, path, "bundled") {
                 Ok(pack) => packs.push(pack),
                 // One bad pack must not take detection down with it.
                 Err(err) => eprintln!("[status] ignoring agent pack {path}: {err}"),
             }
+        }
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+            });
+        if let Some(config) = config {
+            load_manifest_directory(
+                &config.join("markup/agent-detection-updates"),
+                "remote update",
+                &mut packs,
+                false,
+            );
+            load_manifest_directory(
+                &config.join("markup/agent-detection"),
+                "local override",
+                &mut packs,
+                true,
+            );
         }
         packs.sort_by(|a, b| a.id.cmp(&b.id));
         let mut by_name = HashMap::new();
@@ -383,14 +458,18 @@ impl RuleSet {
     /// Canonical agent id for a process name, if a pack claims it.
     pub fn identify(&self, name: &str) -> Option<&str> {
         let key = normalize_name(name);
-        self.by_name.get(&key).map(|&index| self.packs[index].id.as_str())
+        self.by_name
+            .get(&key)
+            .map(|&index| self.packs[index].id.as_str())
     }
 
     /// Canonical agent id for an already-normalized name (lowercase basename,
     /// no path prefix): a bare hash lookup with no allocation, for hot paths
     /// that normalized the name themselves.
     pub fn identify_normalized(&self, key: &str) -> Option<&str> {
-        self.by_name.get(key).map(|&index| self.packs[index].id.as_str())
+        self.by_name
+            .get(key)
+            .map(|&index| self.packs[index].id.as_str())
     }
 }
 
@@ -431,24 +510,23 @@ pub fn evaluate(pack: &RulePack, input: DetectionInput<'_>) -> Option<RuleMatch>
     let mut regions: Vec<(&str, &str, &str)> = Vec::with_capacity(4);
 
     for rule in &pack.rules {
-        let (region_text, lower_text) = match regions
-            .iter()
-            .find(|(spec, _, _)| *spec == rule.region)
-        {
-            Some((_, text, lower)) => (*text, *lower),
-            None => {
-                let text = region(input, &rule.region);
-                let lower = region(lowered, &rule.region);
-                regions.push((rule.region.as_str(), text, lower));
-                (text, lower)
-            }
-        };
+        let (region_text, lower_text) =
+            match regions.iter().find(|(spec, _, _)| *spec == rule.region) {
+                Some((_, text, lower)) => (*text, *lower),
+                None => {
+                    let text = region(input, &rule.region);
+                    let lower = region(lowered, &rule.region);
+                    regions.push((rule.region.as_str(), text, lower));
+                    (text, lower)
+                }
+            };
         if !gate_matches(&rule.gate, region_text, lower_text) {
             continue;
         }
         return Some(RuleMatch {
             pack: pack.id.clone(),
             pack_version: pack.version.clone(),
+            source: pack.source.clone(),
             rule: rule.id.clone(),
             state: rule.state,
             priority: rule.priority,
@@ -496,7 +574,11 @@ fn compile_gate(gate: &RawGate, depth: usize) -> Result<CompiledGate, String> {
 
 /// Port of upstream's `compiled_gate_matches`.
 fn gate_matches(gate: &CompiledGate, text: &str, lower_text: &str) -> bool {
-    if !gate.contains.iter().all(|needle| lower_text.contains(needle)) {
+    if !gate
+        .contains
+        .iter()
+        .all(|needle| lower_text.contains(needle))
+    {
         return false;
     }
 
@@ -512,7 +594,11 @@ fn gate_matches(gate: &CompiledGate, text: &str, lower_text: &str) -> bool {
         return false;
     }
 
-    if !gate.all.iter().all(|nested| gate_matches(nested, text, lower_text)) {
+    if !gate
+        .all
+        .iter()
+        .all(|nested| gate_matches(nested, text, lower_text))
+    {
         return false;
     }
 
@@ -520,7 +606,11 @@ fn gate_matches(gate: &CompiledGate, text: &str, lower_text: &str) -> bool {
         return false;
     }
 
-    if gate.not.iter().any(|nested| gate_matches(nested, text, lower_text)) {
+    if gate
+        .not
+        .iter()
+        .any(|nested| gate_matches(nested, text, lower_text))
+    {
         return false;
     }
 
@@ -813,7 +903,10 @@ mod tests {
         assert!(set.packs.iter().all(|pack| !pack.rules.is_empty()));
         // The packs we care most about must be present under their real ids.
         for id in ["claude", "codex", "gemini", "opencode", "cursor", "copilot"] {
-            assert!(set.packs.iter().any(|pack| pack.id == id), "missing pack {id}");
+            assert!(
+                set.packs.iter().any(|pack| pack.id == id),
+                "missing pack {id}"
+            );
         }
     }
 
@@ -838,12 +931,18 @@ mod tests {
     fn regions_slice_the_way_upstream_does() {
         let screen = "one\n\ntwo\nthree\nfour";
         assert_eq!(region(screen_input(screen), "whole_recent"), screen);
-        assert_eq!(region(screen_input(screen), "bottom_lines(2)"), "three\nfour");
+        assert_eq!(
+            region(screen_input(screen), "bottom_lines(2)"),
+            "three\nfour"
+        );
         assert_eq!(
             region(screen_input(screen), "bottom_non_empty_lines(2)"),
             "three\nfour"
         );
-        assert_eq!(region(screen_input(screen), "bottom_non_empty_lines(4)"), screen);
+        assert_eq!(
+            region(screen_input(screen), "bottom_non_empty_lines(4)"),
+            screen
+        );
         // Runs through to the end of the second non-empty line, blank lines
         // and all — matching upstream's offset arithmetic.
         assert_eq!(
@@ -866,7 +965,9 @@ mod tests {
     fn claude_live_footer_is_working_not_blocked() {
         // `esc to interrupt` with an activity bullet is claude's live turn.
         let screen = "⏺ Read(src/main.rs)\n✳ Baking… (2m 14s · esc to interrupt)";
-        let pack = embedded().pack_for(&["claude".to_string()]).expect("claude pack");
+        let pack = embedded()
+            .pack_for(&["claude".to_string()])
+            .expect("claude pack");
         let m = evaluate(pack, screen_input(screen)).expect("a rule should match");
         assert_eq!(m.state, RuleState::Working, "matched {}", m.rule);
     }
@@ -880,7 +981,9 @@ mod tests {
    2. No, and tell Claude what to do differently
 ────────────────────────────
  esc to cancel · enter to confirm";
-        let pack = embedded().pack_for(&["claude".to_string()]).expect("claude pack");
+        let pack = embedded()
+            .pack_for(&["claude".to_string()])
+            .expect("claude pack");
         let m = evaluate(pack, screen_input(screen)).expect("a rule should match");
         assert_eq!(m.state, RuleState::Blocked, "matched {}", m.rule);
     }
@@ -890,7 +993,9 @@ mod tests {
         // gemini ships `esc to cancel` as its *working* hint; the pack encodes
         // that directly, which is why the packs beat hand-rolled rules.
         let screen = " ⠋ Thinking... (esc to cancel)";
-        let pack = embedded().pack_for(&["gemini".to_string()]).expect("gemini pack");
+        let pack = embedded()
+            .pack_for(&["gemini".to_string()])
+            .expect("gemini pack");
         let m = evaluate(pack, screen_input(screen)).expect("a rule should match");
         assert_eq!(m.state, RuleState::Working, "matched {}", m.rule);
     }
@@ -909,6 +1014,7 @@ region = "made_up_region"
 contains = ["x"]
 "#,
             "agent-detection/test.toml",
+            "test",
         )
         .expect("pack parses");
         assert!(evaluate(&pack, screen_input("x")).is_none());

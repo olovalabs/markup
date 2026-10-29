@@ -11,13 +11,12 @@
 //! renderer's CPU cost, `poll` is the status tick, and `fg` is the `/proc`
 //! inspection that tick used to do inline.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var_os("MARKUP_DIAGNOSTICS").is_some_and(|value| value != "0")
-});
+static ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("MARKUP_DIAGNOSTICS").is_some_and(|value| value != "0"));
 
 /// `true` when diagnostics are on. Cheap enough to call on every hook.
 #[inline]
@@ -209,7 +208,9 @@ impl Sampler {
         let detect_nanos = take(&DETECT_NANOS);
         let gap_max = take(&MAX_FRAME_GAP_NANOS);
 
-        let cpu_ticks = read_cpu_ticks().map(|(utime, stime)| utime + stime).unwrap_or(0);
+        let cpu_ticks = read_cpu_ticks()
+            .map(|(utime, stime)| utime + stime)
+            .unwrap_or(0);
         let cpu_delta = cpu_ticks.saturating_sub(self.last_cpu_ticks);
         self.last_cpu_ticks = cpu_ticks;
         let cpu_percent = if elapsed > 0.0 {

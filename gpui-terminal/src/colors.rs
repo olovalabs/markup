@@ -4,7 +4,6 @@ use gpui::Hsla;
 
 #[derive(Debug, Clone)]
 pub struct ColorPalette {
-
     ansi_colors: [Hsla; 16],
 
     extended_colors: [Hsla; 256],
@@ -18,9 +17,7 @@ pub struct ColorPalette {
 
 impl Default for ColorPalette {
     fn default() -> Self {
-
         let ansi_colors = [
-
             rgb_to_hsla(Rgb {
                 r: 0x00,
                 g: 0x00,
@@ -61,7 +58,6 @@ impl Default for ColorPalette {
                 g: 0xd7,
                 b: 0xcf,
             }),
-
             rgb_to_hsla(Rgb {
                 r: 0x55,
                 g: 0x57,
@@ -159,7 +155,6 @@ impl Default for ColorPalette {
 }
 
 impl ColorPalette {
-
     pub fn new() -> Self {
         Self::default()
     }
@@ -171,29 +166,24 @@ impl ColorPalette {
     pub fn resolve(&self, color: Color, colors: &Colors) -> Hsla {
         match color {
             Color::Named(named) => {
-
                 if let Some(rgb) = colors[named] {
                     return rgb_to_hsla(rgb);
                 }
 
                 let idx = named as usize;
                 if idx < 16 {
-
                     self.ansi_colors[idx]
                 } else {
-
                     match named {
                         NamedColor::Foreground => self.foreground,
                         NamedColor::Background => self.background,
                         NamedColor::Cursor => self.cursor,
                         NamedColor::DimForeground => {
-
                             let mut dim = self.foreground;
                             dim.l *= 0.7;
                             dim
                         }
                         NamedColor::BrightForeground => {
-
                             let mut bright = self.foreground;
                             bright.l = (bright.l * 1.2).min(1.0);
                             bright
@@ -206,7 +196,6 @@ impl ColorPalette {
                         | NamedColor::DimMagenta
                         | NamedColor::DimCyan
                         | NamedColor::DimWhite => {
-
                             let base_idx = match named {
                                 NamedColor::DimBlack => 0,
                                 NamedColor::DimRed => 1,
@@ -226,14 +215,8 @@ impl ColorPalette {
                     }
                 }
             }
-            Color::Spec(rgb) => {
-
-                rgb_to_hsla(rgb)
-            }
-            Color::Indexed(idx) => {
-
-                self.extended_colors[idx as usize]
-            }
+            Color::Spec(rgb) => rgb_to_hsla(rgb),
+            Color::Indexed(idx) => self.extended_colors[idx as usize],
         }
     }
 
@@ -310,7 +293,6 @@ pub fn hsla_to_rgb(hsla: Hsla) -> Rgb {
 }
 
 fn rgb_to_hsla(rgb: Rgb) -> Hsla {
-
     let r = rgb.r as f32 / 255.0;
     let g = rgb.g as f32 / 255.0;
     let b = rgb.b as f32 / 255.0;
@@ -339,12 +321,7 @@ fn rgb_to_hsla(rgb: Rgb) -> Hsla {
 
     let h = if h < 0.0 { h + 360.0 } else { h } / 360.0;
 
-    Hsla {
-        h,
-        s,
-        l,
-        a: 1.0,
-    }
+    Hsla { h, s, l, a: 1.0 }
 }
 
 #[derive(Debug, Clone)]
@@ -359,7 +336,6 @@ impl Default for ColorPaletteBuilder {
 }
 
 impl ColorPaletteBuilder {
-
     pub fn new() -> Self {
         Self {
             palette: ColorPalette::default(),

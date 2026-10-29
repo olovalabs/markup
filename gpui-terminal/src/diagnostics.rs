@@ -5,13 +5,12 @@
 //! [`take_paint_stats`] when it prints a report. When `MARKUP_DIAGNOSTICS` is
 //! unset the hooks are a single relaxed load.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var_os("MARKUP_DIAGNOSTICS").is_some_and(|value| value != "0")
-});
+static ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("MARKUP_DIAGNOSTICS").is_some_and(|value| value != "0"));
 
 #[inline]
 pub fn enabled() -> bool {

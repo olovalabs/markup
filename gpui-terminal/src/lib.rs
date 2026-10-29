@@ -5,6 +5,7 @@
 //!
 //! [GPUI]: https://github.com/zed-industries/zed
 
+mod agent_status;
 pub mod clipboard;
 pub mod colors;
 pub mod diagnostics;
@@ -17,6 +18,7 @@ pub mod search;
 pub mod terminal;
 pub mod view;
 
+pub use agent_status::{AgentReportState, AgentStatusReport};
 pub use alacritty_terminal;
 pub use clipboard::Clipboard;
 pub use colors::{ColorPalette, ColorPaletteBuilder, hsla_to_rgb};

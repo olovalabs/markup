@@ -4,7 +4,6 @@ use gpui::{MouseButton, Pixels, Point};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionType {
-
     Simple,
 
     Word,
@@ -14,7 +13,6 @@ pub enum SelectionType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
-
     pub start: AlacPoint,
 
     pub end: AlacPoint,
@@ -23,7 +21,6 @@ pub struct Selection {
 }
 
 impl Selection {
-
     pub fn new(start: AlacPoint, end: AlacPoint, selection_type: SelectionType) -> Self {
         Self {
             start,
@@ -49,7 +46,6 @@ pub fn pixel_to_cell(
     cell_width: Pixels,
     cell_height: Pixels,
 ) -> AlacPoint {
-
     let col = ((position.x - origin.x) / cell_width).floor();
     let col = col.max(0.0) as usize;
 
@@ -127,7 +123,6 @@ fn format_mouse_report(
             normal_mouse_report(point, 3 | modifiers, true)
         }
     } else {
-
         if pressed {
             normal_mouse_report(point, button_value, false)
         } else {
@@ -144,7 +139,6 @@ pub fn mouse_button_report(
     modifiers: u8,
     mode: TermMode,
 ) -> Option<Vec<u8>> {
-
     if !mode
         .intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG)
     {
@@ -203,7 +197,6 @@ pub fn scroll_report(
             TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG,
         )
     {
-
         let button_code = if delta > 0 { 64 } else { 65 };
         let button_value = button_code | modifiers;
 
@@ -217,10 +210,7 @@ pub fn scroll_report(
         }
     }
 
-    if !shift_held
-        && (mode.contains(TermMode::ALT_SCREEN)
-            || mode.contains(TermMode::APP_CURSOR))
-    {
+    if !shift_held && (mode.contains(TermMode::ALT_SCREEN) || mode.contains(TermMode::APP_CURSOR)) {
         return Some(scroll_to_arrow_keys(delta, mode));
     }
 
@@ -231,14 +221,12 @@ fn scroll_to_arrow_keys(delta: i32, mode: TermMode) -> Vec<u8> {
     let count = delta.unsigned_abs().min(10) as usize;
 
     let arrow_seq = if delta > 0 {
-
         if mode.contains(TermMode::APP_CURSOR) {
             b"\x1bOA"
         } else {
             b"\x1b[A"
         }
     } else {
-
         if mode.contains(TermMode::APP_CURSOR) {
             b"\x1bOB"
         } else {
@@ -304,7 +292,6 @@ mod tests {
 
     #[test]
     fn test_pixel_to_cell_negative_coordinates() {
-
         let position = point(px(5.0), px(5.0));
         let origin = point(px(10.0), px(10.0));
         let cell_width = px(10.0);
@@ -343,7 +330,6 @@ mod tests {
 
     #[test]
     fn test_selection_contains_reverse() {
-
         let selection = Selection::new(
             AlacPoint::new(Line(7), Column(20)),
             AlacPoint::new(Line(5), Column(10)),

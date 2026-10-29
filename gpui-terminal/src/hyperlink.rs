@@ -23,7 +23,8 @@ pub const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|
 
 /// Path-ish run of characters, optionally suffixed with `:line[:column]` or
 /// `(line,column)` so compiler/linter output is clickable.
-pub const PATH_REGEX: &str = r#"[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"'`\s|,;!?*()\[\]{}]+(:\d+(:\d+)?)?"#;
+pub const PATH_REGEX: &str =
+    r#"[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"'`\s|,;!?*()\[\]{}]+(:\d+(:\d+)?)?"#;
 
 /// Whitespace separated word, used for the "select word under cursor" fallback.
 pub const WORD_REGEX: &str = r#"[^\u{0000}-\u{001F}\u{007F}-\u{009F}\s]+"#;

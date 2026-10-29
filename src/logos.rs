@@ -1,8 +1,8 @@
+use gpui::SharedString;
 use std::collections::HashMap;
 #[cfg(debug_assertions)]
 use std::path::Path;
 use std::sync::LazyLock;
-use gpui::SharedString;
 
 use crate::agent_rules;
 use crate::assets::AppAssets;
@@ -139,7 +139,9 @@ fn normalize_cmd_name(name: &str) -> String {
     // Strip trailing script/binary extensions
     let without_ext = if let Some(idx) = base.rfind('.') {
         let ext = &base[idx + 1..];
-        if ["exe", "bin", "sh", "py", "js", "mjs", "ts", "cjs"].contains(&ext.to_ascii_lowercase().as_str()) {
+        if ["exe", "bin", "sh", "py", "js", "mjs", "ts", "cjs"]
+            .contains(&ext.to_ascii_lowercase().as_str())
+        {
             &base[..idx]
         } else {
             base
@@ -274,17 +276,28 @@ mod tests {
     #[test]
     fn resolution_preserves_logo_in_done_state() {
         let fg: Vec<String> = vec![];
-        let logo = resolve_session_logo(&fg, Some("terminal 1"), SessionStatus::Done, "logos/claude.png");
+        let logo = resolve_session_logo(
+            &fg,
+            Some("terminal 1"),
+            SessionStatus::Done,
+            "logos/claude.png",
+        );
         assert_eq!(logo.as_ref(), "logos/claude.png");
     }
 
     #[test]
     fn resolution_from_title() {
         let fg: Vec<String> = vec![];
-        let logo = resolve_session_logo(&fg, Some("Claude Code — project"), SessionStatus::Idle, DEFAULT_LOGO);
+        let logo = resolve_session_logo(
+            &fg,
+            Some("Claude Code — project"),
+            SessionStatus::Idle,
+            DEFAULT_LOGO,
+        );
         assert_eq!(logo.as_ref(), "logos/claude.png");
 
-        let logo_agy = resolve_session_logo(&fg, Some("Antigravity"), SessionStatus::Idle, DEFAULT_LOGO);
+        let logo_agy =
+            resolve_session_logo(&fg, Some("Antigravity"), SessionStatus::Idle, DEFAULT_LOGO);
         assert_eq!(logo_agy.as_ref(), "logos/agy.png");
     }
 }

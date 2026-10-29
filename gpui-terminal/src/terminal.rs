@@ -4,6 +4,7 @@
 //! keeps the terminal behind a `parking_lot::Mutex` so the PTY reader task and
 //! the UI thread can share it.
 
+use crate::agent_status::{AgentOscScanner, AgentStatusReport};
 use crate::event::{GpuiEventProxy, TerminalNotifierHandle};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
@@ -80,6 +81,7 @@ pub struct TerminalState {
     config: Config,
     /// Kept so protocol passthroughs (XTGETTCAP) can reply into the PTY.
     notifier: TerminalNotifierHandle,
+    agent_osc: AgentOscScanner,
 }
 
 impl TerminalState {
@@ -108,6 +110,7 @@ impl TerminalState {
             parser: Processor::new(),
             config,
             notifier,
+            agent_osc: AgentOscScanner::default(),
         }
     }
 
@@ -131,8 +134,23 @@ impl TerminalState {
 
     pub fn process_bytes(&mut self, bytes: &[u8]) {
         self.answer_xtgettcap(bytes);
+        self.agent_osc.scan(bytes);
         let mut term = self.term.lock();
         self.parser.advance(&mut *term, bytes);
+    }
+
+    /// Current highest-priority status reported over OSC 7501.
+    pub fn agent_status_report(&self) -> Option<AgentStatusReport> {
+        self.agent_osc.resolved_report()
+    }
+
+    pub fn clear_agent_status_reports(&mut self) {
+        self.agent_osc.clear_reports();
+    }
+
+    /// Most recent OSC 9;4 progress payload, as `4;1;40`.
+    pub fn osc_progress(&self) -> &str {
+        self.agent_osc.progress()
     }
 
     /// Answer XTGETTCAP queries (`DCS + q <hex-encoded caps> ST`).
