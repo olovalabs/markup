@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use anyhow::Result;
@@ -23,6 +24,7 @@ mod assets;
 mod diagnostics;
 mod logos;
 mod status;
+mod workspace_state;
 
 use assets::{load_embedded_fonts, sync_component_fonts, CombinedAssets, MONO_FONT};
 use status::{SessionStatus, StatusInput};
@@ -213,9 +215,63 @@ struct AppState {
     pub sidebar_visible: bool,
     pub sidebar_width: Pixels,
     drag_start_pos: Option<Point<Pixels>>,
+    persistence_path: Option<PathBuf>,
+    save_generation: Arc<AtomicU64>,
+    startup_loaded: bool,
+    quit_subscription: Option<gpui::Subscription>,
 }
 
 impl AppState {
+    fn saved_workspace(&self) -> workspace_state::SavedWorkspace {
+        workspace_state::SavedWorkspace {
+            projects: self.projects.iter().map(|p| workspace_state::SavedProject {
+                path: p.path.clone(), name: p.name.to_string(), expanded: p.expanded,
+            }).collect(),
+            active_project: self.active_project().map(|p| p.path.clone()),
+            sidebar_visible: self.sidebar_visible,
+            sidebar_width: f32::from(self.sidebar_width),
+        }
+    }
+
+    fn schedule_workspace_save(&mut self, cx: &Context<Self>) {
+        self.startup_loaded = true;
+        let (Some(path), Some(snapshot)) = (self.persistence_path.clone(), Some(self.saved_workspace())) else { return; };
+        let generation = self.save_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation_counter = self.save_generation.clone();
+        let executor = cx.background_executor().clone();
+        executor.clone().spawn(async move {
+            executor.timer(std::time::Duration::from_millis(300)).await;
+            if let Err(error) = workspace_state::save_if_current(&path, &snapshot, &generation_counter, generation) {
+                eprintln!("failed to save workspace state: {error}");
+            }
+        }).detach();
+    }
+
+    fn apply_saved_workspace(&mut self, saved: workspace_state::SavedWorkspace, cx: &mut Context<Self>) {
+        if self.startup_loaded { return; }
+        self.startup_loaded = true;
+        self.sidebar_visible = saved.sidebar_visible;
+        self.sidebar_width = px(saved.sidebar_width.clamp(200.0, 500.0));
+        self.projects.clear();
+        self.active_project_idx = 0;
+        for project in saved.projects {
+            if !project.path.is_dir() || self.projects.iter().any(|p| p.path == project.path) { continue; }
+            let id = self.next_id;
+            self.next_id += 1;
+            let weak = cx.entity().downgrade();
+            let Ok((terminal, pid)) = Self::spawn_terminal_view(Some(&project.path), self.palette.clone(), weak, id, cx) else { continue; };
+            let title = SharedString::from("terminal 1");
+            let pane = TerminalPane { id, terminal, status: SessionStatus::Idle, title: title.to_string(), display_title: title.clone(), pid,
+                screen_scratch: Vec::new(), poll_cache: None, ack_screen: None, agent_active: false, done_since: None, detector: status::Detector::default() };
+            let session = Session { id, title: title.clone(), display_title: title, logo: logos::default_logo(), pane_tree: Some(PaneNode::Leaf(id)), maximized_pane_id: None, panes: vec![pane], status: SessionStatus::Idle };
+            self.projects.push(Project { id, name: SharedString::from(project.name), path: project.path, sessions: vec![session], active_session_idx: 0, expanded: project.expanded });
+        }
+        self.active_project_idx = saved.active_project.as_ref().and_then(|path| self.projects.iter().position(|p| &p.path == path)).unwrap_or(0);
+        if !self.projects.is_empty() { self.focused_pane_id = self.projects[self.active_project_idx].sessions.first().and_then(|s| s.panes.first()).map(|p| p.id); }
+        self.rebuild_session_index();
+        cx.notify();
+    }
+
     fn make_drag_area(&self, cx: &Context<Self>) -> gpui::Div {
         div()
             .window_control_area(WindowControlArea::Drag)
@@ -855,12 +911,14 @@ impl AppState {
         }
         self.focused_pane_id = first_pane.map(|pane| pane.id);
         cx.notify();
+        self.schedule_workspace_save(cx);
     }
 
     fn toggle_project_expanded(&mut self, project_idx: usize, cx: &mut Context<Self>) {
         if let Some(project) = self.projects.get_mut(project_idx) {
             project.expanded = !project.expanded;
             cx.notify();
+            self.schedule_workspace_save(cx);
         }
     }
 
@@ -994,6 +1052,7 @@ impl AppState {
         drop(removed);
         self.rebuild_session_index();
         cx.notify();
+        self.schedule_workspace_save(cx);
     }
 
     /// Close a whole project. Its sessions and PTYs go away; the remaining
@@ -1105,6 +1164,7 @@ impl AppState {
             self.rebuild_session_index();
             self.focused_pane_id = Some(next_id);
             cx.notify();
+            self.schedule_workspace_save(cx);
         }
     }
 
@@ -1602,6 +1662,7 @@ impl AppState {
                 cx.listener::<MouseDownEvent>(|this, _, _, cx| {
                     this.sidebar_visible = !this.sidebar_visible;
                     cx.notify();
+                    this.schedule_workspace_save(cx);
                 }),
             ))
             .child(self.make_drag_area(cx).flex_1().h_full())
@@ -2419,6 +2480,7 @@ impl Render for AppState {
                                                 cx.stop_propagation();
                                                 this.sidebar_visible = true;
                                                 cx.notify();
+                                                this.schedule_workspace_save(cx);
                                             }),
                                         ),
                                 )
@@ -2484,6 +2546,18 @@ impl Render for AppState {
             .child(
                 if self.sidebar_visible {
                     h_resizable("workspace-layout-panels")
+                        .on_resize({
+                            let app_state = cx.entity().downgrade();
+                            move |resize_state, _, app| {
+                                let width = resize_state.read(app).sizes().first().copied();
+                                if let Some(width) = width {
+                                    let _ = app_state.update(app, |state, cx| {
+                                        state.sidebar_width = width;
+                                        state.schedule_workspace_save(cx);
+                                    });
+                                }
+                            }
+                        })
                         .child(
                             resizable_panel()
                                 .size(self.sidebar_width)
@@ -2725,11 +2799,7 @@ fn main() -> Result<()> {
             sync_component_fonts(cx);
 
             let palette = load_github_dark_palette();
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let current_name = current_dir
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Workspace".to_string());
+            let persistence_path = workspace_state::state_path();
 
             let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
             cx.open_window(
@@ -2742,68 +2812,35 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let palette_clone = palette.clone();
-                    let current_dir_clone = current_dir.clone();
-                    let app_state = cx.new(|cx| {
-                        let self_weak = cx.entity().downgrade();
-                        let (initial_terminal, pid) = AppState::spawn_terminal_view(
-                            Some(&current_dir_clone),
-                            palette_clone.clone(),
-                            self_weak,
-                            1,
-                            cx,
-                        )
-                        .expect("Failed to spawn initial terminal");
+                    let app_state = cx.new(|_| AppState {
+                        projects: Vec::new(), active_project_idx: 0, next_id: 1,
+                        session_index: HashMap::new(), pane_index: HashMap::new(), palette: palette.clone(),
+                        focused_pane_id: None, sidebar_visible: true, sidebar_width: px(330.0), drag_start_pos: None,
+                        persistence_path: persistence_path.clone(), save_generation: Arc::new(AtomicU64::new(0)), startup_loaded: false,
+                        quit_subscription: None,
+                    });
 
-                        initial_terminal.read(cx).focus_handle().focus(window);
+                    let weak_state = app_state.downgrade();
+                    let load_path = persistence_path.clone();
+                    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                        let saved = cx.background_executor().spawn(async move {
+                            load_path.as_deref().map(workspace_state::load).unwrap_or_default()
+                        }).await;
+                        let _ = weak_state.update(cx, |state, cx| state.apply_saved_workspace(saved, cx));
+                    }).detach();
 
-                        let initial_pane = TerminalPane {
-                            id: 1,
-                            terminal: initial_terminal,
-                            status: SessionStatus::Idle,
-                            title: "terminal 1".to_string(),
-                            display_title: SharedString::from("terminal 1"),
-                            pid,
-                            screen_scratch: Vec::new(),
-                            poll_cache: None,
-                            ack_screen: None,
-                            agent_active: false,
-                            done_since: None,
-                            detector: status::Detector::default(),
-                        };
-
-                        let initial_session = Session {
-                            id: 1,
-                            title: SharedString::from("terminal 1"),
-                            display_title: SharedString::from("terminal 1"),
-                            logo: logos::default_logo(),
-                            pane_tree: Some(PaneNode::Leaf(1)),
-                            maximized_pane_id: None,
-                            panes: vec![initial_pane],
-                            status: SessionStatus::Idle,
-                        };
-
-                        let initial_project = Project {
-                            id: 1,
-                            name: SharedString::from(current_name),
-                            path: current_dir_clone,
-                            sessions: vec![initial_session],
-                            active_session_idx: 0,
-                            expanded: true,
-                        };
-
-                        AppState {
-                            projects: vec![initial_project],
-                            active_project_idx: 0,
-                            next_id: 2,
-                            session_index: HashMap::from([(1, (0, 0))]),
-                            pane_index: HashMap::from([(1, (0, 0, 0))]),
-                            palette: palette_clone,
-                            focused_pane_id: Some(1),
-                            sidebar_visible: true,
-                            sidebar_width: px(330.0),
-                            drag_start_pos: None,
-                        }
+                    let quit_path = persistence_path.clone();
+                    app_state.update(cx, |state, cx| {
+                        state.persistence_path = persistence_path.clone();
+                        state.startup_loaded = false;
+                        state.quit_subscription = Some(cx.on_app_quit(move |state, cx| {
+                            state.save_generation.fetch_add(1, Ordering::SeqCst);
+                            let path = quit_path.clone();
+                            let snapshot = state.saved_workspace();
+                            cx.background_executor().spawn(async move {
+                                if let Some(path) = path { if let Err(error) = workspace_state::save_atomic(&path, &snapshot) { eprintln!("failed to save workspace state on quit: {error}"); } }
+                            })
+                        }));
                     });
 
                     let app_state_weak = app_state.downgrade();
@@ -2982,6 +3019,10 @@ mod resize_tests {
             sidebar_visible: true,
             sidebar_width: px(330.0),
             drag_start_pos: None,
+            persistence_path: None,
+            save_generation: Arc::new(AtomicU64::new(0)),
+            startup_loaded: true,
+            quit_subscription: None,
         }
     }
 
