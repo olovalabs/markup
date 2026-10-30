@@ -254,7 +254,7 @@ mod tests {
     /// Measurement, not a correctness check: how long does one full-scrollback
     /// rescan take while output streams?
     ///
-    /// `cargo test --release -p gpui-terminal -- --ignored --nocapture search_refresh`
+    /// `cargo test --release -p terminal -- --ignored --nocapture search_refresh`
     #[test]
     #[ignore = "measurement; run with --release --ignored --nocapture"]
     fn search_refresh_cost_over_full_scrollback() {

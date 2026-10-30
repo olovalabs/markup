@@ -13,7 +13,7 @@ use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Root, TitleBar};
-use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
+use terminal::{ColorPalette, TerminalConfig, TerminalView};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
@@ -1186,9 +1186,9 @@ impl AppState {
                             if agent_report.as_ref().is_some_and(|report| {
                                 matches!(
                                     report.state,
-                                    gpui_terminal::AgentReportState::Done
-                                        | gpui_terminal::AgentReportState::Error
-                                        | gpui_terminal::AgentReportState::Idle
+                                    terminal::AgentReportState::Done
+                                        | terminal::AgentReportState::Error
+                                        | terminal::AgentReportState::Idle
                                 )
                             }) {
                                 pane.terminal.update(cx, |terminal, _| {
@@ -1295,17 +1295,17 @@ impl AppState {
                         } else if let Some(report) = &agent_report {
                             reported_agent_state = true;
                             match report.state {
-                                gpui_terminal::AgentReportState::Idle => {
+                                terminal::AgentReportState::Idle => {
                                     if focused {
                                         SessionStatus::Active
                                     } else {
                                         SessionStatus::Idle
                                     }
                                 }
-                                gpui_terminal::AgentReportState::Working => SessionStatus::Working,
-                                gpui_terminal::AgentReportState::Done => SessionStatus::Done,
-                                gpui_terminal::AgentReportState::Blocked => SessionStatus::Blocked,
-                                gpui_terminal::AgentReportState::Error => SessionStatus::Error,
+                                terminal::AgentReportState::Working => SessionStatus::Working,
+                                terminal::AgentReportState::Done => SessionStatus::Done,
+                                terminal::AgentReportState::Blocked => SessionStatus::Blocked,
+                                terminal::AgentReportState::Error => SessionStatus::Error,
                             }
                         } else {
                             let input = StatusInput {
@@ -4482,7 +4482,7 @@ mod xtgettcap_tests {
     //! reach the grid as printable output.
 
     use alacritty_terminal::event::WindowSize;
-    use gpui_terminal::{ColorPalette, GpuiEventProxy, PtyWriter, TerminalNotifier, TerminalState};
+    use terminal::{ColorPalette, GpuiEventProxy, PtyWriter, TerminalNotifier, TerminalState};
     use parking_lot::Mutex;
     use std::sync::Arc;
 

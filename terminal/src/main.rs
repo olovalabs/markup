@@ -3,7 +3,7 @@ use gpui::{
     AppContext, Context, Edges, Entity, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Render, Styled, Window, div, px,
 };
-use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
+use terminal::{ColorPalette, TerminalConfig, TerminalView};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::sync::Arc;
 
@@ -137,7 +137,7 @@ fn main() -> Result<()> {
             cx.open_window(
                 gpui::WindowOptions {
                     titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("gpui-terminal".into()),
+                        title: Some("Terminal".into()),
                         ..Default::default()
                     }),
                     ..Default::default()

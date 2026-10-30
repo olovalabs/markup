@@ -11,28 +11,18 @@
 
 [package]
 edition = "2024"
-name = "gpui-terminal"
+name = "terminal"
 version = "0.1.0"
-authors = ["Leonard Seibold <git[@]zrtx.de"]
-build = false
-autolib = false
-autobins = false
-autoexamples = false
-autotests = false
-autobenches = false
-description = "Terminal emulator component for gpui"
-readme = "README.md"
+description = "Terminal emulator component for Markup"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/zortax/gpui-terminal"
 
 [lib]
-name = "gpui_terminal"
+name = "terminal"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gpui-terminal"
+name = "terminal"
 path = "src/main.rs"
-
 [dependencies.alacritty_terminal]
 version = "0.25.1"
 

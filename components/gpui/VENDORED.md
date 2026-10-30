@@ -2,7 +2,7 @@
 
 Copy of [`gpui`](https://crates.io/crates/gpui) 0.2.2 from crates.io with local
 patches. It is wired in through `[patch.crates-io] gpui` in the workspace
-`Cargo.toml`, so `app`, `gpui-component` and `gpui-terminal` all link this copy
+`Cargo.toml`, so `app`, `gpui-component` and `terminal` all link this copy
 instead of the registry crate.
 
 ## Why

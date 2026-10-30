@@ -187,11 +187,11 @@ impl Sampler {
         let frames = take(&FRAMES);
         let render_nanos = take(&RENDER_NANOS);
         let render_max = take(&RENDER_MAX_NANOS);
-        let paint_stats = gpui_terminal::diagnostics::take_paint_stats();
+        let paint_stats = terminal::diagnostics::take_paint_stats();
         let paints = paint_stats.paints;
         let paint_nanos = paint_stats.nanos;
         let paint_max = paint_stats.max_nanos;
-        let parse_stats = gpui_terminal::diagnostics::take_parse_stats();
+        let parse_stats = terminal::diagnostics::take_parse_stats();
         let parse_batches = parse_stats.batches;
         let parse_nanos = parse_stats.nanos;
         let parse_max = parse_stats.max_nanos;
