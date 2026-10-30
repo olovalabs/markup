@@ -92,12 +92,14 @@ pub enum SessionStatus {
 
 impl SessionStatus {
     /// Render priority used when multiple panes contribute to a session.
+    /// Herdr's order: blocked > done > working > idle. `Error` counts as
+    /// blocked, `Unknown`/`Active` count as idle.
     pub fn rank(self) -> u8 {
         match self {
             SessionStatus::Error => 7,
             SessionStatus::Blocked => 6,
-            SessionStatus::Working => 5,
-            SessionStatus::Done => 4,
+            SessionStatus::Done => 5,
+            SessionStatus::Working => 4,
             SessionStatus::Unknown => 3,
             SessionStatus::Active => 2,
             SessionStatus::Idle => 1,
@@ -680,11 +682,14 @@ pub fn evaluate_screen_with_match(
 ) -> (SessionStatus, Option<agent_rules::RuleMatch>) {
     let (detected, matched) = detect_full_screen(screen, input, prev);
 
-    let tail = tail_lines(screen, FallbackRules::WINDOW);
-    let is_agent_working = match &matched {
-        Some(m) => m.state == RuleState::Working,
-        None => FallbackRules::is_running(&tail),
-    };
+    // Only an agent rule that says "working" is authoritative while focused.
+    // Generic busy text (a prompt glyph, a stale "esc to interrupt") must not
+    // keep a focused pane yellow: it is Active while you are looking at it and
+    // Working once you switch away, matching Herdr's "a finish you watched is
+    // idle" spirit. Agent reports and rule packs still win.
+    let is_agent_working = matched
+        .as_ref()
+        .is_some_and(|m| m.state == RuleState::Working);
 
     // When the user is focused and interacting, plain shell commands report Active.
     // Only an agent running on its own ("own way") reports Working in a focused tab.
@@ -882,9 +887,9 @@ mod tests {
         assert!(SessionStatus::Error.rank() > SessionStatus::Blocked.rank());
         assert!(SessionStatus::Unknown.rank() > SessionStatus::Active.rank());
         assert!(SessionStatus::Done.rank() > SessionStatus::Unknown.rank());
-        assert!(SessionStatus::Blocked.rank() > SessionStatus::Working.rank());
-        assert!(SessionStatus::Working.rank() > SessionStatus::Done.rank());
-        assert!(SessionStatus::Done.rank() > SessionStatus::Active.rank());
+        assert!(SessionStatus::Blocked.rank() > SessionStatus::Done.rank());
+        assert!(SessionStatus::Done.rank() > SessionStatus::Working.rank());
+        assert!(SessionStatus::Working.rank() > SessionStatus::Active.rank());
         assert!(SessionStatus::Active.rank() > SessionStatus::Idle.rank());
     }
 
@@ -1352,9 +1357,8 @@ mod tests {
     }
 
     #[test]
-    fn focused_agent_running_is_working() {
-        // When an agent is running on its own, it reports Working even while focused.
-        assert_eq!(eval(&["⠋ Thinking…"], &[], true), SessionStatus::Working);
+    fn focused_agent_rule_working_is_still_working() {
+        // A real agent pack that reports Working wins even while focused.
         assert_eq!(
             eval(
                 &[
@@ -1366,5 +1370,14 @@ mod tests {
             ),
             SessionStatus::Working
         );
+    }
+
+    #[test]
+    fn generic_busy_text_is_active_while_focused_and_working_when_away() {
+        // No agent pack: generic busy text is not authoritative. Looking at it
+        // reads Active; switching away reads Working.
+        let lines = ["⠋ Working... (3s · esc to interrupt)"];
+        assert_eq!(eval(&lines, &[], true), SessionStatus::Active);
+        assert_eq!(eval(&lines, &[], false), SessionStatus::Working);
     }
 }

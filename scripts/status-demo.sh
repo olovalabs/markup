@@ -2,7 +2,7 @@
 # Simulate each terminal status and watch the sidebar/titlebar badge.
 #
 #   scripts/status-demo.sh active    focused prompt            -> blue  (idle once you click away)
-#   scripts/status-demo.sh working   long command with spinner -> yellow (persists while you switch tabs)
+#   scripts/status-demo.sh working   long command with spinner -> blue while focused, yellow after you switch away
 #   scripts/status-demo.sh blocked   approval prompt           -> orange
 #   scripts/status-demo.sh error     failing command output    -> red
 #   scripts/status-demo.sh agent     agent-shaped run, exits 0 -> green (done) if you are in another tab
@@ -18,7 +18,8 @@ active)
     ;;
 
 working)
-    # A plain foreground command: any running command is "working".
+    # A plain foreground command: Active while you watch it, Working when you
+    # switch away. An agent rule that reports Working stays yellow either way.
     for i in $(seq 1 30); do
         printf '⠋ Working... (%ds · esc to interrupt)\r' "$i"
         sleep 1

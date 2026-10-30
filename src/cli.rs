@@ -208,6 +208,8 @@ pub fn run_status(args: &[String]) -> Result<()> {
                 event: "clear".into(),
                 message: None,
                 approval_id: None,
+                agent_id: None,
+                parent: None,
             };
             let socket = std::env::var_os("MARKUP_STATUS_SOCKET")
                 .context("status service is unavailable")?;

@@ -30,13 +30,8 @@ fn legacy_hook_command(agent: &str) -> String {
 }
 
 fn state_for_event(event: &Value) -> Option<&'static str> {
-    if event
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty())
-    {
-        return None;
-    }
+    // A worker (`agent_id`) reports to its pane too: the app lists it under the
+    // parent and never lets it drive the parent's status or an alert.
     match event.get("hook_event_name").and_then(Value::as_str)? {
         "SessionStart" => Some("register"),
         "SessionEnd" => Some("clear"),
@@ -117,6 +112,13 @@ fn event_from_hook(agent: &str, state: &str, payload: &Value) -> crate::status_b
             .or_else(|| payload.get("request_id"))
             .and_then(Value::as_str)
             .map(str::to_owned),
+        agent_id: payload
+            .get("agent_id")
+            .or_else(|| payload.get("agentId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        parent: None,
     }
 }
 
@@ -740,7 +742,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn maps_lifecycle_and_ignores_subagents() {
+    fn maps_lifecycle_including_subagents() {
         assert_eq!(
             state_for_event(&json!({"hook_event_name":"UserPromptSubmit"})),
             Some("working")
@@ -761,10 +763,23 @@ mod tests {
             state_for_event(&json!({"hook_event_name":"Interrupt", "session_id":"s1"})),
             Some("cancelled")
         );
+        // A worker reports too; the app lists it under its parent.
         assert_eq!(
             state_for_event(&json!({"hook_event_name":"Stop", "agent_id":"child"})),
-            None
+            Some("done")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_subagent_hook_carries_its_agent_id() {
+        let event = event_from_hook(
+            "claude",
+            "working",
+            &json!({"hook_event_name":"PreToolUse", "agent_id":"child"}),
+        );
+        assert_eq!(event.agent_id.as_deref(), Some("child"));
+        assert!(event.parent.is_none());
     }
     #[test]
     fn preserves_existing_hooks_on_setup_and_remove() {

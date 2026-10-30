@@ -8,6 +8,8 @@ use gpui::{
     WindowControlArea, WindowDecorations, WindowOptions, div, linear_color_stop, linear_gradient,
     percentage, px, rgba, size, svg,
 };
+use gpui_component::WindowExt as _;
+use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Root, TitleBar};
@@ -15,7 +17,7 @@ use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -23,12 +25,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod agent_rules;
 mod assets;
+mod attention;
 mod cli;
 mod diagnostics;
 #[cfg(unix)]
 mod herdr_compat;
 mod integrations;
 mod logos;
+mod sound;
 mod status;
 #[cfg(unix)]
 mod status_bus;
@@ -118,6 +122,14 @@ pub struct TerminalPane {
     /// Its disappearance means the agent finished (Done), like herdr.
     pub agent_active: bool,
     pub detector: status::Detector,
+    /// Herdr-style seen/recency bookkeeping for this pane's finalized status.
+    pub attention: attention::Attention,
+    /// The agent's own name from its OSC 7501 report (`app`), when it reports one.
+    pub app: Option<SharedString>,
+    /// Sticky: this pane hosted a recognized agent. Cleared only when recreated.
+    pub is_agent: bool,
+    /// Workers reported by this pane's agent, keyed by their `agent_id`.
+    pub sub_agents: HashMap<String, attention::SubAgent>,
 }
 
 impl Drop for TerminalPane {
@@ -313,6 +325,30 @@ struct AppState {
     save_generation: Arc<AtomicU64>,
     startup_loaded: bool,
     quit_subscription: Option<gpui::Subscription>,
+    /// Whether the OS considers this window focused, mirrored from the render
+    /// pass. "Looking" requires it: a visible-but-backgrounded window hasn't
+    /// been seen.
+    window_active: bool,
+    /// The first poll tick only primes the attention model; it never alerts.
+    status_primed: bool,
+    /// Alerts to drain on the next render, where a window is available to
+    /// push notifications and play sounds.
+    pending_alerts: Vec<attention::AppAlert>,
+    /// Monotonic counter for "most recent status change" ordering.
+    attention_seq: u64,
+    /// Sidebar Agents section folded.
+    agents_collapsed: bool,
+}
+
+/// One row in the sidebar Agents list, built fresh each render.
+struct AgentRow {
+    pane_id: usize,
+    title: String,
+    status: SessionStatus,
+    since: u64,
+    seq: u64,
+    place: String,
+    sub_agents: Vec<(String, SessionStatus)>,
 }
 
 impl AppState {
@@ -412,6 +448,10 @@ impl AppState {
                 ack_screen: None,
                 agent_active: false,
                 detector: status::Detector::default(),
+                attention: Default::default(),
+                app: None,
+                is_agent: false,
+                sub_agents: HashMap::new(),
             };
             let session = Session {
                 id,
@@ -496,6 +536,22 @@ impl AppState {
     fn active_session(&self) -> Option<&Session> {
         let project = self.active_project()?;
         project.sessions.get(project.active_session_idx)
+    }
+
+    /// Panes the person can actually see: the selected screen's panes, minus
+    /// the siblings a maximized pane hides.
+    fn visible_pane_ids(&self) -> HashSet<usize> {
+        self.active_session()
+            .map(|session| {
+                let max = session.maximized_pane_id;
+                session
+                    .panes
+                    .iter()
+                    .filter(|pane| max.map_or(true, |m| m == pane.id))
+                    .map(|pane| pane.id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn spawn_terminal_view(
@@ -778,7 +834,9 @@ impl AppState {
             if pane.generation != event.pane_generation {
                 continue;
             }
-            if event.event == "register" {
+            if event.agent_id.is_some() {
+                // Workers report to the parent pane; they never own its session.
+            } else if event.event == "register" {
                 if let Some(session_id) = event.session_id.as_ref() {
                     if pane
                         .native_session_id
@@ -810,7 +868,9 @@ impl AppState {
                 }
             }
 
-            let source = if is_routed {
+            let source = if let Some(agent_id) = event.agent_id.as_ref() {
+                format!("{}:{}:{agent_id}", event.reporter, event.reporter_generation)
+            } else if is_routed {
                 format!(
                     "route:{}:{}",
                     event.reporter,
@@ -840,6 +900,50 @@ impl AppState {
                 continue;
             }
             pane.native_sequence.insert(source, event.sequence);
+            // A worker reports to its parent pane: update the indented entry and
+            // never let it drive the pane's own status or an alert.
+            if let Some(agent_id) = event.agent_id.clone() {
+                let status = match event.event.as_str() {
+                    "working" => Some(SessionStatus::Working),
+                    "blocked" => Some(SessionStatus::Blocked),
+                    "done" => Some(SessionStatus::Done),
+                    "error" => Some(SessionStatus::Error),
+                    "idle" | "register" => Some(SessionStatus::Idle),
+                    "clear" | "cancelled" => None,
+                    _ => {
+                        pane.is_agent = true;
+                        continue;
+                    }
+                };
+                match status {
+                    Some(status) => {
+                        let since = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let entry = pane.sub_agents.entry(agent_id.clone()).or_insert(
+                            attention::SubAgent {
+                                id: agent_id.clone(),
+                                title: event.message.clone(),
+                                status: SessionStatus::Idle,
+                                since,
+                                seq: since,
+                            },
+                        );
+                        entry.status = status;
+                        entry.since = since;
+                        entry.seq = since;
+                        if entry.title.is_none() {
+                            entry.title = event.message.clone();
+                        }
+                    }
+                    None => {
+                        pane.sub_agents.remove(&agent_id);
+                    }
+                }
+                pane.is_agent = true;
+                continue;
+            }
             let reporter_name = event.reporter.clone();
             let event_name = event.event.clone();
             if pane.native_acknowledged && matches!(event.event.as_str(), "done" | "error") {
@@ -915,6 +1019,10 @@ impl AppState {
             if let Some(next) = next {
                 pane.native_status = Some(next);
                 pane.status = next;
+                pane.is_agent = true;
+                if pane.app.is_none() && !reporter_name.is_empty() {
+                    pane.app = Some(SharedString::from(reporter_name.clone()));
+                }
                 pane.detection = status::DetectionResult::new(
                     next,
                     status::EvidenceSource::AgentReport,
@@ -1395,6 +1503,18 @@ impl AppState {
                         changed = true;
                     }
 
+                    if let Some(app) = agent_report
+                        .as_ref()
+                        .and_then(|report| report.app.clone())
+                        .filter(|app| !app.is_empty())
+                    {
+                        pane.app = Some(SharedString::from(app));
+                    }
+                    pane.is_agent |= reported_agent_state
+                        || matched_agent_rule
+                        || agent_now
+                        || pane.app.is_some();
+
                     pane.poll_cache = Some(poll_key);
                 }
 
@@ -1436,6 +1556,90 @@ impl AppState {
                 }
             }
         }
+        // Herdr's attention pass. It finalizes every pane's badge: a finish the
+        // person missed becomes Done, and looking at a Done pane clears it. It
+        // runs for every pane every tick because visibility and window focus
+        // change without any screen output.
+        let visible_ids = self.visible_pane_ids();
+        let window_active = self.window_active;
+        let focused_id = self.focused_pane_id;
+        let primed = self.status_primed;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut attention_seq = self.attention_seq;
+        let mut alerts: Vec<attention::AppAlert> = Vec::new();
+        let mut attention_changed = false;
+        for project in &mut self.projects {
+            let project_name = project.name.clone();
+            for session in &mut project.sessions {
+                let place = format!("{project_name} · {}", session.display_title);
+                for pane in &mut session.panes {
+                    let focused = focused_id == Some(pane.id);
+                    let looking = visible_ids.contains(&pane.id) && window_active;
+                    let prev = pane.attention.last;
+                    let before = pane.status;
+                    let resolved = attention::resolve(
+                        &mut pane.attention,
+                        pane.status,
+                        pane.is_agent,
+                        focused,
+                        looking,
+                        now_ms,
+                        &mut attention_seq,
+                    );
+                    // Looking clears a finish for good: acknowledge it so a
+                    // sticky native/OSC `done` cannot re-arm when you look away.
+                    if looking
+                        && before == SessionStatus::Done
+                        && resolved.status != SessionStatus::Done
+                    {
+                        pane.native_status = None;
+                        pane.native_acknowledged = true;
+                        pane.ack_screen =
+                            Some(screen_fingerprint(&pane.screen_scratch, &pane.title));
+                        pane.osc_report_active = false;
+                        pane.pending_approvals.clear();
+                        pane.poll_cache = None;
+                        pane.terminal
+                            .update(cx, |terminal, _| terminal.clear_agent_status_reports());
+                    }
+                    if pane.status != resolved.status {
+                        pane.status = resolved.status;
+                        attention_changed = true;
+                    }
+                    if primed
+                        && let Some(kind) = attention::alert_for(prev, resolved.status, looking)
+                    {
+                        alerts.push(attention::AppAlert {
+                            kind,
+                            pane_id: pane.id,
+                            name: pane_agent_name(pane),
+                            place: place.clone(),
+                            looking,
+                        });
+                    }
+                }
+                // Fold the finalized pane badges back into the session rollup.
+                let mut aggregate = SessionStatus::Idle;
+                for pane in &session.panes {
+                    if pane.status.rank() > aggregate.rank() {
+                        aggregate = pane.status;
+                    }
+                }
+                if session.status != aggregate {
+                    session.status = aggregate;
+                    attention_changed = true;
+                }
+            }
+        }
+        self.attention_seq = attention_seq;
+        self.status_primed = true;
+        if !alerts.is_empty() {
+            self.pending_alerts.extend(alerts);
+        }
+        changed |= attention_changed;
         #[cfg(unix)]
         if let Some(bus) = STATUS_BUS.as_ref()
             && status_snapshot_due()
@@ -1603,6 +1807,10 @@ impl AppState {
                 ack_screen: None,
                 agent_active: false,
                 detector: status::Detector::default(),
+                attention: Default::default(),
+                app: None,
+                is_agent: false,
+                sub_agents: HashMap::new(),
             };
             let session = Session {
                 id: next_id,
@@ -1777,6 +1985,10 @@ impl AppState {
                 ack_screen: None,
                 agent_active: false,
                 detector: status::Detector::default(),
+                attention: Default::default(),
+                app: None,
+                is_agent: false,
+                sub_agents: HashMap::new(),
             };
             let session = Session {
                 id: next_id,
@@ -1883,6 +2095,10 @@ impl AppState {
                 ack_screen: None,
                 agent_active: false,
                 detector: status::Detector::default(),
+                attention: Default::default(),
+                app: None,
+                is_agent: false,
+                sub_agents: HashMap::new(),
             };
 
             if let Some(project) = self.projects.get_mut(p_idx) {
@@ -2316,6 +2532,7 @@ impl AppState {
             .border_r_1()
             .border_color(rgba(0xd8cbd8ff))
             .child(self.render_sidebar_toolbar(cx))
+            .child(self.render_agents_panel(cx))
             .child(
                 div()
                     .flex_1()
@@ -2332,6 +2549,184 @@ impl AppState {
                 this.child(self.render_integrations_panel(cx))
             })
             .into_any_element()
+    }
+
+    /// Herdr-style Agents list: Needs you / Done / Working / Idle, most recently
+    /// changed first, with workers indented under the pane that started them.
+    fn render_agents_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut rows: Vec<AgentRow> = Vec::new();
+        for project in &self.projects {
+            for session in &project.sessions {
+                let place = format!("{} · {}", project.name, session.display_title);
+                for pane in &session.panes {
+                    if !pane.is_agent {
+                        continue;
+                    }
+                    let mut sub_agents: Vec<(String, SessionStatus)> = pane
+                        .sub_agents
+                        .values()
+                        .map(|sub| {
+                            (
+                                sub.title.clone().unwrap_or_else(|| sub.id.clone()),
+                                sub.status,
+                            )
+                        })
+                        .collect();
+                    sub_agents.sort_by(|a, b| a.0.cmp(&b.0));
+                    rows.push(AgentRow {
+                        pane_id: pane.id,
+                        title: pane_agent_name(pane),
+                        status: pane.status,
+                        since: pane.attention.since,
+                        seq: pane.attention.seq,
+                        place: place.clone(),
+                        sub_agents,
+                    });
+                }
+            }
+        }
+        let total = rows.len();
+        if total == 0 {
+            return div();
+        }
+
+        let mut body = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .max_h(px(280.0))
+            .overflow_y_scrollbar();
+        for (label, rank) in attention::SECTIONS {
+            let mut section: Vec<&AgentRow> = rows
+                .iter()
+                .filter(|row| attention::rank(row.status) == rank)
+                .collect();
+            if section.is_empty() {
+                continue;
+            }
+            section.sort_by(|a, b| b.since.cmp(&a.since).then(b.seq.cmp(&a.seq)));
+            body = body.child(
+                div()
+                    .px(px(14.0))
+                    .pt(px(6.0))
+                    .pb(px(2.0))
+                    .text_size(px(10.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgba(0x746d7aff))
+                    .child(format!("{label} ({})", section.len())),
+            );
+            for row in section {
+                let pane_id = row.pane_id;
+                let dot = row.status.colors().0;
+                body = body.child(
+                    div()
+                        .id(("agent-row", pane_id))
+                        .w_full()
+                        .mx(px(8.0))
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(6.0))
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(rgba(0xffffff66)))
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(7.0))
+                                .rounded_full()
+                                .bg(rgba(dot)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_size(px(12.0))
+                                .text_color(rgba(0x343039ff))
+                                .child(row.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(9.5))
+                                .text_color(rgba(0x9a929e99))
+                                .child(row.place.clone()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.focus_pane(pane_id, window, cx);
+                            }),
+                        ),
+                );
+                for (sub_title, sub_status) in &row.sub_agents {
+                    body = body.child(
+                        div()
+                            .pl(px(34.0))
+                            .pr(px(14.0))
+                            .py(px(2.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(5.0))
+                                    .rounded_full()
+                                    .bg(rgba(sub_status.colors().0)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgba(0x746d7aff))
+                                    .child(sub_title.clone()),
+                            ),
+                    );
+                }
+            }
+        }
+
+        let collapsed = self.agents_collapsed;
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(rgba(0xd8cbd8ff))
+            .child(
+                div()
+                    .id("agents-panel-header")
+                    .w_full()
+                    .h(px(28.0))
+                    .pl(px(14.0))
+                    .pr(px(12.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor(CursorStyle::PointingHand)
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgba(0x38333fff))
+                            .child(format!("Agents ({total})")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgba(0x746d7aff))
+                            .child(if collapsed { "show" } else { "hide" }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.agents_collapsed = !this.agents_collapsed;
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .when(!collapsed, |this| this.child(body))
     }
 
     fn render_sidebar_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -2652,6 +3047,8 @@ impl AppState {
                                     pane.status = SessionStatus::Idle;
                                     pane.native_status = None;
                                     pane.native_acknowledged = true;
+                                    pane.attention.seen = true;
+                                    pane.attention.last = Some(SessionStatus::Idle);
                                     pane.ack_screen =
                                         Some(screen_fingerprint(&pane.screen_scratch, &pane.title));
                                     pane.osc_report_active = false;
@@ -2719,6 +3116,8 @@ impl AppState {
                                     pane.status = SessionStatus::Idle;
                                     pane.native_status = None;
                                     pane.native_acknowledged = true;
+                                    pane.attention.seen = true;
+                                    pane.attention.last = Some(SessionStatus::Idle);
                                     pane.ack_screen =
                                         Some(screen_fingerprint(&pane.screen_scratch, &pane.title));
                                     pane.osc_report_active = false;
@@ -3065,6 +3464,9 @@ fn sidebar_text_button(
 impl Render for AppState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let diag_render = diagnostics::render_start();
+        // "Looking" needs an active window: a visible but backgrounded window
+        // has not been seen, so a finish there must still become Done.
+        self.window_active = _window.is_window_active();
         // Track which pane owns keyboard focus each frame; the poller uses
         // this for Active-state resolution and for clearing sticky Done/Error.
         let mut focused_pane = None;
@@ -3083,6 +3485,44 @@ impl Render for AppState {
                 .active_session()
                 .and_then(|s| s.panes.first())
                 .map(|p| p.id);
+        }
+
+        // Drain alerts here, where a window exists to take notifications and
+        // sounds; the poller has none. A blocked transition while looking only
+        // rings (no toast), and a missed finish rings only when it happened.
+        let alerts = std::mem::take(&mut self.pending_alerts);
+        if !alerts.is_empty() {
+            let weak = cx.entity().downgrade();
+            _window.defer(cx, move |window, cx| {
+                for alert in alerts {
+                    crate::sound::play(alert.kind);
+                    if alert.kind == attention::AlertKind::Blocked && alert.looking {
+                        continue;
+                    }
+                    let (title, kind) = match alert.kind {
+                        attention::AlertKind::Blocked => (
+                            format!("{} needs you", alert.name),
+                            NotificationType::Error,
+                        ),
+                        attention::AlertKind::Done => (
+                            format!("{} finished", alert.name),
+                            NotificationType::Info,
+                        ),
+                    };
+                    let weak = weak.clone();
+                    let pane_id = alert.pane_id;
+                    let note = Notification::new()
+                        .title(title)
+                        .message(alert.place)
+                        .with_type(kind)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.focus_pane(pane_id, window, cx);
+                            });
+                        });
+                    window.push_notification(note, cx);
+                }
+            });
         }
 
         let active_title = self
@@ -3359,6 +3799,19 @@ fn screen_fingerprint(lines: &[String], title: &str) -> u64 {
     hasher.finish()
 }
 
+/// How alerts and the Agents list name a pane: its agent app first, else a
+/// meaningful title, else a neutral fallback.
+fn pane_agent_name(pane: &TerminalPane) -> String {
+    if let Some(app) = &pane.app {
+        return app.to_string();
+    }
+    let title = pane.display_title.trim();
+    if !title.is_empty() && !title.starts_with("terminal ") {
+        return title.to_string();
+    }
+    "An agent".to_string()
+}
+
 fn parse_hex(s: &str) -> Option<u32> {
     let hex = s.strip_prefix('#')?;
     if hex.len() == 6 {
@@ -3616,6 +4069,11 @@ fn main() -> Result<()> {
                         save_generation: Arc::new(AtomicU64::new(0)),
                         startup_loaded: false,
                         quit_subscription: None,
+                        window_active: true,
+                        status_primed: false,
+                        pending_alerts: Vec::new(),
+                        attention_seq: 0,
+                        agents_collapsed: false,
                     });
 
                     let weak_state = app_state.downgrade();
@@ -3817,6 +4275,10 @@ mod resize_tests {
             ack_screen: None,
             agent_active: false,
             detector: status::Detector::default(),
+            attention: Default::default(),
+            app: None,
+            is_agent: false,
+            sub_agents: HashMap::new(),
         };
 
         AppState {
@@ -3854,6 +4316,11 @@ mod resize_tests {
             save_generation: Arc::new(AtomicU64::new(0)),
             startup_loaded: true,
             quit_subscription: None,
+            window_active: true,
+            status_primed: false,
+            pending_alerts: Vec::new(),
+            attention_seq: 0,
+            agents_collapsed: false,
         }
     }
 
@@ -4501,5 +4968,46 @@ mod pane_tests {
         });
         assert_eq!(active, 0);
         assert!(expanded);
+    }
+
+    #[test]
+    fn agents_panel_renders_an_agent_with_a_worker() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.is_agent = true;
+            pane.app = Some(SharedString::from("claude"));
+            pane.status = SessionStatus::Done;
+            pane.attention.seen = false;
+            pane.attention.last = Some(SessionStatus::Done);
+            pane.attention.since = 42;
+            pane.sub_agents.insert(
+                "child".into(),
+                attention::SubAgent {
+                    id: "child".into(),
+                    title: Some("explore".into()),
+                    status: SessionStatus::Working,
+                    since: 41,
+                    seq: 41,
+                },
+            );
+            cx.notify();
+        });
+        // The panel builds sections and rows from live state; drawing it is the
+        // contract (a missing `is_agent` row or a bad element would panic).
+        cx.draw_frame().expect("frame with the Agents panel");
+        let agents = app_state.read_with(&cx, |state, _| {
+            state
+                .projects
+                .iter()
+                .flat_map(|project| &project.sessions)
+                .flat_map(|session| &session.panes)
+                .filter(|pane| pane.is_agent)
+                .count()
+        });
+        assert_eq!(agents, 1);
     }
 }

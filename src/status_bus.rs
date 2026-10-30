@@ -31,6 +31,13 @@ pub struct StatusEvent {
     pub event: String,
     pub message: Option<String>,
     pub approval_id: Option<String>,
+    /// A worker started by this pane's agent. Its events update the parent's
+    /// sub-agent list and never drive the parent's own status or an alert.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// The terminal address of the parent agent, when the reporter knows it.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +301,8 @@ mod tests {
             event: "working".into(),
             message: None,
             approval_id: None,
+            agent_id: None,
+            parent: None,
         }
     }
 
@@ -312,6 +321,25 @@ mod tests {
         let mut event = valid_event();
         event.turn_id = Some("bad\nturn".into());
         assert!(!valid(&event));
+    }
+
+    #[test]
+    fn subagent_fields_are_optional_on_the_wire() {
+        // Older reporters omit them entirely.
+        let old = r#"{"version":1,"app_id":"a","pane_id":1,"pane_generation":"g",
+            "reporter":"claude","reporter_generation":"r","sequence":3,
+            "session_id":null,"turn_id":null,"event":"working","message":null,
+            "approval_id":null}"#;
+        let event: StatusEvent = serde_json::from_str(old).unwrap();
+        assert!(event.agent_id.is_none() && event.parent.is_none());
+
+        let mut event = valid_event();
+        event.agent_id = Some("child".into());
+        event.parent = Some("t1".into());
+        let round: StatusEvent =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(round.agent_id.as_deref(), Some("child"));
+        assert_eq!(round.parent.as_deref(), Some("t1"));
     }
 }
 

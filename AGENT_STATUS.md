@@ -2,6 +2,29 @@
 
 Command Code uses its built-in Herdr reporter through Markup's scoped reporting compatibility endpoint. New Markup panes export `HERDR_ENV`, `HERDR_SOCKET_PATH`, an opaque `HERDR_PANE_ID` bound to the pane generation, and `HERDR_BIN_PATH`. No Command Code mod is needed. Only native reporting is supported; Herdr's general pane control, metadata, and session restoration API are outside this compatibility interface. Native initial idle means ready; a working/blocked → idle transition settles a turn and latches the checkmark. The protocol does not distinguish every reason an agent became idle.
 
+## Status semantics (Herdr parity)
+
+The badge follows Herdr's attention rules on top of the two-tier detection:
+
+- Priority is `blocked > done > working > idle`. `Error` ranks as blocked and
+  `Unknown`/`Active` rank as idle for rollups and the Agents list.
+- A busy agent that finishes while its screen is not visible (or the window is
+  inactive) becomes `done`. Looking at it — selecting its session, focusing it,
+  or reactivating the window — clears `done` to `idle` automatically.
+- A finish seen live never becomes `done`; it goes straight to `idle`/`active`.
+  `Error` is a live blocked state and does not auto-clear; use the badge or
+  `markup status clear`.
+- Only an agent rule pack reporting `working`, or a native/OSC `working` report,
+  keeps a focused pane on `working`. Generic busy text reads `active` while you
+  look at it and `working` once you switch away.
+- Needing you (blocked/error) always plays the alert sound; the toast appears
+  only when you were not looking. A missed finish plays the done sound and shows
+  a toast. `MARKUP_NO_SOUND=1` disables sounds.
+- The sidebar **Agents** section lists reporting panes under Needs you / Done /
+  Working / Idle, most recently changed first. Workers reported with an
+  `agent_id` are indented under their parent and never take the parent's status
+  or raise their own alert.
+
 OpenCode uses the unmodified upstream Herdr TUI integration pinned at `bc8c28988f75c538d4ca058b702f5adbea30566e`. It follows the displayed session, listens using the actual V2 `api.data.listen` interface, reads initial string-valued session status, tracks child-session approvals, and rejects stale selection work. One-click setup registers its TUI entry in OpenCode's configuration; copying plugin files alone is insufficient. V2 registration uses `cli.json.plugins`; legacy TUI configuration is preserved and migration can require a second enablement after restart. See [`assets/integrations/NOTICE.md`](assets/integrations/NOTICE.md) for source and license details.
 
 Generic screen detection treats a static busy marker as uncertain after five seconds without changes to the marker itself. Unrelated output cannot keep an old transcript spinner active. This restores Unknown; it never fabricates a completion check from silence. Agent-specific rules and explicit reports retain their own authority.

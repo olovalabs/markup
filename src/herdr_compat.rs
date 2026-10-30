@@ -200,6 +200,8 @@ pub fn request(input: Value) -> (Vec<StatusEvent>, Value) {
                 .and_then(Value::as_str)
                 .map(|s| s.chars().take(512).collect()),
             approval_id: None,
+            agent_id: None,
+            parent: None,
         }
     };
     if let Some(session) = session {
