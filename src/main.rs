@@ -6388,15 +6388,18 @@ impl AppState {
                             .child(format!("{needs_attention} needs you")),
                     )
                 })
-                .child(sidebar_icon_button(
-                    ("project-new-session", project.id),
-                    "icons/plus.svg",
-                    13.0,
-                    &tokens,
-                    cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
-                        this.create_new_session_in_project(project_idx, window, cx);
-                    }),
-                ))
+                .child(
+                    sidebar_icon_button(
+                        ("project-new-session", project.id),
+                        "icons/plus.svg",
+                        13.0,
+                        &tokens,
+                        cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                            this.create_new_session_in_project(project_idx, window, cx);
+                        }),
+                    )
+                    .debug_selector(|| "project-new-session".to_string()),
+                )
                 .into_any_element()
         };
 
@@ -6653,10 +6656,12 @@ impl AppState {
 
         div()
             .id(("session-item", session.id))
-            .mx(px(8.0))
+            .ml(px(6.0))
+            .mr(px(6.0))
             .h(px(38.0))
-            .px(px(12.0))
-            .rounded(px(9.0))
+            .pl(px(12.0))
+            .pr(px(4.0))
+            .rounded(px(6.0))
             .cursor(CursorStyle::PointingHand)
             .tooltip(move |_, cx| {
                 let text = selected_evidence.clone();
@@ -6702,15 +6707,18 @@ impl AppState {
                     .child(session.display_title.clone()),
             )
             .child(indicator)
-            .child(sidebar_icon_button(
-                ("session-close", session.id),
-                "icons/x.svg",
-                10.0,
-                &tokens,
-                cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
-                    this.close_session(project_idx, session_idx, window, cx);
-                }),
-            ))
+            .child(
+                sidebar_icon_button(
+                    ("session-close", session.id),
+                    "icons/x.svg",
+                    10.0,
+                    &tokens,
+                    cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                        this.close_session(project_idx, session_idx, window, cx);
+                    }),
+                )
+                .debug_selector(|| "session-close".to_string()),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
@@ -8536,6 +8544,40 @@ mod pane_tests {
                 .count()
         });
         assert_eq!(agents, 1);
+    }
+
+    #[test]
+    fn sidebar_new_session_and_remove_session_icons_align() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, _) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame with project and session");
+
+        let new_session_bounds = cx
+            .debug_bounds("project-new-session")
+            .expect("project-new-session button bounds");
+        let remove_session_bounds = cx
+            .debug_bounds("session-close")
+            .expect("session-close button bounds");
+        let new_session_right = new_session_bounds.origin.x + new_session_bounds.size.width;
+        let remove_session_right = remove_session_bounds.origin.x + remove_session_bounds.size.width;
+        assert_eq!(
+            new_session_right, remove_session_right,
+            "create new session icon and remove session icon must have the same right alignment"
+        );
+        assert_eq!(
+            new_session_bounds.origin.x, remove_session_bounds.origin.x,
+            "create new session icon and remove session icon must have the same horizontal start"
+        );
+        assert_eq!(
+            new_session_bounds.size.width, remove_session_bounds.size.width,
+            "create new session icon and remove session icon must have the same width"
+        );
+        assert_eq!(new_session_bounds.size.width, px(20.0));
+        assert_eq!(new_session_right, px(249.0));
+        assert_eq!(remove_session_right, px(249.0));
+        assert_eq!(new_session_bounds.origin.x, px(229.0));
+        assert_eq!(remove_session_bounds.origin.x, px(229.0));
     }
 
     #[test]
