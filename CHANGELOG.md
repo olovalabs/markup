@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Warp-style input editor**:
+  - Shell history from zsh, bash, and fish history files, merged with the session's own commands for Up/Down recall and ghost suggestions.
+  - Context-aware completion menu (Tab) for `PATH` commands, shell builtins, files and directories, git branches, and history — with arrow navigation and click-to-accept.
+  - Inline ghost suggestion from history, accepted with Right or Tab.
+  - Ctrl+R reverse history search palette with live filtering.
+  - Readline editing in the input bar: Ctrl+A/E, Ctrl+U/K/W, Alt+B/F, Ctrl+P/N, Shift+Enter newline, and Ctrl+C interrupt.
+  - Multi-line programmatic edits now leave the cursor at the end of the line.
+
+---
+
 ## [0.1.0] - 2026-10-30
 
 ### Added

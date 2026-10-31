@@ -214,7 +214,7 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
 
-        if self.accept_inline_completion(window, cx) {
+        if self.lsp.completion_provider.is_some() && self.accept_inline_completion(window, cx) {
             return;
         }
         self.indent(false, window, cx);

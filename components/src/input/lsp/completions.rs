@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gpui::{Context, EntityInputHandler, Task, Window};
+use gpui::{Context, EntityInputHandler, SharedString, Task, Window};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionResponse, InlineCompletionContext,
     InlineCompletionItem, InlineCompletionResponse, InlineCompletionTriggerKind,
@@ -243,16 +243,58 @@ impl InputState {
     }
 
     #[inline]
-    pub(crate) fn has_inline_completion(&self) -> bool {
+    pub fn has_inline_completion(&self) -> bool {
         self.inline_completion.item.is_some()
     }
 
-    pub(crate) fn clear_inline_completion(&mut self, cx: &mut Context<Self>) {
+    /// Show plain-text ghost text after the cursor.
+    ///
+    /// This is the same inline completion slot an LSP provider fills, exposed
+    /// for embedders that compute suggestions themselves (shell history,
+    /// command/path completion). The text is inserted verbatim at the cursor
+    /// when accepted, so callers pass only the missing suffix.
+    pub fn set_inline_completion_text(
+        &mut self,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let text: SharedString = text.into();
+        if text.is_empty() {
+            self.clear_inline_completion(cx);
+            return;
+        }
+        if self
+            .inline_completion
+            .item
+            .as_ref()
+            .is_some_and(|item| item.insert_text == text.as_ref())
+        {
+            return;
+        }
+        self.inline_completion.item = Some(InlineCompletionItem {
+            insert_text: text.to_string(),
+            filter_text: None,
+            range: None,
+            command: None,
+            insert_text_format: None,
+        });
+        cx.notify();
+    }
+
+    /// The ghost text currently shown after the cursor, if any.
+    pub fn inline_completion_text(&self) -> Option<&str> {
+        self.inline_completion
+            .item
+            .as_ref()
+            .map(|item| item.insert_text.as_str())
+    }
+
+    pub fn clear_inline_completion(&mut self, cx: &mut Context<Self>) {
         self.inline_completion = InlineCompletion::default();
         cx.notify();
     }
 
-    pub(crate) fn accept_inline_completion(
+    pub fn accept_inline_completion(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,

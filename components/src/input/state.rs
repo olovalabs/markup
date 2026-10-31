@@ -598,11 +598,10 @@ impl InputState {
         self.disabled = was_disabled;
         self.history.ignore = false;
 
-        if self.mode.is_single_line() {
-            self.selected_range = (self.text.len()..self.text.len()).into();
-        } else {
-            self.selected_range.clear();
-        }
+        // Programmatic replacement (history recall, completions, clearing)
+        // leaves the cursor at the end of the new value, where typing
+        // continues. Starting at offset 0 would insert into the front.
+        self.selected_range = (self.text.len()..self.text.len()).into();
 
         if self.mode.is_code_editor() {
             self._pending_update = true;
@@ -833,6 +832,11 @@ impl InputState {
     pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selected_range = (0..self.text.len()).into();
         cx.notify();
+        // An auto-growing prompt is a shell line editor: `Ctrl+A` there means
+        // "go to the start of the line", so let the embedder reinterpret it.
+        if self.mode.is_auto_grow() {
+            cx.propagate();
+        }
     }
 
     pub(super) fn select_to_start(
@@ -1393,13 +1397,13 @@ impl InputState {
     }
 
     pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            cx.propagate();
-            return;
+        let selected_text = self.text.slice(self.selected_range.clone()).to_string();
+        if !selected_text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
         }
-
-        let selected_text = self.text.slice(self.selected_range).to_string();
-        cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
+        // Copy must not swallow the key: a terminal prompt uses `Ctrl+C` to
+        // interrupt the foreground job whether or not text is selected.
+        cx.propagate();
     }
 
     pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {

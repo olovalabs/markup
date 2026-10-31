@@ -120,6 +120,12 @@ impl InputState {
     pub(super) fn right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
         self.pause_blink_cursor(cx);
         if self.selected_range.is_empty() {
+            // At the end of the text there is nowhere to move: let the
+            // embedder use Right to accept an inline completion.
+            if self.selected_range.end >= self.text.len() {
+                cx.propagate();
+                return;
+            }
             self.move_to(self.next_boundary(self.selected_range.end), None, cx);
         } else {
             self.move_to(self.selected_range.end, None, cx)
@@ -132,6 +138,14 @@ impl InputState {
         }
 
         if self.mode.is_single_line() {
+            return;
+        }
+
+        // At the top of the buffer there is nowhere to move: hand the key to
+        // the embedder, which may use it for shell/history recall.
+        if self.cursor_position().line == 0 {
+            self.pause_blink_cursor(cx);
+            cx.propagate();
             return;
         }
 
@@ -152,6 +166,14 @@ impl InputState {
         }
 
         if self.mode.is_single_line() {
+            return;
+        }
+
+        // Same hand-off at the bottom of the buffer.
+        let last_line = self.text.lines_len().saturating_sub(1);
+        if self.cursor_position().line as usize >= last_line {
+            self.pause_blink_cursor(cx);
+            cx.propagate();
             return;
         }
 

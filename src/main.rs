@@ -5,20 +5,20 @@ use gpui::{
     Edges, Entity, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, ParentElement, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement as _, Styled, Transformation, Window, WindowBounds,
-    WindowControlArea, WindowDecorations, WindowOptions, deferred, div,
-    percentage, px, rgba, size, svg,
+    WindowControlArea, WindowDecorations, WindowOptions, actions, deferred, div,
+    percentage, px, relative, rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Root, Sizable as _, TitleBar};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, RopeExt as _};
 use terminal::{ColorPalette, TerminalConfig, TerminalView};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,11 +27,13 @@ mod agent_rules;
 mod assets;
 mod attention;
 mod cli;
+mod completion;
 mod diagnostics;
 #[cfg(unix)]
 mod herdr_compat;
 mod integrations;
 mod logos;
+mod shell_history;
 mod sound;
 mod status;
 #[cfg(unix)]
@@ -40,6 +42,24 @@ mod workspace_state;
 mod theme;
 
 use theme::{ThemePreference, ThemeTokens, load_github_palette};
+
+/// Key context of the Warp-style input bar.
+///
+/// Tab has to be bound here rather than handled from `on_key_down`: the input
+/// component binds `tab` to `IndentInline` and `gpui-component` binds it at the
+/// `Root` context for focus traversal, which would otherwise consume the key
+/// before the completion handler runs.
+const WARP_INPUT_CONTEXT: &str = "WarpInput";
+
+actions!(markup_input, [CompleteCommand, IgnoreKey]);
+
+fn init_warp_input_bindings(cx: &mut App) {
+    cx.bind_keys([
+        gpui::KeyBinding::new("tab", CompleteCommand, Some(WARP_INPUT_CONTEXT)),
+        // Keep Shift+Tab from running the Root context's focus traversal.
+        gpui::KeyBinding::new("shift-tab", IgnoreKey, Some(WARP_INPUT_CONTEXT)),
+    ]);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ActiveView {
@@ -143,12 +163,32 @@ pub struct TerminalPane {
     /// Workers reported by this pane's agent, keyed by their `agent_id`.
     pub sub_agents: HashMap<String, attention::SubAgent>,
     pub input_state: Option<Entity<InputState>>,
+    /// Drops the `InputEvent::Change` subscription that keeps ghost text and
+    /// the completion menu in sync with what is typed.
+    pub input_subscription: Option<gpui::Subscription>,
+    /// Shell history loaded from disk, shared by every pane.
+    pub shell_history: Arc<Vec<String>>,
+    /// Commands executed from this pane's input bar, newest last.
     pub command_history: Vec<String>,
     pub history_index: Option<usize>,
     pub pending_draft: String,
+    /// Open completion menu (Warp-style suggestions above the input).
+    pub completion_menu: Option<CompletionMenuState>,
     pub bottom_input_enabled: bool,
     pub bottom_input_visible: bool,
     pub plus_menu_open: bool,
+}
+
+/// One visible completion popup for a pane.
+pub struct CompletionMenuState {
+    /// Byte range in the input value that accepting replaces.
+    pub start: usize,
+    pub end: usize,
+    /// The token these candidates were computed for, so typing resets the
+    /// highlight instead of carrying it into a different list.
+    pub token: String,
+    pub items: Vec<completion::CompletionItem>,
+    pub selected: usize,
 }
 
 impl Drop for TerminalPane {
@@ -200,9 +240,12 @@ impl TerminalPane {
             is_agent: false,
             sub_agents: HashMap::new(),
             input_state: None,
+            input_subscription: None,
+            shell_history: shell_history::cached(),
             command_history: Vec::new(),
             history_index: None,
             pending_draft: String::new(),
+            completion_menu: None,
             bottom_input_enabled,
             bottom_input_visible: bottom_input_enabled,
             plus_menu_open: false,
@@ -433,6 +476,17 @@ struct AppState {
     project_menu: Option<usize>,
     renaming_project: Option<RenamingProject>,
     pub terminal_context_menu: Option<TerminalContextMenu>,
+    /// Ctrl+R reverse history search palette, if open.
+    history_search: Option<HistorySearchState>,
+}
+
+/// Warp-style "search command history" palette.
+struct HistorySearchState {
+    pane_id: usize,
+    input: Entity<InputState>,
+    matches: Vec<String>,
+    selected: usize,
+    _subscription: gpui::Subscription,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1688,6 +1742,7 @@ impl AppState {
                                 // Agent or command started working: auto-hide the input bar
                                 if pane.bottom_input_visible {
                                     pane.bottom_input_visible = false;
+                                    pane.completion_menu = None;
                                     pane.terminal.update(cx, |term, _| term.set_read_only(false));
                                 }
                             } else if (prev_status == SessionStatus::Working && next != SessionStatus::Working)
@@ -1988,11 +2043,7 @@ impl AppState {
                 pid,
                 self.warp_bottom_input,
             );
-            let input_state = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Run commands")
-                    .auto_grow(1, 8)
-            });
+            let (input_state, input_subscription) = build_pane_input(next_id, window, cx);
             if self.warp_bottom_input {
                 input_state.update(cx, |state, cx| {
                     state.focus(window, cx);
@@ -2001,6 +2052,7 @@ impl AppState {
                 terminal.read(cx).focus_handle().focus(window);
             }
             pane.input_state = Some(input_state);
+            pane.input_subscription = Some(input_subscription);
             let session = Session {
                 id: next_id,
                 title: title.clone(),
@@ -2212,11 +2264,7 @@ impl AppState {
                 pid,
                 self.warp_bottom_input,
             );
-            let input_state = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Run commands")
-                    .auto_grow(1, 8)
-            });
+            let (input_state, input_subscription) = build_pane_input(next_id, window, cx);
             if self.warp_bottom_input {
                 input_state.update(cx, |state, cx| {
                     state.focus(window, cx);
@@ -2225,6 +2273,7 @@ impl AppState {
                 terminal.read(cx).focus_handle().focus(window);
             }
             pane.input_state = Some(input_state);
+            pane.input_subscription = Some(input_subscription);
             let session = Session {
                 id: next_id,
                 title: title.clone(),
@@ -2312,11 +2361,7 @@ impl AppState {
                 pid,
                 self.warp_bottom_input,
             );
-            let input_state = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Run commands")
-                    .auto_grow(1, 8)
-            });
+            let (input_state, input_subscription) = build_pane_input(next_id, window, cx);
             if self.warp_bottom_input {
                 input_state.update(cx, |state, cx| {
                     state.focus(window, cx);
@@ -2325,6 +2370,7 @@ impl AppState {
                 terminal.read(cx).focus_handle().focus(window);
             }
             pane.input_state = Some(input_state);
+            pane.input_subscription = Some(input_subscription);
 
             if let Some(project) = self.projects.get_mut(p_idx) {
                 if let Some(session) = project.sessions.get_mut(s_idx) {
@@ -2469,6 +2515,453 @@ impl AppState {
         cx.notify();
     }
 
+    fn pane_ref(&self, pane_id: usize) -> Option<&TerminalPane> {
+        let &(p_idx, s_idx, pane_idx) = self.pane_index.get(&pane_id)?;
+        self.projects
+            .get(p_idx)?
+            .sessions
+            .get(s_idx)?
+            .panes
+            .get(pane_idx)
+    }
+
+    fn pane_mut(&mut self, pane_id: usize) -> Option<&mut TerminalPane> {
+        let &(p_idx, s_idx, pane_idx) = self.pane_index.get(&pane_id)?;
+        self.projects
+            .get_mut(p_idx)?
+            .sessions
+            .get_mut(s_idx)?
+            .panes
+            .get_mut(pane_idx)
+    }
+
+    /// Shell history plus in-session commands, oldest first.
+    fn pane_history_entries(&self, pane: &TerminalPane) -> Vec<String> {
+        shell_history::merge(&pane.shell_history, &pane.command_history)
+    }
+
+    /// Snapshot of everything suggestion code needs from a pane's input.
+    fn input_context(
+        &self,
+        pane_id: usize,
+        cx: &App,
+    ) -> Option<(String, usize, PathBuf, Vec<String>, Entity<InputState>)> {
+        let pane = self.pane_ref(pane_id)?;
+        let input = pane.input_state.clone()?;
+        let value = input.read(cx).value().to_string();
+        let cursor = input.read(cx).cursor();
+        let cwd = self
+            .pane_cwd_path(pane)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Some((value, cursor, cwd, self.pane_history_entries(pane), input))
+    }
+
+    /// Create a pane's input editor and subscribe to its changes.
+    fn create_pane_input(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        let (input, subscription) = build_pane_input(pane_id, window, cx);
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.input_state = Some(input.clone());
+            pane.input_subscription = Some(subscription);
+        }
+        input
+    }
+
+    /// Keep ghost text and the completion menu in sync with typed text.
+    fn on_pane_input_changed(
+        &mut self,
+        pane_id: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((value, cursor, cwd, entries, input)) = self.input_context(pane_id, cx) else {
+            return;
+        };
+        let menu_open = self
+            .pane_ref(pane_id)
+            .is_some_and(|pane| pane.completion_menu.is_some());
+
+        if menu_open {
+            // Typing filters an open menu instead of dismissing it.
+            self.refresh_completion_menu(pane_id, &value, cursor, &cwd, &entries);
+            input.update(cx, |state, cx| state.clear_inline_completion(cx));
+            return;
+        }
+
+        let suggestion = completion::history_suggestion(&value, cursor, &entries);
+        input.update(cx, |state, cx| match suggestion {
+            Some(text) if !text.is_empty() => state.set_inline_completion_text(text, cx),
+            _ => state.clear_inline_completion(cx),
+        });
+    }
+
+    /// Recompute the open completion menu for the current input value.
+    fn refresh_completion_menu(
+        &mut self,
+        pane_id: usize,
+        value: &str,
+        cursor_utf16: usize,
+        cwd: &Path,
+        entries: &[String],
+    ) {
+        let cursor = completion::utf16_to_byte(value, cursor_utf16);
+        let result = completion::complete(value, cursor, cwd, entries);
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        match result {
+            Some(result) => {
+                let token = value
+                    .get(result.start..result.end)
+                    .unwrap_or_default()
+                    .to_string();
+                let previous = pane
+                    .completion_menu
+                    .as_ref()
+                    .filter(|menu| menu.token == token)
+                    .map(|menu| menu.selected)
+                    .unwrap_or(0);
+                pane.completion_menu = Some(CompletionMenuState {
+                    start: result.start,
+                    end: result.end,
+                    token,
+                    selected: previous.min(result.items.len().saturating_sub(1)),
+                    items: result.items,
+                });
+            }
+            None => pane.completion_menu = None,
+        }
+    }
+
+    fn close_completion_menu(&mut self, pane_id: usize, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.completion_menu = None;
+        }
+        cx.notify();
+    }
+
+    fn move_completion_selection(&mut self, pane_id: usize, delta: isize, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            if let Some(menu) = pane.completion_menu.as_mut() {
+                if !menu.items.is_empty() {
+                    let len = menu.items.len() as isize;
+                    menu.selected = (menu.selected as isize + delta).rem_euclid(len) as usize;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Tab: accept the only candidate, or open the menu when there are several.
+    fn start_completion(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((value, cursor, cwd, entries, input)) = self.input_context(pane_id, cx) else {
+            return;
+        };
+
+        // A visible ghost suggestion is the best candidate; Tab accepts it.
+        let ghost = input.read(cx).inline_completion_text().map(str::to_string);
+        if ghost.is_some() {
+            input.update(cx, |state, cx| {
+                state.accept_inline_completion(window, cx);
+            });
+            cx.notify();
+            return;
+        }
+
+        // Even before the deferred change handler has painted ghost text, Tab
+        // completes from history.
+        if let Some(suffix) = completion::history_suggestion(&value, cursor, &entries) {
+            let cursor = cursor + completion::utf16_len(&suffix);
+            set_input_text_with_cursor(
+                &input,
+                format!("{value}{suffix}"),
+                cursor,
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+
+        let cursor_byte = completion::utf16_to_byte(&value, cursor);
+        let Some(result) = completion::complete(&value, cursor_byte, &cwd, &entries) else {
+            self.close_completion_menu(pane_id, cx);
+            return;
+        };
+
+        if result.items.len() == 1 {
+            let item = result.items[0].clone();
+            self.apply_completion(
+                pane_id,
+                result.start,
+                result.end,
+                item,
+                window,
+                cx,
+            );
+        } else {
+            if let Some(pane) = self.pane_mut(pane_id) {
+                pane.completion_menu = Some(CompletionMenuState {
+                    start: result.start,
+                    end: result.end,
+                    token: value
+                        .get(result.start..result.end)
+                        .unwrap_or_default()
+                        .to_string(),
+                    items: result.items,
+                    selected: 0,
+                });
+            }
+            cx.notify();
+        }
+    }
+
+    fn accept_completion_at(
+        &mut self,
+        pane_id: usize,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self.pane_ref(pane_id).and_then(|pane| {
+            let menu = pane.completion_menu.as_ref()?;
+            let item = menu.items.get(index)?.clone();
+            Some((menu.start, menu.end, item))
+        });
+        let Some((start, end, item)) = selected else {
+            return;
+        };
+        self.apply_completion(pane_id, start, end, item, window, cx);
+    }
+
+    /// Replace the completing token with `item` and keep the editor usable.
+    fn apply_completion(
+        &mut self,
+        pane_id: usize,
+        start: usize,
+        end: usize,
+        item: completion::CompletionItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((value, _, _, _entries, input)) = self.input_context(pane_id, cx) else {
+            return;
+        };
+        let start = start.min(value.len());
+        let end = end.min(value.len());
+        if !value.is_char_boundary(start) || !value.is_char_boundary(end) || start > end {
+            return;
+        }
+
+        let mut new_value = String::with_capacity(value.len() + item.value.len() + 1);
+        new_value.push_str(&value[..start]);
+        new_value.push_str(&item.value);
+        let mut cursor = start + item.value.len();
+        new_value.push_str(&value[end..]);
+
+        // Command and branch completions read better with the cursor moved to
+        // the next token; file completions stay tight to the path.
+        if !item.is_dir && item.kind != completion::CompletionKind::File {
+            new_value.insert(cursor, ' ');
+            cursor += 1;
+        }
+
+        let cursor_utf16 = completion::byte_to_utf16(&new_value, cursor);
+        input.update(cx, |state, cx| {
+            state.set_value(new_value, window, cx);
+            let position = state
+                .text()
+                .offset_to_position(cursor_utf16.min(completion::utf16_len(state.value().as_str())));
+            state.set_cursor_position(position, window, cx);
+            state.clear_inline_completion(cx);
+        });
+
+        if item.is_dir {
+            // Descend into the directory: keep completing the new token.
+            if let Some((value, cursor, cwd, entries, _)) = self.input_context(pane_id, cx) {
+                if let Some(pane) = self.pane_mut(pane_id) {
+                    pane.completion_menu = None;
+                }
+                self.refresh_completion_menu(pane_id, &value, cursor, &cwd, &entries);
+                if let Some(pane) = self.pane_mut(pane_id) {
+                    if let Some(menu) = pane.completion_menu.as_mut() {
+                        menu.selected = 0;
+                    }
+                }
+            }
+        } else if let Some(pane) = self.pane_mut(pane_id) {
+            pane.completion_menu = None;
+        }
+
+        if let Some(pane) = self.pane_ref(pane_id) {
+            if let Some(input_state) = pane.input_state.clone() {
+                input_state.update(cx, |state, cx| state.focus(window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    // ---------------------------------------------------------------------
+    // History search (Ctrl+R)
+    // ---------------------------------------------------------------------
+
+    fn open_history_search(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.history_search.is_some() {
+            return;
+        }
+        let Some(pane) = self.pane_ref(pane_id) else {
+            return;
+        };
+        let entries = self.pane_history_entries(pane);
+        let initial = pane
+            .input_state
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Search command history")
+                .default_value(initial.clone())
+        });
+        input.update(cx, |state, cx| {
+            let position = state
+                .text()
+                .offset_to_position(completion::utf16_len(&initial));
+            state.set_cursor_position(position, window, cx);
+            state.focus(window, cx);
+        });
+
+        let matches: Vec<String> = shell_history::search(&entries, &initial)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |_this: &mut Self, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let weak = cx.entity().downgrade();
+                    window.defer(cx, move |window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.refresh_history_search(window, cx);
+                        });
+                    });
+                }
+            },
+        );
+
+        self.history_search = Some(HistorySearchState {
+            pane_id,
+            input,
+            matches,
+            selected: 0,
+            _subscription: subscription,
+        });
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.completion_menu = None;
+        }
+        cx.notify();
+    }
+
+    fn refresh_history_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(search) = self.history_search.as_ref() else {
+            return;
+        };
+        let query = search.input.read(cx).value().to_string();
+        let pane_id = search.pane_id;
+        let Some(pane) = self.pane_ref(pane_id) else {
+            return;
+        };
+        let entries = self.pane_history_entries(pane);
+        let matches: Vec<String> = shell_history::search(&entries, &query)
+            .into_iter()
+            .cloned()
+            .collect();
+        if let Some(search) = self.history_search.as_mut() {
+            search.matches = matches;
+            search.selected = 0;
+        }
+        cx.notify();
+    }
+
+    fn move_history_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(search) = self.history_search.as_mut() {
+            if !search.matches.is_empty() {
+                let len = search.matches.len() as isize;
+                search.selected = (search.selected as isize + delta).rem_euclid(len) as usize;
+            }
+        }
+        cx.notify();
+    }
+
+    fn close_history_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane_id = self.history_search.as_ref().map(|search| search.pane_id);
+        self.history_search = None;
+        if let Some(pane_id) = pane_id {
+            if let Some(input) = self
+                .pane_ref(pane_id)
+                .and_then(|pane| pane.input_state.clone())
+            {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    fn accept_history_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(search) = self.history_search.as_ref() else {
+            return;
+        };
+        let Some(command) = search.matches.get(search.selected).cloned() else {
+            let pane_id = search.pane_id;
+            self.history_search = None;
+            if let Some(input) = self
+                .pane_ref(pane_id)
+                .and_then(|pane| pane.input_state.clone())
+            {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
+            cx.notify();
+            return;
+        };
+        let pane_id = search.pane_id;
+        let input = self
+            .pane_ref(pane_id)
+            .and_then(|pane| pane.input_state.clone());
+        self.history_search = None;
+        if let Some(input) = input {
+            set_input_text(&input, command, window, cx);
+            input.update(cx, |state, cx| state.focus(window, cx));
+        }
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.history_index = None;
+        }
+        cx.notify();
+    }
+
+    fn accept_history_search_index(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(search) = self.history_search.as_mut() {
+            search.selected = index;
+        }
+        self.accept_history_search(window, cx);
+    }
+
     fn toggle_pane_bottom_input(
         &mut self,
         pane_id: usize,
@@ -2491,6 +2984,7 @@ impl AppState {
         if is_showing_now {
             pane.bottom_input_enabled = false;
             pane.bottom_input_visible = false;
+            pane.completion_menu = None;
         } else {
             pane.bottom_input_enabled = true;
             pane.bottom_input_visible = true;
@@ -2534,6 +3028,7 @@ impl AppState {
         }
         pane.history_index = None;
         pane.pending_draft.clear();
+        pane.completion_menu = None;
         cx.notify();
     }
 
@@ -2557,7 +3052,6 @@ impl AppState {
         cx.notify();
     }
 
-    #[allow(dead_code)]
     fn step_pane_history(
         &mut self,
         pane_id: usize,
@@ -2565,54 +3059,40 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
-            return;
-        };
-        let Some(project) = self.projects.get_mut(p_idx) else {
-            return;
-        };
-        let Some(session) = project.sessions.get_mut(s_idx) else {
-            return;
-        };
-        let Some(pane) = session.panes.get_mut(pane_idx) else {
+        let Some(pane) = self.pane_mut(pane_id) else {
             return;
         };
         let Some(input_state) = pane.input_state.clone() else {
             return;
         };
+        let entries = shell_history::merge(&pane.shell_history, &pane.command_history);
+        if entries.is_empty() {
+            return;
+        }
 
         if is_up {
-            if pane.command_history.is_empty() {
-                return;
-            }
             let new_idx = match pane.history_index {
                 None => {
                     pane.pending_draft = input_state.read(cx).value().to_string();
-                    pane.command_history.len().saturating_sub(1)
+                    entries.len() - 1
                 }
                 Some(idx) => idx.saturating_sub(1),
             };
             pane.history_index = Some(new_idx);
-            if let Some(cmd) = pane.command_history.get(new_idx).cloned() {
-                input_state.update(cx, |state, cx| {
-                    state.set_value(&cmd, window, cx);
-                });
+            if let Some(cmd) = entries.get(new_idx).cloned() {
+                set_input_text(&input_state, cmd, window, cx);
             }
         } else if let Some(idx) = pane.history_index {
-            if idx + 1 < pane.command_history.len() {
+            if idx + 1 < entries.len() {
                 let new_idx = idx + 1;
                 pane.history_index = Some(new_idx);
-                if let Some(cmd) = pane.command_history.get(new_idx).cloned() {
-                    input_state.update(cx, |state, cx| {
-                        state.set_value(&cmd, window, cx);
-                    });
+                if let Some(cmd) = entries.get(new_idx).cloned() {
+                    set_input_text(&input_state, cmd, window, cx);
                 }
             } else {
                 pane.history_index = None;
                 let draft = std::mem::take(&mut pane.pending_draft);
-                input_state.update(cx, |state, cx| {
-                    state.set_value(&draft, window, cx);
-                });
+                set_input_text(&input_state, draft, window, cx);
             }
         }
         cx.notify();
@@ -2704,6 +3184,7 @@ impl AppState {
         }
         pane.history_index = None;
         pane.pending_draft.clear();
+        pane.completion_menu = None;
 
         // 2. Send \x03 (ETX/SIGINT) to PTY (interrupts process on Linux, macOS, and Windows ConPTY)
         pane.terminal.update(cx, |term, cx| {
@@ -2743,31 +3224,83 @@ impl AppState {
         let key = keystroke.key.as_str();
         let modifiers = keystroke.modifiers;
 
-        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
-            return;
-        };
-        let Some(project) = self.projects.get_mut(p_idx) else {
-            return;
-        };
-        let Some(session) = project.sessions.get_mut(s_idx) else {
-            return;
-        };
-        let Some(pane) = session.panes.get_mut(pane_idx) else {
+        let Some(pane) = self.pane_ref(pane_id) else {
             return;
         };
         let Some(input_state) = pane.input_state.clone() else {
             return;
         };
+        let value = input_state.read(cx).value().to_string();
+        let cursor_utf16 = input_state.read(cx).cursor();
+        let cursor_byte = completion::utf16_to_byte(&value, cursor_utf16);
+        let cursor_line = input_state.read(cx).cursor_position().line;
+        let last_line = value.matches('\n').count();
+        let has_menu = pane.completion_menu.is_some();
+        let plus_menu_open = pane.plus_menu_open;
+        let terminal = pane.terminal.clone();
 
-        // Enter: execute command
-        if (key == "enter" || key == "return") && !modifiers.shift && !modifiers.control && !modifiers.alt {
+        // --- completion menu navigation ------------------------------------
+        if has_menu {
+            if key == "down" {
+                cx.stop_propagation();
+                self.move_completion_selection(pane_id, 1, cx);
+                return;
+            }
+            if key == "up" {
+                cx.stop_propagation();
+                self.move_completion_selection(pane_id, -1, cx);
+                return;
+            }
+            if key == "right" && !modifiers.control && !modifiers.shift && !modifiers.alt {
+                cx.stop_propagation();
+                let selected = self
+                    .pane_ref(pane_id)
+                    .and_then(|pane| pane.completion_menu.as_ref().map(|menu| menu.selected))
+                    .unwrap_or(0);
+                self.accept_completion_at(pane_id, selected, window, cx);
+                return;
+            }
+            if (key == "enter" || key == "return") && !modifiers.shift {
+                // Enter means "run this", never "insert the highlighted
+                // suggestion": Tab and Right accept completions.
+                cx.stop_propagation();
+                self.close_completion_menu(pane_id, cx);
+                self.execute_pane_input(pane_id, window, cx);
+                return;
+            }
+            if key == "tab" && !modifiers.control && !modifiers.alt {
+                cx.stop_propagation();
+                let selected = self
+                    .pane_ref(pane_id)
+                    .and_then(|pane| pane.completion_menu.as_ref().map(|menu| menu.selected))
+                    .unwrap_or(0);
+                self.accept_completion_at(pane_id, selected, window, cx);
+                return;
+            }
+            if key == "escape" {
+                cx.stop_propagation();
+                self.close_completion_menu(pane_id, cx);
+                return;
+            }
+        }
+
+        // Enter: execute the command.
+        if (key == "enter" || key == "return")
+            && !modifiers.shift
+            && !modifiers.control
+            && !modifiers.alt
+        {
             cx.stop_propagation();
             self.execute_pane_input(pane_id, window, cx);
             return;
         }
 
-        // Shift+Enter: insert newline in input bar (multiline expansion like Warp)
-        if (key == "enter" || key == "return") && modifiers.shift && !modifiers.control && !modifiers.alt {
+        // Shift+Enter: insert a newline (multi-line commands, Warp style).
+        if (key == "enter" || key == "return")
+            && modifiers.shift
+            && !modifiers.control
+            && !modifiers.alt
+        {
             input_state.update(cx, |state, cx| {
                 state.insert("\n", window, cx);
             });
@@ -2776,7 +3309,7 @@ impl AppState {
             return;
         }
 
-        // Ctrl+G: toggle bottom input (Warp shortcut)
+        // Ctrl+G: toggle the input editor.
         if (key == "g" || key == "G")
             && (modifiers.control || modifiers.platform)
             && !modifiers.shift
@@ -2787,137 +3320,168 @@ impl AppState {
             return;
         }
 
-        // Ctrl+C: interrupt running command or cancel input line (SIGINT)
+        // Ctrl+C is handled by the terminal's `Copy` action as well; the guard
+        // here keeps it working even when the editor has no selection.
         if key == "c" && modifiers.control && !modifiers.shift && !modifiers.alt {
             cx.stop_propagation();
             self.handle_pane_ctrl_c(pane_id, window, cx);
             return;
         }
 
-        // Tab: accept autosuggestion or trigger native shell completion
+        // Ctrl+R: reverse history search, like the shell's own prompt.
+        if key == "r" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            cx.stop_propagation();
+            self.open_history_search(pane_id, window, cx);
+            return;
+        }
+
+        // Tab: accept the ghost suggestion, or open completion candidates.
         if key == "tab" && !modifiers.control && !modifiers.alt {
             cx.stop_propagation();
-            let current_val = input_state.read(cx).value().to_string();
-            if !current_val.is_empty() {
-                if let Some(suggestion) = pane.command_history.iter().rev().find(|cmd| cmd.starts_with(&current_val) && cmd.as_str() != current_val.as_str()) {
-                    input_state.update(cx, |state, cx| {
-                        state.set_value(suggestion, window, cx);
-                    });
-                    cx.notify();
-                    return;
-                }
-            }
-            pane.terminal.update(cx, |term, cx| {
-                term.send_bytes(b"\t", cx);
-            });
-            cx.notify();
+            self.start_completion(pane_id, window, cx);
             return;
         }
 
-        // Right arrow or Ctrl+E: accept autosuggestion from history if cursor at end
-        if (key == "right" && !modifiers.control && !modifiers.shift && !modifiers.alt)
-            || (key == "e" && modifiers.control && !modifiers.shift && !modifiers.alt)
-        {
-            let current_val = input_state.read(cx).value().to_string();
-            if !current_val.is_empty() {
-                let cursor = input_state.read(cx).cursor();
-                if cursor >= current_val.len() {
-                    if let Some(suggestion) = pane.command_history.iter().rev().find(|cmd| cmd.starts_with(&current_val) && cmd.as_str() != current_val.as_str()) {
-                        input_state.update(cx, |state, cx| {
-                            state.set_value(suggestion, window, cx);
-                        });
-                        cx.stop_propagation();
-                        cx.notify();
-                        return;
-                    }
-                }
+        // Right at the end of the line accepts a ghost suggestion.
+        if key == "right" && !modifiers.control && !modifiers.shift && !modifiers.alt {
+            if cursor_utf16 >= completion::utf16_len(&value)
+                && input_state.read(cx).has_inline_completion()
+            {
+                input_state.update(cx, |state, cx| {
+                    state.accept_inline_completion(window, cx);
+                });
+                cx.stop_propagation();
+                cx.notify();
+                return;
             }
         }
 
-        // Ctrl+A: move cursor to start of line (native readline/zsh)
+        // Ctrl+A / Ctrl+E: readline start/end of line.
         if key == "a" && modifiers.control && !modifiers.shift && !modifiers.alt {
-            input_state.update(cx, |state, cx| {
-                state.move_to_start_of_line(cx);
-            });
+            let start = value[..cursor_byte].rfind('\n').map_or(0, |idx| idx + 1);
+            move_input_cursor(
+                &input_state,
+                completion::byte_to_utf16(&value, start),
+                window,
+                cx,
+            );
             cx.stop_propagation();
             cx.notify();
             return;
         }
-
-        // Ctrl+E: move cursor to end of line
         if key == "e" && modifiers.control && !modifiers.shift && !modifiers.alt {
-            input_state.update(cx, |state, cx| {
-                state.move_to_end_of_line(cx);
-            });
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        // Ctrl+U: clear line (native readline/zsh)
-        if key == "u" && modifiers.control && !modifiers.shift && !modifiers.alt {
-            input_state.update(cx, |state, cx| {
-                state.set_value("", window, cx);
-            });
-            pane.history_index = None;
-            pane.pending_draft.clear();
+            let end = value[cursor_byte..]
+                .find('\n')
+                .map_or(value.len(), |idx| cursor_byte + idx);
+            move_input_cursor(
+                &input_state,
+                completion::byte_to_utf16(&value, end),
+                window,
+                cx,
+            );
             cx.stop_propagation();
             cx.notify();
             return;
         }
 
-        // Ctrl+W / Alt+Backspace: delete word backward (native readline/zsh)
+        // Ctrl+U: kill from the start of the line to the cursor.
+        if key == "u" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            let start = value[..cursor_byte].rfind('\n').map_or(0, |idx| idx + 1);
+            let mut new_value = String::with_capacity(value.len());
+            new_value.push_str(&value[..start]);
+            new_value.push_str(&value[cursor_byte..]);
+            set_input_text_with_cursor(
+                &input_state,
+                new_value,
+                completion::byte_to_utf16(&value, start),
+                window,
+                cx,
+            );
+            if let Some(pane) = self.pane_mut(pane_id) {
+                pane.history_index = None;
+                pane.pending_draft.clear();
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        // Ctrl+W / Alt+Backspace: delete the previous word.
         if (key == "w" && modifiers.control && !modifiers.shift && !modifiers.alt)
             || (key == "backspace" && modifiers.alt && !modifiers.control && !modifiers.shift)
         {
-            let current_val = input_state.read(cx).value().to_string();
-            if let Some(last_boundary) = current_val.trim_end().rfind(|c: char| c.is_whitespace() || c == '/' || c == '-' || c == '_') {
-                let new_val = current_val[..=last_boundary].to_string();
-                input_state.update(cx, |state, cx| {
-                    state.set_value(new_val, window, cx);
-                });
-            } else {
-                input_state.update(cx, |state, cx| {
-                    state.set_value("", window, cx);
-                });
-            }
+            let start = previous_word_start(&value, cursor_byte);
+            let mut new_value = String::with_capacity(value.len());
+            new_value.push_str(&value[..start]);
+            new_value.push_str(&value[cursor_byte..]);
+            set_input_text_with_cursor(
+                &input_state,
+                new_value,
+                completion::byte_to_utf16(&value, start),
+                window,
+                cx,
+            );
             cx.stop_propagation();
             cx.notify();
             return;
         }
 
-        // Ctrl+K: kill line forward (native readline/zsh)
+        // Ctrl+K: kill from the cursor to the end of the line.
         if key == "k" && modifiers.control && !modifiers.shift && !modifiers.alt {
-            input_state.update(cx, |state, cx| {
-                state.set_value("", window, cx);
-            });
+            let end = value[cursor_byte..]
+                .find('\n')
+                .map_or(value.len(), |idx| cursor_byte + idx);
+            let mut new_value = String::with_capacity(value.len());
+            new_value.push_str(&value[..cursor_byte]);
+            new_value.push_str(&value[end..]);
+            set_input_text_with_cursor(&input_state, new_value, cursor_utf16, window, cx);
             cx.stop_propagation();
             cx.notify();
             return;
         }
 
-        // Ctrl+L: clear terminal screen
+        // Alt+B / Alt+F: move by word (readline).
+        if key == "b" && modifiers.alt && !modifiers.control && !modifiers.shift {
+            let start = previous_word_start(&value, cursor_byte);
+            move_input_cursor(
+                &input_state,
+                completion::byte_to_utf16(&value, start),
+                window,
+                cx,
+            );
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "f" && modifiers.alt && !modifiers.control && !modifiers.shift {
+            let end = next_word_end(&value, cursor_byte);
+            move_input_cursor(
+                &input_state,
+                completion::byte_to_utf16(&value, end),
+                window,
+                cx,
+            );
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        // Ctrl+L: clear the terminal screen.
         if key == "l" && modifiers.control && !modifiers.shift && !modifiers.alt {
-            pane.terminal.update(cx, |term, cx| {
+            terminal.update(cx, |term, cx| {
                 term.send_bytes(b"\x0c", cx);
             });
             cx.stop_propagation();
             return;
         }
 
-        // Ctrl+Z: suspend foreground job (SIGTSTP)
-        if key == "z" && modifiers.control && !modifiers.shift && !modifiers.alt {
-            pane.terminal.update(cx, |term, cx| {
-                term.send_bytes(b"\x1a", cx);
-            });
-            cx.stop_propagation();
-            return;
-        }
+        // Ctrl+Z stays with the editor (undo), not job control: a terminal
+        // prompt's line editor is what the user is typing into here.
 
-        // Ctrl+D: EOF
+        // Ctrl+D: EOF on an empty line.
         if key == "d" && modifiers.control && !modifiers.shift && !modifiers.alt {
-            let current_val = input_state.read(cx).value().to_string();
-            if current_val.is_empty() {
-                pane.terminal.update(cx, |term, cx| {
+            if value.is_empty() {
+                terminal.update(cx, |term, cx| {
                     term.send_bytes(b"\x04", cx);
                 });
                 cx.stop_propagation();
@@ -2925,16 +3489,16 @@ impl AppState {
             }
         }
 
-        // Ctrl+\: quit foreground job (SIGQUIT)
+        // Ctrl+\: quit the foreground job (SIGQUIT).
         if key == "\\" && modifiers.control && !modifiers.shift && !modifiers.alt {
-            pane.terminal.update(cx, |term, cx| {
+            terminal.update(cx, |term, cx| {
                 term.send_bytes(b"\x1c", cx);
             });
             cx.stop_propagation();
             return;
         }
 
-        // Escape: clear input
+        // Escape: dismiss menus, then clear the input.
         if key == "escape" && !modifiers.shift && !modifiers.control && !modifiers.alt {
             if self.terminal_context_menu.is_some() {
                 self.terminal_context_menu = None;
@@ -2942,72 +3506,68 @@ impl AppState {
                 cx.notify();
                 return;
             }
-            if pane.plus_menu_open {
-                pane.plus_menu_open = false;
+            if plus_menu_open {
+                if let Some(pane) = self.pane_mut(pane_id) {
+                    pane.plus_menu_open = false;
+                }
                 cx.stop_propagation();
                 cx.notify();
                 return;
             }
-            let current_val = input_state.read(cx).value().to_string();
-            if !current_val.is_empty() {
+            if !value.is_empty() {
                 input_state.update(cx, |state, cx| {
                     state.set_value("", window, cx);
                 });
-                pane.history_index = None;
-                pane.pending_draft.clear();
+                if let Some(pane) = self.pane_mut(pane_id) {
+                    pane.history_index = None;
+                    pane.pending_draft.clear();
+                }
                 cx.stop_propagation();
                 cx.notify();
             }
-        }
-
-        // Up: previous command in history
-        if key == "up" && !modifiers.shift && !modifiers.control && !modifiers.alt {
-            if pane.command_history.is_empty() {
-                return;
-            }
-            cx.stop_propagation();
-            let new_idx = match pane.history_index {
-                None => {
-                    pane.pending_draft = input_state.read(cx).value().to_string();
-                    pane.command_history.len().saturating_sub(1)
-                }
-                Some(idx) => idx.saturating_sub(1),
-            };
-            pane.history_index = Some(new_idx);
-            if let Some(cmd) = pane.command_history.get(new_idx).cloned() {
-                input_state.update(cx, |state, cx| {
-                    state.set_value(&cmd, window, cx);
-                });
-            }
-            cx.notify();
             return;
         }
 
-        // Down: next command in history
-        if key == "down" && !modifiers.shift && !modifiers.control && !modifiers.alt {
-            if let Some(idx) = pane.history_index {
+        // Ctrl+P / Ctrl+N: previous / next history entry.
+        if (key == "p" || key == "n")
+            && modifiers.control
+            && !modifiers.shift
+            && !modifiers.alt
+        {
+            cx.stop_propagation();
+            self.step_pane_history(pane_id, key == "p", window, cx);
+            return;
+        }
+
+        // Up / Down: history, but only once the cursor is on the first / last
+        // line of a multi-line buffer, so line navigation still works.
+        if key == "up" && !modifiers.shift && !modifiers.control && !modifiers.alt {
+            if cursor_line == 0 {
                 cx.stop_propagation();
-                if idx + 1 < pane.command_history.len() {
-                    let new_idx = idx + 1;
-                    pane.history_index = Some(new_idx);
-                    if let Some(cmd) = pane.command_history.get(new_idx).cloned() {
-                        input_state.update(cx, |state, cx| {
-                            state.set_value(&cmd, window, cx);
-                        });
-                    }
-                } else {
-                    pane.history_index = None;
-                    let draft = std::mem::take(&mut pane.pending_draft);
-                    input_state.update(cx, |state, cx| {
-                        state.set_value(&draft, window, cx);
-                    });
-                }
-                cx.notify();
+                self.step_pane_history(pane_id, true, window, cx);
+            }
+            return;
+        }
+        if key == "down" && !modifiers.shift && !modifiers.control && !modifiers.alt {
+            if cursor_line as usize >= last_line {
+                cx.stop_propagation();
+                self.step_pane_history(pane_id, false, window, cx);
+            }
+            return;
+        }
+
+        // Ordinary typing leaves history navigation mode.
+        if (!modifiers.control && !modifiers.alt)
+            && (keystroke.key_char.is_some() || key == "backspace" || key == "delete")
+        {
+            if let Some(pane) = self.pane_mut(pane_id) {
+                pane.history_index = None;
             }
         }
     }
 
     fn ensure_panes_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut missing = Vec::new();
         for project in &mut self.projects {
             for session in &mut project.sessions {
                 for pane in &mut session.panes {
@@ -3017,20 +3577,25 @@ impl AppState {
                             state.set_placeholder(placeholder, window, cx);
                             state.set_auto_grow(1, 8);
                         });
+                        if pane.input_subscription.is_none() && pane.input_state.is_none() {
+                            missing.push(pane.id);
+                        }
                     } else {
-                        let input = cx.new(|cx| {
-                            InputState::new(window, cx)
-                                .placeholder(placeholder)
-                                .auto_grow(1, 8)
-                        });
-                        pane.input_state = Some(input);
+                        missing.push(pane.id);
                     }
                 }
             }
         }
+        for pane_id in missing {
+            self.create_pane_input(pane_id, window, cx);
+        }
 
-        // Dynamically ensure the focused pane's input is focused like Warp
-        if self.warp_bottom_input && self.active_view == ActiveView::Workspace {
+        // Dynamically ensure the focused pane's input is focused like Warp.
+        // The history palette owns focus while it is open.
+        if self.warp_bottom_input
+            && self.active_view == ActiveView::Workspace
+            && self.history_search.is_none()
+        {
             if let Some(pane_id) = self.focused_pane_id {
                 if let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) {
                     if let Some(project) = self.projects.get(p_idx) {
@@ -3461,6 +4026,231 @@ impl AppState {
         .into_any_element()
     }
 
+    /// Ctrl+R palette: type to filter, arrows to pick, Enter to insert.
+    fn render_history_search_layer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(search) = self.history_search.as_ref() else {
+            return div().into_any_element();
+        };
+        let tokens = self.tokens(cx);
+
+        let panel_bg: Hsla = if tokens.is_dark {
+            rgba(0x16171eff).into()
+        } else {
+            rgba(0xffffffff).into()
+        };
+        let panel_border: Hsla = if tokens.is_dark {
+            rgba(0x2d2e3dff).into()
+        } else {
+            tokens.card_border
+        };
+
+        let row_selected_bg: Hsla = if tokens.is_dark {
+            rgba(0x262838ff).into()
+        } else {
+            rgba(0x0000000f).into()
+        };
+        let row_hover_bg: Hsla = if tokens.is_dark {
+            rgba(0x1f2130ff).into()
+        } else {
+            rgba(0x0000000a).into()
+        };
+
+        let rows: Vec<gpui::AnyElement> = if search.matches.is_empty() {
+            vec![div()
+                .px(px(10.0))
+                .py(px(10.0))
+                .text_size(px(12.0))
+                .text_color(tokens.text_muted)
+                .child("No matching commands")
+                .into_any_element()]
+        } else {
+            search
+                .matches
+                .iter()
+                .take(10)
+                .enumerate()
+                .map(|(index, command)| {
+                    let selected = index == search.selected;
+                    div()
+                        .id(("history-search-row", index))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.0))
+                        .px(px(9.0))
+                        .py(px(6.0))
+                        .rounded(px(5.0))
+                        .cursor(CursorStyle::PointingHand)
+                        .when(selected, |this| this.bg(row_selected_bg))
+                        .hover(|this| this.bg(row_hover_bg))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .w(px(16.0))
+                                        .text_size(px(10.0))
+                                        .text_color(if selected {
+                                            rgba(0x38bdf8ff).into()
+                                        } else {
+                                            tokens.text_muted
+                                        })
+                                        .child(format!("{}", index + 1)),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(12.5))
+                                        .text_color(tokens.text_primary)
+                                        .truncate()
+                                        .child(command.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(tokens.text_muted)
+                                .child("↵"),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.accept_history_search_index(index, window, cx);
+                            }),
+                        )
+                        .into_any_element()
+                })
+                .collect()
+        };
+
+        deferred(
+            div()
+                .id("history-search-layer")
+                .size_full()
+                .absolute()
+                .top_0()
+                .left_0()
+                .child(
+                    div()
+                        .id("history-search-backdrop")
+                        .size_full()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .bg(rgba(0x00000055))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_history_search(window, cx);
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("history-search-panel")
+                        .absolute()
+                        .top(px(80.0))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(560.0))
+                                .p(px(10.0))
+                                .rounded(px(10.0))
+                                .border_1()
+                                .border_color(panel_border)
+                                .bg(panel_bg)
+                                .shadow_lg()
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.0))
+                                .on_action(cx.listener(
+                                    |this, _: &gpui_component::input::Enter, window, cx| {
+                                        this.accept_history_search(window, cx);
+                                    },
+                                ))
+                                .on_key_down(cx.listener(
+                                    |this, event: &KeyDownEvent, window, cx| {
+                                        match event.keystroke.key.as_str() {
+                                            "down" => {
+                                                cx.stop_propagation();
+                                                this.move_history_search_selection(1, cx);
+                                            }
+                                            "up" => {
+                                                cx.stop_propagation();
+                                                this.move_history_search_selection(-1, cx);
+                                            }
+                                            "escape" => {
+                                                cx.stop_propagation();
+                                                this.close_history_search(window, cx);
+                                            }
+                                            _ => {}
+                                        }
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .text_color(tokens.text_muted)
+                                                .child("SEARCH COMMAND HISTORY"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.0))
+                                                .text_color(tokens.text_muted)
+                                                .child("Esc to cancel"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(13.0))
+                                        .child(
+                                            Input::new(&search.input)
+                                                .appearance(true)
+                                                .bordered(true)
+                                                .px_2()
+                                                .py_1(),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("history-search-results")
+                                        .max_h(px(300.0))
+                                        .overflow_y_scrollbar()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(1.0))
+                                        .children(rows),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(tokens.text_muted)
+                                        .child(
+                                            "↑↓ navigate · Enter insert · Esc cancel",
+                                        ),
+                                ),
+                        ),
+                ),
+        )
+        .priority(210)
+        .into_any_element()
+    }
+
     #[allow(dead_code)]
     fn toggle_plus_menu(&mut self, pane_id: usize, cx: &mut Context<Self>) {
         let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
@@ -3708,17 +4498,6 @@ impl AppState {
             rgba(0x236823ff).into()
         };
         let input_element = if let Some(input_state) = &pane.input_state {
-            let current_val = input_state.read(cx).value().to_string();
-            let ghost_suffix = if !current_val.is_empty() {
-                pane.command_history
-                    .iter()
-                    .rev()
-                    .find(|cmd| cmd.starts_with(&current_val) && cmd.as_str() != current_val.as_str())
-                    .map(|cmd| cmd[current_val.len()..].to_string())
-            } else {
-                None
-            };
-
             div()
                 .id(("warp-input-wrapper", pane_id))
                 .w_full()
@@ -3729,20 +4508,15 @@ impl AppState {
                 .items_start()
                 .font_family(MONO_FONT)
                 .text_size(px(14.0))
-                .on_action(cx.listener(move |this, _: &gpui_component::input::Enter, window, cx| {
-                    this.execute_pane_input(pane_id, window, cx);
-                }))
-                .on_action(cx.listener(move |this, _: &gpui_component::input::Copy, window, cx| {
-                    this.handle_pane_ctrl_c(pane_id, window, cx);
-                }))
-                .on_action(cx.listener(move |this, _: &gpui_component::input::Escape, window, cx| {
-                    this.clear_pane_input(pane_id, window, cx);
-                }))
-                .on_action(cx.listener(move |this, _: &gpui_component::input::MoveUp, window, cx| {
-                    this.step_pane_history(pane_id, true, window, cx);
-                }))
-                .on_action(cx.listener(move |this, _: &gpui_component::input::MoveDown, window, cx| {
-                    this.step_pane_history(pane_id, false, window, cx);
+                .key_context(WARP_INPUT_CONTEXT)
+                .on_action(cx.listener(
+                    move |this, _: &CompleteCommand, window, cx| {
+                        cx.stop_propagation();
+                        this.start_completion(pane_id, window, cx);
+                    },
+                ))
+                .on_action(cx.listener(|_, _: &IgnoreKey, _, cx| {
+                    cx.stop_propagation();
                 }))
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                     this.handle_pane_input_key(pane_id, event, window, cx);
@@ -3760,18 +4534,14 @@ impl AppState {
                                 .cleanable(false)
                                 .px_0()
                                 .py_0(),
-                        )
-                        .children(ghost_suffix.map(|suffix| {
-                            div()
-                                .text_color(if tokens.is_dark { rgba(0x696969ff).into() } else { tokens.text_muted })
-                                .opacity(0.65)
-                                .child(suffix)
-                        })),
+                        ),
                 )
                 .into_any_element()
         } else {
             div().id(("warp-input-wrapper-empty", pane_id)).w_full().min_h(px(24.0)).into_any_element()
         };
+
+        let completion_menu = self.render_completion_menu(pane, &tokens, cx);
 
         let plus_menu = if pane.plus_menu_open {
             Some(
@@ -3876,6 +4646,7 @@ impl AppState {
                 }),
             )
             .children(plus_menu)
+            .children(completion_menu)
             // Row 1: Badges
             .child(
                 div()
@@ -3946,6 +4717,146 @@ impl AppState {
                     .mt(px(12.0))
                     .child(input_element),
             )
+            .child(
+                div()
+                    .w_full()
+                    .mt(px(7.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(10.0))
+                    .text_color(tokens.text_muted)
+                    .child(
+                        div().child(
+                            "Tab complete · ↑↓ history · Ctrl+R search · Shift+Enter newline",
+                        ),
+                    )
+                    .child(div().font_family(MONO_FONT).child("Ctrl+G")),
+            )
+    }
+
+    /// Warp-style completion popup, anchored above the input bar.
+    fn render_completion_menu(
+        &self,
+        pane: &TerminalPane,
+        tokens: &ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let pane_id = pane.id;
+        let menu = pane.completion_menu.as_ref()?;
+        if menu.items.is_empty() {
+            return None;
+        }
+
+        let bg: Hsla = if tokens.is_dark {
+            rgba(0x16171eff).into()
+        } else {
+            rgba(0xffffffff).into()
+        };
+        let border: Hsla = if tokens.is_dark {
+            rgba(0x2d2e3dff).into()
+        } else {
+            tokens.card_border
+        };
+        let row_selected_bg: Hsla = if tokens.is_dark {
+            rgba(0x262838ff).into()
+        } else {
+            rgba(0x0000000f).into()
+        };
+        let row_hover_bg: Hsla = if tokens.is_dark {
+            rgba(0x1f2130ff).into()
+        } else {
+            rgba(0x0000000a).into()
+        };
+
+        let rows: Vec<gpui::AnyElement> = menu
+            .items
+            .iter()
+            .enumerate()
+            .take(9)
+            .map(|(index, item)| {
+                let selected = index == menu.selected;
+                let kind_color: Hsla = match item.kind {
+                    completion::CompletionKind::Directory => rgba(0x54aeffff).into(),
+                    completion::CompletionKind::File => tokens.text_secondary,
+                    completion::CompletionKind::Branch => rgba(0x9ecb7bff).into(),
+                    completion::CompletionKind::History => rgba(0xd7ba7dff).into(),
+                    completion::CompletionKind::Command => rgba(0xc5a3ffff).into(),
+                };
+                div()
+                    .id(("completion-item", pane_id * 1000 + index))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .cursor(CursorStyle::PointingHand)
+                    .when(selected, |this| this.bg(row_selected_bg))
+                    .hover(|this| this.bg(row_hover_bg))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .w(px(14.0))
+                                    .text_size(px(10.0))
+                                    .text_color(kind_color)
+                                    .child(if item.is_dir { "▸" } else { "·" }),
+                            )
+                            .child(
+                                div()
+                                    .font_family(MONO_FONT)
+                                    .text_size(px(12.5))
+                                    .text_color(tokens.text_primary)
+                                    .truncate()
+                                    .child(item.display.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(tokens.text_muted)
+                            .child(item.detail.clone()),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.accept_completion_at(pane_id, index, window, cx);
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        Some(
+            div()
+                .id(("completion-menu", pane_id))
+                .absolute()
+                .bottom(relative(1.0))
+                .left(px(0.0))
+                .mb(px(6.0))
+                .w(px(440.0))
+                .max_w(relative(1.0))
+                .max_h(px(240.0))
+                .overflow_y_scrollbar()
+                .p(px(5.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(border)
+                .bg(bg)
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .children(rows)
+                .into_any_element(),
+        )
     }
 
     fn render_terminal_pane(
@@ -6378,6 +7289,9 @@ impl Render for AppState {
             )
             .when(self.terminal_context_menu.is_some(), |this| {
                 this.child(self.render_terminal_context_menu_layer(cx))
+            })
+            .when(self.history_search.is_some(), |this| {
+                this.child(self.render_history_search_layer(cx))
             });
         diagnostics::render_end(diag_render);
         root
@@ -6419,6 +7333,115 @@ fn pane_agent_name(pane: &TerminalPane) -> String {
         return title.to_string();
     }
     "An agent".to_string()
+}
+
+/// Build a pane's input editor plus its change subscription.
+///
+/// The subscription defers its work: `InputEvent::Change` is emitted while the
+/// input entity is leased, so ghost text and the completion menu are refreshed
+/// after that effect cycle instead of re-entering the entity.
+fn build_pane_input(
+    pane_id: usize,
+    window: &mut Window,
+    cx: &mut Context<AppState>,
+) -> (Entity<InputState>, gpui::Subscription) {
+    let input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder("Run commands")
+            .auto_grow(1, 8)
+    });
+    let subscription = cx.subscribe_in(
+        &input,
+        window,
+        move |_this: &mut AppState, _input, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::Change) {
+                let weak = cx.entity().downgrade();
+                window.defer(cx, move |window, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.on_pane_input_changed(pane_id, window, cx);
+                    });
+                });
+            }
+        },
+    );
+    (input, subscription)
+}
+
+/// Replace the input value and place the cursor at the end.
+fn set_input_text(
+    input: &Entity<InputState>,
+    text: String,
+    window: &mut Window,
+    cx: &mut Context<AppState>,
+) {
+    let cursor = completion::utf16_len(&text);
+    set_input_text_with_cursor(input, text, cursor, window, cx);
+}
+
+fn set_input_text_with_cursor(
+    input: &Entity<InputState>,
+    text: String,
+    cursor_utf16: usize,
+    window: &mut Window,
+    cx: &mut Context<AppState>,
+) {
+    input.update(cx, |state, cx| {
+        state.set_value(text, window, cx);
+        let cursor = cursor_utf16.min(completion::utf16_len(state.value().as_str()));
+        let position = state.text().offset_to_position(cursor);
+        state.set_cursor_position(position, window, cx);
+    });
+}
+
+fn move_input_cursor(
+    input: &Entity<InputState>,
+    cursor_utf16: usize,
+    window: &mut Window,
+    cx: &mut Context<AppState>,
+) {
+    input.update(cx, |state, cx| {
+        let cursor = cursor_utf16.min(completion::utf16_len(state.value().as_str()));
+        let position = state.text().offset_to_position(cursor);
+        state.set_cursor_position(position, window, cx);
+    });
+}
+
+/// Byte offset where the word before `cursor` starts (readline `Ctrl+W`).
+fn previous_word_start(value: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(value.len());
+    let mut start = cursor;
+    while let Some(ch) = value[..start].chars().next_back() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        start -= ch.len_utf8();
+    }
+    while let Some(ch) = value[..start].chars().next_back() {
+        if ch.is_whitespace() {
+            break;
+        }
+        start -= ch.len_utf8();
+    }
+    start
+}
+
+/// Byte offset just past the word at `cursor` (readline `Alt+F`).
+fn next_word_end(value: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(value.len());
+    let mut end = cursor;
+    while let Some(ch) = value[end..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    while let Some(ch) = value[end..].chars().next() {
+        if ch.is_whitespace() {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    end
 }
 
 fn detect_shell() -> (String, String) {
@@ -6520,10 +7543,16 @@ fn main() -> Result<()> {
             ensure_linux_desktop_entry();
             let window_icon = gpui::WindowIcon::from_png_bytes(APP_ICON_PNG).ok();
             gpui_component::init(cx);
+            init_warp_input_bindings(cx);
             let initial_mode = ThemePreference::System.resolve_mode(cx.window_appearance());
             gpui_component::Theme::change(initial_mode, None, cx);
             load_embedded_fonts(cx);
             sync_component_fonts(cx);
+
+            std::thread::spawn(|| {
+                completion::prewarm();
+                let _ = shell_history::cached();
+            });
 
             let palette = load_github_palette(initial_mode.is_dark());
             let persistence_path = workspace_state::state_path();
@@ -6566,6 +7595,7 @@ fn main() -> Result<()> {
                         project_menu: None,
                         renaming_project: None,
                         terminal_context_menu: None,
+                        history_search: None,
                     });
 
                     let weak_state = app_state.downgrade();
@@ -6740,7 +7770,7 @@ mod resize_tests {
                 .expect("terminal view");
         let title = SharedString::from("terminal 1");
 
-        let pane = TerminalPane::new(
+        let mut pane = TerminalPane::new(
             1,
             generation,
             terminal,
@@ -6749,6 +7779,9 @@ mod resize_tests {
             pid,
             true,
         );
+        // Tests assert exact history indices; the developer machine's real
+        // shell history must not leak into that.
+        pane.shell_history = Arc::new(Vec::new());
 
         AppState {
             projects: vec![Project {
@@ -6795,6 +7828,7 @@ mod resize_tests {
             project_menu: None,
             renaming_project: None,
             terminal_context_menu: None,
+            history_search: None,
         }
     }
 
@@ -6802,6 +7836,7 @@ mod resize_tests {
     pub(crate) fn open_app(cx: &mut TestAppContext) -> (VisualTestContext, Entity<AppState>) {
         cx.update(|cx| {
             gpui_component::init(cx);
+            init_warp_input_bindings(cx);
             gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
             load_embedded_fonts(cx);
             sync_component_fonts(cx);
@@ -8586,6 +9621,350 @@ mod warp_bottom_input_tests {
             let pane = &state.projects[0].sessions[0].panes[0];
             let input = pane.input_state.as_ref().unwrap();
             assert!(!input.read(cx).value().contains('\n'), "Enter action must not insert newline into auto-grow prompt");
+        });
+    }
+
+    #[test]
+    fn typing_shows_ghost_history_suggestion_and_right_accepts_it() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.command_history.push("docker compose up -d".to_string());
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("docker comp", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        app_state.read_with(&cx, |state, cx| {
+            let input = state.projects[0].sessions[0].panes[0]
+                .input_state
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                input.read(cx).inline_completion_text(),
+                Some("ose up -d"),
+                "typing a history prefix must show ghost text"
+            );
+        });
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("right").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let input = state.projects[0].sessions[0].panes[0]
+                .input_state
+                .as_ref()
+                .unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "docker compose up -d");
+        });
+    }
+
+    #[test]
+    fn completion_menu_opens_navigates_and_accepts_with_tab() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("cat Cargo", window, cx);
+            });
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("tab").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, _| {
+            let menu = state.projects[0].sessions[0].panes[0]
+                .completion_menu
+                .as_ref()
+                .expect("Tab must open the completion menu");
+            assert_eq!(menu.items.len(), 2, "Cargo.lock and Cargo.toml match");
+            assert_eq!(menu.selected, 0);
+        });
+
+        // Move the highlight down, then accept with Tab.
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("down").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("tab").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "cat Cargo.toml");
+            assert!(pane.completion_menu.is_none(), "accepting closes the menu");
+            assert!(pane.command_history.is_empty(), "completion must not execute");
+        });
+    }
+
+    #[test]
+    fn right_and_ctrl_c_flow_through_the_action_pipeline() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        // Ghost suggestion set through the deferred change handler, then
+        // accepted with Right (bound to MoveRight in the Input context).
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.command_history.push("docker compose up -d".to_string());
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("docker comp", window, cx);
+                inp.focus(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.draw_frame().expect("draw frame with ghost suggestion");
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+
+        app_state.read_with(&cx, |state, cx| {
+            let input = state.projects[0].sessions[0].panes[0]
+                .input_state
+                .as_ref()
+                .unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "docker compose up -d");
+        });
+
+        // Ctrl+C (Copy in the Input context) must still interrupt and clear.
+        cx.simulate_keystrokes("ctrl-c");
+        cx.run_until_parked();
+        app_state.read_with(&cx, |state, cx| {
+            let input = state.projects[0].sessions[0].panes[0]
+                .input_state
+                .as_ref()
+                .unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "");
+        });
+    }
+
+    #[test]
+    fn ctrl_r_palette_accepts_with_enter_through_dispatch() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.command_history.push("git status".to_string());
+            pane.command_history.push("git push".to_string());
+            state.open_history_search(pane_id, window, cx);
+        });
+        cx.draw_frame().expect("draw palette frame");
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        app_state.read_with(&cx, |state, cx| {
+            assert!(state.history_search.is_none(), "Enter closes the palette");
+            let input = state.projects[0].sessions[0].panes[0]
+                .input_state
+                .as_ref()
+                .unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "git push");
+        });
+    }
+
+    #[test]
+    fn history_and_readline_keys_flow_through_the_action_pipeline() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.command_history.push("echo one".to_string());
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| inp.focus(window, cx));
+        });
+        cx.draw_frame().expect("draw focused frame");
+
+        // Up is bound to `MoveUp` in the Input context; at the first line it
+        // must propagate so history recall runs.
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        app_state.read_with(&cx, |state, cx| {
+            let input = state.projects[0].sessions[0].panes[0]
+                .input_state
+                .as_ref()
+                .unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "echo one");
+        });
+
+        // Ctrl+A is bound to SelectAll in the Input context; in an auto-grow
+        // prompt it must end up as readline "start of line".
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let input = state.projects[0].sessions[0].panes[0]
+                .input_state
+                .as_ref()
+                .unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("git status", window, cx);
+                inp.focus(window, cx);
+            });
+        });
+        cx.draw_frame().expect("draw frame before Ctrl+A");
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        app_state.read_with(&cx, |state, cx| {
+            let input = state.projects[0].sessions[0].panes[0]
+                .input_state
+                .as_ref()
+                .unwrap();
+            assert_eq!(input.read(cx).cursor(), 0);
+        });
+    }
+
+    #[test]
+    fn enter_key_executes_once_through_the_action_pipeline() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("echo dispatched", window, cx);
+                inp.focus(window, cx);
+            });
+        });
+        cx.draw_frame().expect("draw frame with command");
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "");
+            assert_eq!(pane.command_history.last().map(String::as_str), Some("echo dispatched"));
+        });
+    }
+
+    #[test]
+    fn tab_key_dispatches_completion_not_indentation() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("cat Cargo", window, cx);
+                inp.focus(window, cx);
+            });
+        });
+        cx.draw_frame().expect("draw frame with input focused");
+
+        // Goes through the real keybinding (`IndentInline` in the Input
+        // context) and then bubbles to the wrapper's completion handler.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(
+                input.read(cx).value().as_str(),
+                "cat Cargo",
+                "Tab must not insert indentation into the prompt"
+            );
+            assert!(
+                pane.completion_menu.is_some(),
+                "Tab must open the completion menu through the action pipeline"
+            );
+        });
+    }
+
+    #[test]
+    fn ctrl_r_history_search_filters_and_inserts() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.command_history
+                .push("cargo test".to_string());
+            pane.command_history
+                .push("git status".to_string());
+            pane.command_history
+                .push("git push".to_string());
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("ctrl-r").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+            assert!(state.history_search.is_some(), "Ctrl+R opens history search");
+        });
+
+        // Type a query into the palette; the deferred handler refreshes it.
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let search = state.history_search.as_ref().unwrap();
+            let input = search.input.clone();
+            input.update(cx, |inp, cx| {
+                inp.set_value("git", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        app_state.read_with(&cx, |state, _| {
+            let search = state.history_search.as_ref().unwrap();
+            assert_eq!(search.matches, vec!["git push", "git status"]);
+        });
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.accept_history_search(window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            assert!(state.history_search.is_none(), "accepting closes the palette");
+            let input = state.projects[0].sessions[0].panes[0]
+                .input_state
+                .as_ref()
+                .unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "git push");
         });
     }
 }
