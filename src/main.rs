@@ -2025,6 +2025,7 @@ impl AppState {
     }
 
     /// New session in whichever project is currently open in the workspace.
+    #[allow(dead_code)]
     fn create_new_session_for_active_project(
         &mut self,
         window: &mut Window,
@@ -5211,7 +5212,6 @@ impl AppState {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
                     .child(sidebar_icon_button(
                         "sidebar-open-project-btn",
                         "icons/folder-plus.svg",
@@ -5219,25 +5219,6 @@ impl AppState {
                         &tokens,
                         cx.listener::<MouseDownEvent>(|this, _, window, cx| {
                             this.select_folder_and_add_project(window, cx);
-                        }),
-                    ))
-                    .child(sidebar_icon_button(
-                        "sidebar-new-session-btn",
-                        "icons/plus.svg",
-                        15.0,
-                        &tokens,
-                        cx.listener::<MouseDownEvent>(|this, _, window, cx| {
-                            this.create_new_session_for_active_project(window, cx);
-                        }),
-                    ))
-                    .child(sidebar_icon_button(
-                        "sidebar-integrations-btn",
-                        "icons/command.svg",
-                        15.0,
-                        &tokens,
-                        cx.listener::<MouseDownEvent>(|this, _, _, cx| {
-                            this.integration_panel_visible = !this.integration_panel_visible;
-                            cx.notify();
                         }),
                     )),
             )
