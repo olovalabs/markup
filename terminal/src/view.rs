@@ -95,6 +95,8 @@ pub struct TerminalConfig {
     pub search_match_color: Hsla,
     /// Overlay colour painted over the focused search match.
     pub active_search_match_color: Hsla,
+    /// Disallow direct user typing on the terminal grid (read-only mode).
+    pub read_only: bool,
 }
 
 impl Default for TerminalConfig {
@@ -122,6 +124,7 @@ impl Default for TerminalConfig {
             selection_color: hsla(215.0 / 360.0, 0.85, 0.45, 0.35),
             search_match_color: hsla(45.0 / 360.0, 0.9, 0.5, 0.30),
             active_search_match_color: hsla(25.0 / 360.0, 0.95, 0.55, 0.55),
+            read_only: false,
         }
     }
 }
@@ -189,6 +192,7 @@ pub struct TerminalView {
     title: Option<String>,
     exit_status: Option<i32>,
     exited: bool,
+    read_only: bool,
     /// Events a background drain (`drain_background_events`) could not fully
     /// process and is saving for the next foreground render.
     deferred_events: Vec<TerminalEvent>,
@@ -366,6 +370,7 @@ impl TerminalView {
             }
         });
 
+        let read_only = config.read_only;
         Self {
             state,
             renderer,
@@ -408,6 +413,7 @@ impl TerminalView {
             search_last_refresh: None,
             search_refresh_pending: false,
             last_render: None,
+            read_only,
         }
     }
 
@@ -488,6 +494,19 @@ impl TerminalView {
         self
     }
 
+
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
     // -----------------------------------------------------------------------
     // PTY plumbing
     // -----------------------------------------------------------------------
@@ -715,6 +734,9 @@ impl TerminalView {
     }
 
     pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
@@ -724,6 +746,9 @@ impl TerminalView {
     }
 
     pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         self.scroll_to_bottom_on_input(cx);
         let payload = self.paste_payload(text);
         self.write_to_pty(&payload);
@@ -772,6 +797,14 @@ impl TerminalView {
         self.state.is_vi_mode()
     }
 
+
+    pub fn is_alt_screen(&self) -> bool {
+        self.state.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    pub fn term_mode(&self) -> TermMode {
+        self.state.mode()
+    }
     pub fn toggle_vi_mode(&mut self, cx: &mut Context<Self>) {
         self.state.toggle_vi_mode();
         cx.notify();
@@ -933,6 +966,10 @@ impl TerminalView {
     // Keyboard
     // -----------------------------------------------------------------------
 
+    pub fn dispatch_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_key_down(event, window, cx);
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let key = keystroke.key.to_ascii_lowercase();
@@ -970,12 +1007,40 @@ impl TerminalView {
             }
         }
 
-        if modifiers.control && !modifiers.shift && !modifiers.alt && key == "c" {
-            // Ctrl-C copies when there is a selection, otherwise it is SIGINT.
-            if self.state.has_selection() {
-                self.copy_selection(cx);
-                self.state.clear_selection();
-                return;
+        if modifiers.control && !modifiers.shift && !modifiers.alt {
+            match key.as_str() {
+                "c" => {
+                    // Ctrl-C copies when there is a selection, otherwise it sends SIGINT.
+                    if self.state.has_selection() {
+                        self.copy_selection(cx);
+                        self.state.clear_selection();
+                        return;
+                    } else {
+                        self.write_to_pty(b"\x03");
+                        return;
+                    }
+                }
+                "z" => {
+                    self.write_to_pty(b"\x1a");
+                    return;
+                }
+                "\\" => {
+                    self.write_to_pty(b"\x1c");
+                    return;
+                }
+                "d" => {
+                    self.write_to_pty(b"\x04");
+                    return;
+                }
+                "l" => {
+                    self.write_to_pty(b"\x0c");
+                    return;
+                }
+                "a" => {
+                    self.select_all(cx);
+                    return;
+                }
+                _ => {}
             }
         }
 
@@ -989,19 +1054,21 @@ impl TerminalView {
         }
 
         // --- scrollback navigation -----------------------------------------
-        if modifiers.shift && !modifiers.control && !modifiers.alt {
+        if !modifiers.control && !modifiers.alt {
             let scroll = match key.as_str() {
                 "pageup" => Some(GridScroll::PageUp),
                 "pagedown" => Some(GridScroll::PageDown),
-                "home" => Some(GridScroll::Top),
-                "end" => Some(GridScroll::Bottom),
+                "home" if modifiers.shift || self.read_only => Some(GridScroll::Top),
+                "end" if modifiers.shift || self.read_only => Some(GridScroll::Bottom),
                 _ => None,
             };
 
             if let Some(scroll) = scroll {
-                self.state.scroll(scroll);
-                cx.notify();
-                return;
+                if modifiers.shift || self.read_only {
+                    self.state.scroll(scroll);
+                    cx.notify();
+                    return;
+                }
             }
         }
 
@@ -1024,6 +1091,10 @@ impl TerminalView {
             cx.notify();
         }
 
+        if self.read_only {
+            return;
+        }
+
         if let Some(bytes) = keystroke_to_bytes(keystroke, self.state.mode()) {
             self.scroll_to_bottom_on_input(cx);
             self.write_to_pty(&bytes);
@@ -1041,7 +1112,9 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        if !self.read_only {
+            window.focus(&self.focus_handle);
+        }
         self.last_mouse_position = event.position;
 
         // A host-provided context menu owns right click completely. In
@@ -1075,6 +1148,10 @@ impl TerminalView {
         // Shift bypasses application mouse reporting so the user can always
         // select text, even inside a full screen TUI.
         if self.mouse_reporting_active(mode) && !event.modifiers.shift {
+            if self.read_only {
+                self.clear_selection(cx);
+                return;
+            }
             let modifiers = crate::mouse::encode_modifiers(
                 event.modifiers.shift,
                 event.modifiers.alt,

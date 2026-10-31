@@ -618,8 +618,14 @@ impl TextElement {
         let visible_range_offset = &last_layout.visible_range_offset;
 
         if is_single_line {
+            let s = display_text.to_string();
+            let clean_text = if s.contains('\n') || s.contains('\r') {
+                s.replace("\r\n", " ").replace('\n', " ").replace('\r', "")
+            } else {
+                s
+            };
             let shaped_line = window.text_system().shape_line(
-                display_text.to_string().into(),
+                clean_text.into(),
                 font_size,
                 &runs,
                 None,

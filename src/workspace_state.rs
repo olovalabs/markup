@@ -28,6 +28,8 @@ pub struct SavedWorkspace {
     pub sidebar_width: f32,
     #[serde(default)]
     pub theme: ThemePreference,
+    #[serde(default = "default_warp_bottom_input")]
+    pub warp_bottom_input: bool,
 }
 
 impl Default for SavedWorkspace {
@@ -38,11 +40,15 @@ impl Default for SavedWorkspace {
             sidebar_visible: default_visible(),
             sidebar_width: default_width(),
             theme: ThemePreference::default(),
+            warp_bottom_input: default_warp_bottom_input(),
         }
     }
 }
 
 fn default_visible() -> bool {
+    true
+}
+fn default_warp_bottom_input() -> bool {
     true
 }
 fn default_expanded() -> bool {

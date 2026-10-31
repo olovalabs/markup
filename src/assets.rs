@@ -1,4 +1,4 @@
-use gpui::{App, px};
+use gpui::{App, px, rgba};
 use rust_embed::RustEmbed;
 
 pub const SANS_FONT: &str = "IBM Plex Sans";
@@ -74,6 +74,7 @@ pub fn sync_component_fonts(cx: &mut App) {
     theme.font_family = SANS_FONT.into();
     theme.mono_font_family = MONO_FONT.into();
     theme.mono_font_size = px(13.5);
+    theme.colors.muted_foreground = rgba(0x696969ff).into();
 }
 
 #[cfg(test)]
@@ -100,8 +101,11 @@ mod tests {
         assert!(assets.load("icons/chevron-right.svg").unwrap().is_some());
         assert!(assets.load("icons/chevron-down.svg").unwrap().is_some());
         assert!(assets.load("icons/folder.svg").unwrap().is_some());
+        assert!(assets.load("icons/git-branch.svg").unwrap().is_some());
         assert!(assets.load("icons/folder-plus.svg").unwrap().is_some());
         assert!(assets.load("icons/x.svg").unwrap().is_some());
+        assert!(assets.load("icons/copy.svg").unwrap().is_some());
+        assert!(assets.load("icons/clipboard.svg").unwrap().is_some());
         assert!(assets.load("icons/settings.svg").unwrap().is_some());
         assert!(assets.load("icons/arrow-left.svg").unwrap().is_some());
         assert!(assets.load("icons/sun.svg").unwrap().is_some());

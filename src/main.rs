@@ -2,7 +2,7 @@ use anyhow::Result;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext, Application, Bounds, Context, CursorStyle,
-    Edges, Entity, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    Edges, Entity, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, ParentElement, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement as _, Styled, Transformation, Window, WindowBounds,
     WindowControlArea, WindowDecorations, WindowOptions, deferred, div,
@@ -140,12 +140,69 @@ pub struct TerminalPane {
     pub is_agent: bool,
     /// Workers reported by this pane's agent, keyed by their `agent_id`.
     pub sub_agents: HashMap<String, attention::SubAgent>,
+    pub input_state: Option<Entity<InputState>>,
+    pub command_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub pending_draft: String,
+    pub bottom_input_enabled: bool,
+    pub plus_menu_open: bool,
 }
 
 impl Drop for TerminalPane {
     fn drop(&mut self) {
         #[cfg(unix)]
         herdr_compat::unregister(&self.generation);
+    }
+}
+
+impl TerminalPane {
+    pub fn new(
+        id: usize,
+        generation: String,
+        terminal: Entity<TerminalView>,
+        title: SharedString,
+        display_title: SharedString,
+        pid: Option<u32>,
+        bottom_input_enabled: bool,
+    ) -> Self {
+        Self {
+            id,
+            generation,
+            native_session_id: None,
+            native_session_reporter: None,
+            native_turn_id: None,
+            native_sequence: HashMap::new(),
+            native_reporter_generation: HashMap::new(),
+            pending_approvals: std::collections::HashSet::new(),
+            native_status: None,
+            native_acknowledged: false,
+            osc_report_active: false,
+            terminal,
+            status: SessionStatus::Idle,
+            detection: status::DetectionResult::new(
+                SessionStatus::Idle,
+                status::EvidenceSource::NoSignal,
+                status::Confidence::None,
+            ),
+            title: title.to_string(),
+            display_title,
+            pid,
+            screen_scratch: Vec::new(),
+            poll_cache: None,
+            ack_screen: None,
+            agent_active: false,
+            detector: status::Detector::default(),
+            attention: Default::default(),
+            app: None,
+            is_agent: false,
+            sub_agents: HashMap::new(),
+            input_state: None,
+            command_history: Vec::new(),
+            history_index: None,
+            pending_draft: String::new(),
+            bottom_input_enabled,
+            plus_menu_open: false,
+        }
     }
 }
 
@@ -329,6 +386,7 @@ struct AppState {
     pub active_view: ActiveView,
     pub theme_preference: ThemePreference,
     pub sidebar_visible: bool,
+    pub warp_bottom_input: bool,
     integration_panel_visible: bool,
     integration_feedback: SharedString,
     pub sidebar_width: Pixels,
@@ -350,8 +408,14 @@ struct AppState {
     attention_seq: u64,
     /// Currently open project dropdown menu: Some(project_id).
     project_menu: Option<usize>,
-    /// Currently active project rename state: Some(RenamingProject).
     renaming_project: Option<RenamingProject>,
+    pub terminal_context_menu: Option<TerminalContextMenu>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalContextMenu {
+    pub pane_id: usize,
+    pub position: Point<Pixels>,
 }
 
 struct RenamingProject {
@@ -375,6 +439,7 @@ impl AppState {
             sidebar_visible: self.sidebar_visible,
             sidebar_width: f32::from(self.sidebar_width),
             theme: self.theme_preference,
+            warp_bottom_input: self.warp_bottom_input,
         }
     }
 
@@ -416,6 +481,7 @@ impl AppState {
         self.sidebar_visible = saved.sidebar_visible;
         self.sidebar_width = px(saved.sidebar_width.clamp(200.0, 500.0));
         self.theme_preference = saved.theme;
+        self.warp_bottom_input = saved.warp_bottom_input;
         let mode = self.theme_preference.resolve_mode(cx.window_appearance());
         self.palette = load_github_palette(mode.is_dark());
         gpui_component::Theme::change(mode, None, cx);
@@ -434,38 +500,15 @@ impl AppState {
                 continue;
             };
             let title = SharedString::from("terminal 1");
-            let pane = TerminalPane {
+            let pane = TerminalPane::new(
                 id,
                 generation,
-                native_session_id: None,
-                native_session_reporter: None,
-                native_turn_id: None,
-                native_sequence: HashMap::new(),
-                native_reporter_generation: HashMap::new(),
-                pending_approvals: std::collections::HashSet::new(),
-                native_status: None,
-                native_acknowledged: false,
-                osc_report_active: false,
                 terminal,
-                status: SessionStatus::Idle,
-                detection: status::DetectionResult::new(
-                    SessionStatus::Idle,
-                    status::EvidenceSource::NoSignal,
-                    status::Confidence::None,
-                ),
-                title: title.to_string(),
-                display_title: title.clone(),
+                title.clone(),
+                title.clone(),
                 pid,
-                screen_scratch: Vec::new(),
-                poll_cache: None,
-                ack_screen: None,
-                agent_active: false,
-                detector: status::Detector::default(),
-                attention: Default::default(),
-                app: None,
-                is_agent: false,
-                sub_agents: HashMap::new(),
-            };
+                saved.warp_bottom_input,
+            );
             let session = Session {
                 id,
                 title: title.clone(),
@@ -490,7 +533,53 @@ impl AppState {
             .as_ref()
             .and_then(|path| self.projects.iter().position(|p| &p.path == path))
             .unwrap_or(0);
-        if !self.projects.is_empty() {
+        if self.projects.is_empty() {
+            let default_dir = std::env::current_dir()
+                .ok()
+                .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()))
+                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            let name = default_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            let id = self.next_id;
+            self.next_id += 1;
+            let weak = cx.entity().downgrade();
+            if let Ok((terminal, pid, generation)) =
+                Self::spawn_terminal_view(Some(&default_dir), self.palette.clone(), weak, id, cx)
+            {
+                let title = SharedString::from("terminal 1");
+                let pane = TerminalPane::new(
+                    id,
+                    generation,
+                    terminal,
+                    title.clone(),
+                    title.clone(),
+                    pid,
+                    self.warp_bottom_input,
+                );
+                let session = Session {
+                    id,
+                    title: title.clone(),
+                    display_title: title,
+                    logo: logos::default_logo(),
+                    pane_tree: Some(PaneNode::Leaf(id)),
+                    maximized_pane_id: None,
+                    panes: vec![pane],
+                    status: SessionStatus::Idle,
+                };
+                self.projects.push(Project {
+                    id,
+                    name: SharedString::from(name),
+                    path: default_dir,
+                    sessions: vec![session],
+                    active_session_idx: 0,
+                    expanded: true,
+                });
+                self.focused_pane_id = Some(id);
+                self.active_project_idx = 0;
+            }
+        } else {
             self.focused_pane_id = self.projects[self.active_project_idx]
                 .sessions
                 .first()
@@ -719,11 +808,12 @@ impl AppState {
             padding: Edges::all(px(8.0)),
             colors: palette,
             cursor_blink: true,
-            copy_on_select: false,
+            copy_on_select: true,
             right_click_paste: false,
             alternate_scroll: true,
             detect_path_links: true,
             show_scrollbar: true,
+            read_only: true,
             ..TerminalConfig::default()
         };
 
@@ -1839,45 +1929,33 @@ impl AppState {
         if let Ok((terminal, pid, generation)) =
             Self::spawn_terminal_view(Some(&dir), self.palette.clone(), self_weak, next_id, cx)
         {
-            terminal.read(cx).focus_handle().focus(window);
             let session_count = self
                 .projects
                 .get(project_idx)
                 .map(|p| p.sessions.len())
                 .unwrap_or(0);
             let title = SharedString::from(format!("terminal {}", session_count + 1));
-            let pane = TerminalPane {
-                id: next_id,
+            let display_title = truncate_title(&title);
+            let mut pane = TerminalPane::new(
+                next_id,
                 generation,
-                native_session_id: None,
-                native_session_reporter: None,
-                native_turn_id: None,
-                native_sequence: HashMap::new(),
-                native_reporter_generation: HashMap::new(),
-                pending_approvals: std::collections::HashSet::new(),
-                native_status: None,
-                native_acknowledged: false,
-                osc_report_active: false,
-                terminal,
-                status: SessionStatus::Idle,
-                detection: status::DetectionResult::new(
-                    SessionStatus::Idle,
-                    status::EvidenceSource::NoSignal,
-                    status::Confidence::None,
-                ),
-                title: title.to_string(),
-                display_title: truncate_title(&title),
+                terminal.clone(),
+                title.clone(),
+                display_title.clone(),
                 pid,
-                screen_scratch: Vec::new(),
-                poll_cache: None,
-                ack_screen: None,
-                agent_active: false,
-                detector: status::Detector::default(),
-                attention: Default::default(),
-                app: None,
-                is_agent: false,
-                sub_agents: HashMap::new(),
-            };
+                self.warp_bottom_input,
+            );
+            let input_state = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Run commands")
+            });
+            if self.warp_bottom_input {
+                input_state.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                });
+            } else {
+                terminal.read(cx).focus_handle().focus(window);
+            }
+            pane.input_state = Some(input_state);
             let session = Session {
                 id: next_id,
                 title: title.clone(),
@@ -1951,10 +2029,7 @@ impl AppState {
             .map(|pane| pane.id);
         if is_active_project {
             if let Some(pane_id) = pane_id {
-                if let Some(pane) = project.sessions[project.active_session_idx].panes.first() {
-                    pane.terminal.read(cx).focus_handle().focus(window);
-                }
-                self.focused_pane_id = Some(pane_id);
+                self.focus_pane(pane_id, window, cx);
             } else {
                 self.focused_pane_id = None;
             }
@@ -2081,40 +2156,27 @@ impl AppState {
         if let Ok((terminal, pid, generation)) =
             Self::spawn_terminal_view(Some(&folder), self.palette.clone(), self_weak, next_id, cx)
         {
-            terminal.read(cx).focus_handle().focus(window);
             let title = SharedString::from("terminal 1");
-            let pane = TerminalPane {
-                id: next_id,
+            let mut pane = TerminalPane::new(
+                next_id,
                 generation,
-                native_session_id: None,
-                native_session_reporter: None,
-                native_turn_id: None,
-                native_sequence: HashMap::new(),
-                native_reporter_generation: HashMap::new(),
-                pending_approvals: std::collections::HashSet::new(),
-                native_status: None,
-                native_acknowledged: false,
-                osc_report_active: false,
-                terminal,
-                status: SessionStatus::Idle,
-                detection: status::DetectionResult::new(
-                    SessionStatus::Idle,
-                    status::EvidenceSource::NoSignal,
-                    status::Confidence::None,
-                ),
-                title: title.to_string(),
-                display_title: title.clone(),
+                terminal.clone(),
+                title.clone(),
+                title.clone(),
                 pid,
-                screen_scratch: Vec::new(),
-                poll_cache: None,
-                ack_screen: None,
-                agent_active: false,
-                detector: status::Detector::default(),
-                attention: Default::default(),
-                app: None,
-                is_agent: false,
-                sub_agents: HashMap::new(),
-            };
+                self.warp_bottom_input,
+            );
+            let input_state = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Run commands")
+            });
+            if self.warp_bottom_input {
+                input_state.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                });
+            } else {
+                terminal.read(cx).focus_handle().focus(window);
+            }
+            pane.input_state = Some(input_state);
             let session = Session {
                 id: next_id,
                 title: title.clone(),
@@ -2191,40 +2253,28 @@ impl AppState {
         if let Ok((terminal, pid, generation)) =
             Self::spawn_terminal_view(dir.as_ref(), self.palette.clone(), self_weak, next_id, cx)
         {
-            terminal.read(cx).focus_handle().focus(window);
             let title = SharedString::from(format!("terminal {}", pane_count + 1));
-            let pane = TerminalPane {
-                id: next_id,
+            let display_title = truncate_title(&title);
+            let mut pane = TerminalPane::new(
+                next_id,
                 generation,
-                native_session_id: None,
-                native_session_reporter: None,
-                native_turn_id: None,
-                native_sequence: HashMap::new(),
-                native_reporter_generation: HashMap::new(),
-                pending_approvals: std::collections::HashSet::new(),
-                native_status: None,
-                native_acknowledged: false,
-                osc_report_active: false,
-                terminal,
-                status: SessionStatus::Idle,
-                detection: status::DetectionResult::new(
-                    SessionStatus::Idle,
-                    status::EvidenceSource::NoSignal,
-                    status::Confidence::None,
-                ),
-                title: title.to_string(),
-                display_title: truncate_title(&title),
+                terminal.clone(),
+                title.clone(),
+                display_title,
                 pid,
-                screen_scratch: Vec::new(),
-                poll_cache: None,
-                ack_screen: None,
-                agent_active: false,
-                detector: status::Detector::default(),
-                attention: Default::default(),
-                app: None,
-                is_agent: false,
-                sub_agents: HashMap::new(),
-            };
+                self.warp_bottom_input,
+            );
+            let input_state = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Run commands")
+            });
+            if self.warp_bottom_input {
+                input_state.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                });
+            } else {
+                terminal.read(cx).focus_handle().focus(window);
+            }
+            pane.input_state = Some(input_state);
 
             if let Some(project) = self.projects.get_mut(p_idx) {
                 if let Some(session) = project.sessions.get_mut(s_idx) {
@@ -2302,8 +2352,8 @@ impl AppState {
                     .map(|t| t.first_leaf())
                     .and_then(|id| session.panes.iter().find(|p| p.id == id));
                 if let Some(pane) = next_leaf {
-                    pane.terminal.read(cx).focus_handle().focus(window);
-                    self.focused_pane_id = Some(pane.id);
+                    let pid = pane.id;
+                    self.focus_pane(pid, window, cx);
                 }
             }
         }
@@ -2326,12 +2376,1375 @@ impl AppState {
                 p.active_session_idx = s_idx;
                 if let Some(session) = p.sessions.get_mut(s_idx) {
                     if let Some(pane) = session.panes.iter_mut().find(|p| p.id == pane_id) {
-                        pane.terminal.read(cx).focus_handle().focus(window);
+                        let is_alt = pane.terminal.read(cx).is_alt_screen();
+                        if pane.bottom_input_enabled && !is_alt {
+                            if let Some(input_state) = &pane.input_state {
+                                input_state.update(cx, |state, cx| {
+                                    state.focus(window, cx);
+                                });
+                            } else {
+                                pane.terminal.read(cx).focus_handle().focus(window);
+                            }
+                        } else {
+                            pane.terminal.read(cx).focus_handle().focus(window);
+                        }
                     }
                 }
             }
         }
         cx.notify();
+    }
+
+    fn focus_pane_input(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_view = ActiveView::Workspace;
+        self.focused_pane_id = Some(pane_id);
+        if let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) {
+            self.active_project_idx = p_idx;
+            if let Some(pane) = self
+                .projects
+                .get_mut(p_idx)
+                .and_then(|p| p.sessions.get_mut(s_idx))
+                .and_then(|s| s.panes.get_mut(pane_idx))
+            {
+                if let Some(input_state) = &pane.input_state {
+                    input_state.update(cx, |state, cx| {
+                        state.focus(window, cx);
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_pane_bottom_input(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+        let Some(session) = project.sessions.get_mut(s_idx) else {
+            return;
+        };
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+        pane.bottom_input_enabled = !pane.bottom_input_enabled;
+        if pane.bottom_input_enabled {
+            if let Some(input_state) = &pane.input_state {
+                input_state.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                });
+            }
+        } else {
+            pane.terminal.read(cx).focus_handle().focus(window);
+        }
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    fn clear_pane_input(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+        let Some(session) = project.sessions.get_mut(s_idx) else {
+            return;
+        };
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+        if let Some(input_state) = &pane.input_state {
+            input_state.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                state.focus(window, cx);
+            });
+        }
+        pane.history_index = None;
+        pane.pending_draft.clear();
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    fn cancel_pane_job(&mut self, pane_id: usize, cx: &mut Context<Self>) {
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+        let Some(session) = project.sessions.get_mut(s_idx) else {
+            return;
+        };
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+        pane.terminal.update(cx, |term, cx| {
+            term.send_bytes(b"\x03", cx);
+        });
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    fn step_pane_history(
+        &mut self,
+        pane_id: usize,
+        is_up: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+        let Some(session) = project.sessions.get_mut(s_idx) else {
+            return;
+        };
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+        let Some(input_state) = pane.input_state.clone() else {
+            return;
+        };
+
+        if is_up {
+            if pane.command_history.is_empty() {
+                return;
+            }
+            let new_idx = match pane.history_index {
+                None => {
+                    pane.pending_draft = input_state.read(cx).value().to_string();
+                    pane.command_history.len().saturating_sub(1)
+                }
+                Some(idx) => idx.saturating_sub(1),
+            };
+            pane.history_index = Some(new_idx);
+            if let Some(cmd) = pane.command_history.get(new_idx).cloned() {
+                input_state.update(cx, |state, cx| {
+                    state.set_value(&cmd, window, cx);
+                });
+            }
+        } else if let Some(idx) = pane.history_index {
+            if idx + 1 < pane.command_history.len() {
+                let new_idx = idx + 1;
+                pane.history_index = Some(new_idx);
+                if let Some(cmd) = pane.command_history.get(new_idx).cloned() {
+                    input_state.update(cx, |state, cx| {
+                        state.set_value(&cmd, window, cx);
+                    });
+                }
+            } else {
+                pane.history_index = None;
+                let draft = std::mem::take(&mut pane.pending_draft);
+                input_state.update(cx, |state, cx| {
+                    state.set_value(&draft, window, cx);
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    fn execute_pane_input(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+        let Some(session) = project.sessions.get_mut(s_idx) else {
+            return;
+        };
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+        let Some(input_state) = pane.input_state.clone() else {
+            return;
+        };
+
+        let cmd = input_state.read(cx).value().to_string();
+        if cmd.is_empty() {
+            pane.terminal.update(cx, |term, cx| {
+                term.send_bytes(b"\r", cx);
+            });
+        } else {
+            pane.terminal.update(cx, |term, cx| {
+                term.send_text(&format!("{cmd}\r"), cx);
+            });
+            if pane.command_history.last().map(|s| s.as_str()) != Some(&cmd) {
+                pane.command_history.push(cmd);
+            }
+            pane.history_index = None;
+            pane.pending_draft.clear();
+            input_state.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+        }
+        input_state.update(cx, |state, cx| {
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn handle_pane_input_key(
+        &mut self,
+        pane_id: usize,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        let key = keystroke.key.as_str();
+        let modifiers = keystroke.modifiers;
+
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+        let Some(session) = project.sessions.get_mut(s_idx) else {
+            return;
+        };
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+        let Some(input_state) = pane.input_state.clone() else {
+            return;
+        };
+
+        // Enter: execute command
+        if key == "enter" && !modifiers.shift && !modifiers.control && !modifiers.alt {
+            cx.stop_propagation();
+            self.execute_pane_input(pane_id, window, cx);
+            return;
+        }
+        // Ctrl+Shift+Enter: new /agent conversation
+        if (key == "enter" || key == "return") && modifiers.control && modifiers.shift {
+            cx.stop_propagation();
+            self.trigger_agent_conversation(pane_id, window, cx);
+            return;
+        }
+
+        // Ctrl+C: clear input if text present, or send SIGINT to PTY
+        if key == "c" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            let current_val = input_state.read(cx).value().to_string();
+            if !current_val.is_empty() {
+                input_state.update(cx, |state, cx| {
+                    state.set_value("", window, cx);
+                });
+                pane.history_index = None;
+                pane.pending_draft.clear();
+            }
+            pane.terminal.update(cx, |term, cx| {
+                term.send_bytes(b"\x03", cx);
+            });
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        // Ctrl+L: clear terminal screen
+        if key == "l" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            pane.terminal.update(cx, |term, cx| {
+                term.send_bytes(b"\x0c", cx);
+            });
+            cx.stop_propagation();
+            return;
+        }
+
+        // Ctrl+Z: suspend foreground job (SIGTSTP)
+        if key == "z" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            pane.terminal.update(cx, |term, cx| {
+                term.send_bytes(b"\x1a", cx);
+            });
+            cx.stop_propagation();
+            return;
+        }
+
+        // Ctrl+D: EOF
+        if key == "d" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            let current_val = input_state.read(cx).value().to_string();
+            if current_val.is_empty() {
+                pane.terminal.update(cx, |term, cx| {
+                    term.send_bytes(b"\x04", cx);
+                });
+                cx.stop_propagation();
+                return;
+            }
+        }
+
+        // Ctrl+\: quit foreground job (SIGQUIT)
+        if key == "\\" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            pane.terminal.update(cx, |term, cx| {
+                term.send_bytes(b"\x1c", cx);
+            });
+            cx.stop_propagation();
+            return;
+        }
+
+        // Escape: clear input
+        if key == "escape" && !modifiers.shift && !modifiers.control && !modifiers.alt {
+            if self.terminal_context_menu.is_some() {
+                self.terminal_context_menu = None;
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if pane.plus_menu_open {
+                pane.plus_menu_open = false;
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            let current_val = input_state.read(cx).value().to_string();
+            if !current_val.is_empty() {
+                input_state.update(cx, |state, cx| {
+                    state.set_value("", window, cx);
+                });
+                pane.history_index = None;
+                pane.pending_draft.clear();
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }
+
+        // Up: previous command in history
+        if key == "up" && !modifiers.shift && !modifiers.control && !modifiers.alt {
+            if pane.command_history.is_empty() {
+                return;
+            }
+            cx.stop_propagation();
+            let new_idx = match pane.history_index {
+                None => {
+                    pane.pending_draft = input_state.read(cx).value().to_string();
+                    pane.command_history.len().saturating_sub(1)
+                }
+                Some(idx) => idx.saturating_sub(1),
+            };
+            pane.history_index = Some(new_idx);
+            if let Some(cmd) = pane.command_history.get(new_idx).cloned() {
+                input_state.update(cx, |state, cx| {
+                    state.set_value(&cmd, window, cx);
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        // Down: next command in history
+        if key == "down" && !modifiers.shift && !modifiers.control && !modifiers.alt {
+            if let Some(idx) = pane.history_index {
+                cx.stop_propagation();
+                if idx + 1 < pane.command_history.len() {
+                    let new_idx = idx + 1;
+                    pane.history_index = Some(new_idx);
+                    if let Some(cmd) = pane.command_history.get(new_idx).cloned() {
+                        input_state.update(cx, |state, cx| {
+                            state.set_value(&cmd, window, cx);
+                        });
+                    }
+                } else {
+                    pane.history_index = None;
+                    let draft = std::mem::take(&mut pane.pending_draft);
+                    input_state.update(cx, |state, cx| {
+                        state.set_value(&draft, window, cx);
+                    });
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn ensure_panes_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                for pane in &mut session.panes {
+                    let placeholder = "Run commands";
+                    if let Some(input) = &pane.input_state {
+                        input.update(cx, |state, cx| {
+                            state.set_placeholder(placeholder, window, cx);
+                        });
+                    } else {
+                        let input = cx.new(|cx| {
+                            InputState::new(window, cx).placeholder(placeholder)
+                        });
+                        pane.input_state = Some(input);
+                    }
+                }
+            }
+        }
+
+        // Dynamically ensure the focused pane's input is focused like Warp
+        if self.warp_bottom_input && self.active_view == ActiveView::Workspace {
+            if let Some(pane_id) = self.focused_pane_id {
+                if let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) {
+                    if let Some(project) = self.projects.get(p_idx) {
+                        if let Some(session) = project.sessions.get(s_idx) {
+                            if let Some(pane) = session.panes.get(pane_idx) {
+                                if pane.bottom_input_enabled && !pane.terminal.read(cx).is_alt_screen() {
+                                    if let Some(input_state) = &pane.input_state {
+                                        let is_input_focused = input_state.read(cx).focus_handle().is_focused(window);
+                                        let is_term_focused = pane.terminal.read(cx).focus_handle().is_focused(window);
+                                        if is_term_focused || !is_input_focused {
+                                            input_state.update(cx, |state, cx| {
+                                                state.focus(window, cx);
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn open_terminal_context_menu(
+        &mut self,
+        pane_id: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_context_menu = Some(TerminalContextMenu { pane_id, position });
+        self.focus_pane(pane_id, window, cx);
+        cx.notify();
+    }
+
+    fn close_terminal_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_context_menu.is_some() {
+            self.terminal_context_menu = None;
+            cx.notify();
+        }
+    }
+
+    fn copy_terminal_selection(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) {
+            if let Some(pane) = self
+                .projects
+                .get(p_idx)
+                .and_then(|p| p.sessions.get(s_idx))
+                .and_then(|s| s.panes.get(pane_idx))
+            {
+                if let Some(text) = pane.terminal.read(cx).selected_text() {
+                    if !text.is_empty() {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                        pane.terminal.update(cx, |term, cx| {
+                            term.clear_selection(cx);
+                        });
+                    }
+                }
+            }
+        }
+        self.close_terminal_context_menu(cx);
+        self.focus_pane(pane_id, window, cx);
+    }
+
+    fn paste_from_clipboard_into_pane(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) {
+            if let Some(pane) = self
+                .projects
+                .get(p_idx)
+                .and_then(|p| p.sessions.get(s_idx))
+                .and_then(|s| s.panes.get(pane_idx))
+            {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    let clean = text
+                        .trim_matches(&['\r', '\n'][..])
+                        .replace("\r\n", " ")
+                        .replace('\n', " ")
+                        .replace('\r', "");
+                    if !clean.is_empty() {
+                        let is_alt = pane.terminal.read(cx).is_alt_screen();
+                        if pane.bottom_input_enabled && !is_alt {
+                            if let Some(input_state) = &pane.input_state {
+                                input_state.update(cx, |state, cx| {
+                                    let cur = state.value().to_string();
+                                    state.set_value(&format!("{cur}{clean}"), window, cx);
+                                    state.focus(window, cx);
+                                });
+                            }
+                        } else {
+                            pane.terminal.update(cx, |term, cx| {
+                                term.paste_text(&clean, cx);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        self.close_terminal_context_menu(cx);
+        self.focus_pane(pane_id, window, cx);
+    }
+
+    fn select_all_in_terminal(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) {
+            if let Some(pane) = self
+                .projects
+                .get(p_idx)
+                .and_then(|p| p.sessions.get(s_idx))
+                .and_then(|s| s.panes.get(pane_idx))
+            {
+                pane.terminal.update(cx, |term, cx| {
+                    term.select_all(cx);
+                });
+            }
+        }
+        self.close_terminal_context_menu(cx);
+        self.focus_pane(pane_id, window, cx);
+    }
+
+    fn clear_terminal_buffer(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) {
+            if let Some(pane) = self
+                .projects
+                .get(p_idx)
+                .and_then(|p| p.sessions.get(s_idx))
+                .and_then(|s| s.panes.get(pane_idx))
+            {
+                pane.terminal.update(cx, |term, cx| {
+                    term.send_bytes(b"\x0c", cx);
+                });
+            }
+        }
+        self.close_terminal_context_menu(cx);
+        self.focus_pane(pane_id, window, cx);
+    }
+
+    fn render_terminal_context_menu_layer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(menu) = self.terminal_context_menu else {
+            return div().into_any_element();
+        };
+
+        let pane_id = menu.pane_id;
+        let tokens = self.tokens(cx);
+
+        let has_selection = self
+            .pane_index
+            .get(&pane_id)
+            .and_then(|&(p_idx, s_idx, pane_idx)| {
+                self.projects
+                    .get(p_idx)
+                    .and_then(|p| p.sessions.get(s_idx))
+                    .and_then(|s| s.panes.get(pane_idx))
+            })
+            .map(|pane| pane.terminal.read(cx).has_selection())
+            .unwrap_or(false);
+
+        let left = (menu.position.x - px(5.0)).max(px(10.0));
+        let top = (menu.position.y - px(5.0)).max(px(35.0));
+
+        let modal_border: Hsla = if tokens.is_dark {
+            rgba(0x2d2e3dff).into()
+        } else {
+            tokens.card_border
+        };
+        let modal_bg: Hsla = if tokens.is_dark {
+            rgba(0x16171eff).into()
+        } else {
+            rgba(0xffffffff).into()
+        };
+        let sep_bg: Hsla = if tokens.is_dark {
+            rgba(0xffffff14).into()
+        } else {
+            rgba(0x00000014).into()
+        };
+
+        deferred(
+            div()
+                .id("terminal-context-menu-layer")
+                .size_full()
+                .absolute()
+                .top_0()
+                .left_0()
+                .child(
+                    div()
+                        .id("terminal-context-menu-backdrop")
+                        .size_full()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_terminal_context_menu(cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_terminal_context_menu(cx);
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(("terminal-context-menu-modal", pane_id))
+                        .absolute()
+                        .top(top)
+                        .left(left)
+                        .w(px(180.0))
+                        .p(px(5.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(modal_border)
+                        .bg(modal_bg)
+                        .shadow_lg()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        // Copy option
+                        .child(
+                            div()
+                                .id(("context-menu-copy", pane_id))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(8.0))
+                                .py(px(5.5))
+                                .rounded(px(5.0))
+                                .cursor(if has_selection {
+                                    CursorStyle::PointingHand
+                                } else {
+                                    CursorStyle::Arrow
+                                })
+                                .opacity(if has_selection { 1.0 } else { 0.45 })
+                                .when(has_selection, |this| {
+                                    this.hover(|s| s.bg(tokens.sidebar_item_hover))
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            svg()
+                                                .path("icons/copy.svg")
+                                                .size(px(13.0))
+                                                .text_color(tokens.text_primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(MONO_FONT)
+                                                .text_size(px(12.0))
+                                                .text_color(tokens.text_primary)
+                                                .child("Copy"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(10.5))
+                                        .text_color(tokens.text_muted)
+                                        .child("Ctrl+C"),
+                                )
+                                .when(has_selection, |this| {
+                                    this.on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.copy_terminal_selection(pane_id, window, cx);
+                                        }),
+                                    )
+                                }),
+                        )
+                        // Paste option
+                        .child(
+                            div()
+                                .id(("context-menu-paste", pane_id))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(8.0))
+                                .py(px(5.5))
+                                .rounded(px(5.0))
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|s| s.bg(tokens.sidebar_item_hover))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            svg()
+                                                .path("icons/clipboard.svg")
+                                                .size(px(13.0))
+                                                .text_color(tokens.text_primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(MONO_FONT)
+                                                .text_size(px(12.0))
+                                                .text_color(tokens.text_primary)
+                                                .child("Paste"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(10.5))
+                                        .text_color(tokens.text_muted)
+                                        .child("Ctrl+V"),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.paste_from_clipboard_into_pane(pane_id, window, cx);
+                                    }),
+                                ),
+                        )
+                        // Separator
+                        .child(
+                            div()
+                                .my(px(2.0))
+                                .h(px(1.0))
+                                .w_full()
+                                .bg(sep_bg),
+                        )
+                        // Select All
+                        .child(
+                            div()
+                                .id(("context-menu-select-all", pane_id))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(8.0))
+                                .py(px(5.5))
+                                .rounded(px(5.0))
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|s| s.bg(tokens.sidebar_item_hover))
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(12.0))
+                                        .text_color(tokens.text_primary)
+                                        .child("Select All"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(10.5))
+                                        .text_color(tokens.text_muted)
+                                        .child("Ctrl+A"),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.select_all_in_terminal(pane_id, window, cx);
+                                    }),
+                                ),
+                        )
+                        // Clear Screen
+                        .child(
+                            div()
+                                .id(("context-menu-clear", pane_id))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(8.0))
+                                .py(px(5.5))
+                                .rounded(px(5.0))
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|s| s.bg(tokens.sidebar_item_hover))
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(12.0))
+                                        .text_color(tokens.text_primary)
+                                        .child("Clear Screen"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(10.5))
+                                        .text_color(tokens.text_muted)
+                                        .child("Ctrl+L"),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.clear_terminal_buffer(pane_id, window, cx);
+                                    }),
+                                ),
+                        ),
+                ),
+        )
+        .priority(200)
+        .into_any_element()
+    }
+
+    fn trigger_agent_conversation(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+        let Some(session) = project.sessions.get_mut(s_idx) else {
+            return;
+        };
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+        let Some(input_state) = pane.input_state.clone() else {
+            return;
+        };
+
+        let val = input_state.read(cx).value().trim().to_string();
+        if val.is_empty() {
+            input_state.update(cx, |state, cx| {
+                state.set_value("/agent ", window, cx);
+                state.focus(window, cx);
+            });
+        } else if val.starts_with("/agent") {
+            self.execute_pane_input(pane_id, window, cx);
+        } else {
+            let cmd = format!("/agent {val}");
+            pane.terminal.update(cx, |term, cx| {
+                term.send_text(&format!("{cmd}\r"), cx);
+            });
+            if pane.command_history.last().map(|s| s.as_str()) != Some(&cmd) {
+                pane.command_history.push(cmd);
+            }
+            pane.history_index = None;
+            pane.pending_draft.clear();
+            input_state.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                state.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    fn toggle_plus_menu(&mut self, pane_id: usize, cx: &mut Context<Self>) {
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+        let Some(session) = project.sessions.get_mut(s_idx) else {
+            return;
+        };
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+        pane.plus_menu_open = !pane.plus_menu_open;
+        cx.notify();
+    }
+
+    fn run_quick_action(
+        &mut self,
+        pane_id: usize,
+        cmd: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+        let Some(session) = project.sessions.get_mut(s_idx) else {
+            return;
+        };
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+        pane.plus_menu_open = false;
+        pane.terminal.update(cx, |term, cx| {
+            term.send_text(&format!("{cmd}\r"), cx);
+        });
+        if pane.command_history.last().map(|s| s.as_str()) != Some(&cmd) {
+            pane.command_history.push(cmd.to_string());
+        }
+        if let Some(input_state) = &pane.input_state {
+            input_state.update(cx, |state, cx| {
+                state.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn render_quick_action_item(
+        label: &'static str,
+        cmd: &'static str,
+        icon: &'static str,
+        pane_id: usize,
+        tokens: &ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!("quick-action-{pane_id}-{cmd}")))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(4.0))
+            .cursor(CursorStyle::PointingHand)
+            .hover(|s| s.bg(tokens.pane_header_btn_hover))
+            .child(
+                svg()
+                    .path(icon)
+                    .size(px(13.0))
+                    .text_color(tokens.text_muted),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(tokens.text_primary)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .font_family(MONO_FONT)
+                    .text_color(tokens.text_muted)
+                    .ml_auto()
+                    .child(cmd),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.run_quick_action(pane_id, cmd, window, cx);
+                }),
+            )
+    }
+
+    fn pane_cwd_path(&self, pane: &TerminalPane) -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        if let Some(link) = pane
+            .pid
+            .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
+        {
+            return Some(link);
+        }
+        if let Some(project) = self
+            .pane_index
+            .get(&pane.id)
+            .and_then(|&(p_idx, _, _)| self.projects.get(p_idx))
+        {
+            return Some(project.path.clone());
+        }
+        directories::UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+    }
+
+    fn pane_git_branch(&self, pane: &TerminalPane) -> Option<String> {
+        let dir = self.pane_cwd_path(pane)?;
+        Self::detect_git_branch(&dir)
+    }
+
+    fn detect_git_branch(dir: &std::path::Path) -> Option<String> {
+        let mut current = dir;
+        loop {
+            let git_path = current.join(".git");
+            if git_path.is_dir() {
+                let head_file = git_path.join("HEAD");
+                if let Ok(content) = std::fs::read_to_string(head_file) {
+                    let trimmed = content.trim();
+                    if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+                        return Some(branch.to_string());
+                    } else if !trimmed.is_empty() {
+                        let short = if trimmed.len() > 7 { &trimmed[..7] } else { trimmed };
+                        return Some(short.to_string());
+                    }
+                }
+                return None;
+            } else if git_path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&git_path) {
+                    for line in content.lines() {
+                        if let Some(rest) = line.strip_prefix("gitdir:") {
+                            let rel = rest.trim();
+                            let target = if std::path::Path::new(rel).is_absolute() {
+                                std::path::PathBuf::from(rel)
+                            } else {
+                                current.join(rel)
+                            };
+                            let head_file = target.join("HEAD");
+                            if let Ok(head_content) = std::fs::read_to_string(head_file) {
+                                let trimmed = head_content.trim();
+                                if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+                                    return Some(branch.to_string());
+                                } else if !trimmed.is_empty() {
+                                    let short = if trimmed.len() > 7 { &trimmed[..7] } else { trimmed };
+                                    return Some(short.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                return None;
+            }
+            match current.parent() {
+                Some(parent) if parent != current => current = parent,
+                _ => break,
+            }
+        }
+        None
+    }
+
+    fn pane_cwd_display(&self, pane: &TerminalPane) -> String {
+        if let Some(path) = self.pane_cwd_path(pane) {
+            Self::format_path_display(&path)
+        } else {
+            "~".to_string()
+        }
+    }
+
+    fn format_path_display(path: &std::path::Path) -> String {
+        let home = directories::UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
+        if let Some(rel) = home.as_ref().and_then(|h| path.strip_prefix(h).ok()) {
+            if rel.as_os_str().is_empty() {
+                return "~".to_string();
+            } else {
+                return format!("~/{}", rel.display());
+            }
+        }
+        path.display().to_string()
+    }
+
+    fn render_warp_input_bar(
+        &self,
+        pane: &TerminalPane,
+        _is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let pane_id = pane.id;
+        let tokens = self.tokens(cx);
+        let cwd_display = self.pane_cwd_display(pane);
+        let git_branch = self.pane_git_branch(pane);
+
+        let bar_border: Hsla = if tokens.is_dark {
+            rgba(0x1d1d1dff).into()
+        } else {
+            tokens.pane_border
+        };
+        let bar_bg: Hsla = if tokens.is_dark {
+            rgba(0x050505ff).into()
+        } else {
+            tokens.pane_header_bg
+        };
+        let badge_border: Hsla = if tokens.is_dark {
+            rgba(0x282828ff).into()
+        } else {
+            rgba(0x00000018).into()
+        };
+        let badge_bg: Hsla = if tokens.is_dark {
+            rgba(0x111111ff).into()
+        } else {
+            rgba(0x0000000a).into()
+        };
+        let dir_icon_color: Hsla = if tokens.is_dark {
+            rgba(0xb2b2c3ff).into()
+        } else {
+            tokens.text_secondary
+        };
+        let dir_text_color: Hsla = if tokens.is_dark {
+            rgba(0xe5e6fcff).into()
+        } else {
+            tokens.text_primary
+        };
+        let git_icon_color: Hsla = if tokens.is_dark {
+            rgba(0xadc993ff).into()
+        } else {
+            rgba(0x2d7a2dff).into()
+        };
+        let git_text_color: Hsla = if tokens.is_dark {
+            rgba(0xd9fcb8ff).into()
+        } else {
+            rgba(0x236823ff).into()
+        };
+        let hint_color: Hsla = if tokens.is_dark {
+            rgba(0x696969ff).into()
+        } else {
+            tokens.text_muted
+        };
+        let input_element = if let Some(input_state) = &pane.input_state {
+            div()
+                .id(("warp-input-wrapper", pane_id))
+                .w_full()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .font_family(MONO_FONT)
+                .text_size(px(14.0))
+                .on_action(cx.listener(move |this, enter: &gpui_component::input::Enter, window, cx| {
+                    if enter.secondary {
+                        this.trigger_agent_conversation(pane_id, window, cx);
+                    } else {
+                        this.execute_pane_input(pane_id, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(move |this, _: &gpui_component::input::Escape, window, cx| {
+                    this.clear_pane_input(pane_id, window, cx);
+                }))
+                .on_action(cx.listener(move |this, _: &gpui_component::input::MoveUp, window, cx| {
+                    this.step_pane_history(pane_id, true, window, cx);
+                }))
+                .on_action(cx.listener(move |this, _: &gpui_component::input::MoveDown, window, cx| {
+                    this.step_pane_history(pane_id, false, window, cx);
+                }))
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    this.handle_pane_input_key(pane_id, event, window, cx);
+                }))
+                .child(
+                    Input::new(input_state)
+                        .appearance(false)
+                        .bordered(false)
+                        .focus_bordered(false)
+                        .cleanable(false)
+                        .px_0()
+                        .py_0(),
+                )
+        } else {
+            div().id(("warp-input-wrapper-empty", pane_id)).w_full().h(px(24.0))
+        };
+
+        let plus_menu = if pane.plus_menu_open {
+            Some(
+                div()
+                    .id(("warp-plus-menu", pane_id))
+                    .absolute()
+                    .bottom(px(100.0))
+                    .left(px(12.0))
+                    .w(px(220.0))
+                    .p(px(6.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(tokens.card_border)
+                    .bg(if tokens.is_dark {
+                        rgba(0x1e1f22ff)
+                    } else {
+                        rgba(0xffffffff)
+                    })
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(tokens.text_muted)
+                            .child("QUICK ACTIONS"),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .border_b_1()
+                            .border_color(tokens.card_border)
+                            .text_size(px(11.0))
+                            .text_color(tokens.text_secondary)
+                            .child(format!("📁 {}", cwd_display)),
+                    )
+                    .child(Self::render_quick_action_item(
+                        "Clear Terminal",
+                        "clear",
+                        "icons/x.svg",
+                        pane_id,
+                        &tokens,
+                        cx,
+                    ))
+                    .child(Self::render_quick_action_item(
+                        "List Files",
+                        "ls -la",
+                        "icons/folder.svg",
+                        pane_id,
+                        &tokens,
+                        cx,
+                    ))
+                    .child(Self::render_quick_action_item(
+                        "Git Status",
+                        "git status",
+                        "icons/status-check.svg",
+                        pane_id,
+                        &tokens,
+                        cx,
+                    ))
+                    .child(Self::render_quick_action_item(
+                        "Working Directory",
+                        "pwd",
+                        "icons/monitor.svg",
+                        pane_id,
+                        &tokens,
+                        cx,
+                    )),
+            )
+        } else {
+            None
+        };
+
+        div()
+            .id(("warp-input-bar", pane_id))
+            .relative()
+            .w_full()
+            .flex()
+            .flex_col()
+            .px(px(12.0))
+            .pt(px(11.0))
+            .pb(px(10.0))
+            .border_t_1()
+            .border_color(bar_border)
+            .bg(bar_bg)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.focus_pane_input(pane_id, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_terminal_context_menu(pane_id, event.position, window, cx);
+                }),
+            )
+            .children(plus_menu)
+            // Row 1: Badges
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    // Badge 1: Directory
+                    .child(
+                        div()
+                            .id(("warp-badge-cwd", pane_id))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .h(px(22.0))
+                            .px(px(7.0))
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(badge_border)
+                            .bg(badge_bg)
+                            .child(
+                                svg()
+                                    .path("icons/folder.svg")
+                                    .size(px(12.0))
+                                    .text_color(dir_icon_color),
+                            )
+                            .child(
+                                div()
+                                    .font_family(MONO_FONT)
+                                    .text_size(px(12.0))
+                                    .text_color(dir_text_color)
+                                    .child(cwd_display),
+                            ),
+                    )
+                    // Badge 2: Git branch
+                    .when_some(git_branch, |this, branch| {
+                        this.child(
+                            div()
+                                .id(("warp-badge-git", pane_id))
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .h(px(22.0))
+                                .px(px(7.0))
+                                .rounded(px(5.0))
+                                .border_1()
+                                .border_color(badge_border)
+                                .bg(badge_bg)
+                                .child(
+                                    svg()
+                                        .path("icons/git-branch.svg")
+                                        .size(px(12.0))
+                                        .text_color(git_icon_color),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(12.0))
+                                        .text_color(git_text_color)
+                                        .child(branch),
+                                ),
+                        )
+                    }),
+            )
+            // Row 2: Input Row
+            .child(
+                div()
+                    .w_full()
+                    .mt(px(12.0))
+                    .child(input_element),
+            )
+            // Row 3: Hint Row
+            .child(
+                div()
+                    .id(("warp-hint-row", pane_id))
+                    .w_full()
+                    .mt(px(12.0))
+                    .flex()
+                    .items_center()
+                    .font_family(MONO_FONT)
+                    .text_size(px(11.5))
+                    .text_color(hint_color)
+                    .cursor(CursorStyle::PointingHand)
+                    .child("ctrl-shift-↩ new /agent conversation")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.trigger_agent_conversation(pane_id, window, cx);
+                        }),
+                    ),
+            )
     }
 
     fn render_terminal_pane(
@@ -2384,6 +3797,40 @@ impl AppState {
                             .flex()
                             .items_center()
                             .gap(px(6.0))
+                            .child(
+                                div()
+                                    .id(("bottom-input-toggle-btn", pane_id))
+                                    .size(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .bg(if pane.bottom_input_enabled {
+                                        tokens.pane_header_btn_hover
+                                    } else {
+                                        gpui::transparent_black()
+                                    })
+                                    .hover(|s| s.bg(tokens.pane_header_btn_hover))
+                                    .child(
+                                        svg()
+                                            .path("icons/terminal-bottom.svg")
+                                            .size(px(13.0))
+                                            .text_color(if pane.bottom_input_enabled {
+                                                rgba(0x38bdf8ff).into()
+                                            } else {
+                                                tokens.pane_header_icon
+                                            })
+                                            .hover(|s| s.text_color(tokens.pane_header_icon_hover)),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_pane_bottom_input(pane_id, window, cx);
+                                        }),
+                                    ),
+                            )
                             .child(
                                 div()
                                     .id(("split-v-btn", pane_id))
@@ -2505,7 +3952,24 @@ impl AppState {
                     .flex_1()
                     .size_full()
                     .overflow_hidden()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.focus_pane(pane_id, window, cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_terminal_context_menu(pane_id, event.position, window, cx);
+                        }),
+                    )
                     .child(pane.terminal.clone()),
+            )
+            .when(
+                pane.bottom_input_enabled && !pane.terminal.read(cx).is_alt_screen(),
+                |this| this.child(self.render_warp_input_bar(pane, is_focused, cx)),
             )
     }
 
@@ -3173,6 +4637,156 @@ impl AppState {
                             )),
                     ),
             );
+        let warp_input_enabled = self.warp_bottom_input;
+        let input_section = div()
+            .w_full()
+            .p(px(20.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(tokens.card_border)
+            .bg(tokens.card_bg)
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(tokens.text_primary)
+                            .child("Terminal Input Style"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(tokens.text_secondary)
+                            .child("Choose the default input editor style for every terminal inside Markup."),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .id("input-style-warp")
+                            .flex_1()
+                            .p(px(14.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(if warp_input_enabled {
+                                tokens.pane_border_focused
+                            } else {
+                                tokens.border_subtle
+                            })
+                            .bg(if warp_input_enabled {
+                                tokens.pill_active_bg
+                            } else {
+                                tokens.pill_inactive_bg
+                            })
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(tokens.card_hover))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.warp_bottom_input = true;
+                                for project in &mut this.projects {
+                                    for session in &mut project.sessions {
+                                        for pane in &mut session.panes {
+                                            pane.bottom_input_enabled = true;
+                                        }
+                                    }
+                                }
+                                this.schedule_workspace_save(cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.0))
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(rgba(0x38bdf8ff))
+                                                    .child("❯"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.0))
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(tokens.text_primary)
+                                                    .child("Warp-style Bottom Input (Recommended)"),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(tokens.text_secondary)
+                                            .child("Pinned modern prompt editor at the bottom with command history, multi-line editing, and status."),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("input-style-classic")
+                            .flex_1()
+                            .p(px(14.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(if !warp_input_enabled {
+                                tokens.pane_border_focused
+                            } else {
+                                tokens.border_subtle
+                            })
+                            .bg(if !warp_input_enabled {
+                                tokens.pill_active_bg
+                            } else {
+                                tokens.pill_inactive_bg
+                            })
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(tokens.card_hover))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.warp_bottom_input = false;
+                                for project in &mut this.projects {
+                                    for session in &mut project.sessions {
+                                        for pane in &mut session.panes {
+                                            pane.bottom_input_enabled = false;
+                                        }
+                                    }
+                                }
+                                this.schedule_workspace_save(cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(tokens.text_primary)
+                                            .child("Classic Terminal"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(tokens.text_secondary)
+                                            .child("Direct cursor typing inline on the terminal character grid."),
+                                    ),
+                            ),
+                    ),
+            );
 
         let token_swatch = |label: &'static str, color: gpui::Hsla, name: &'static str| {
             div()
@@ -3344,6 +4958,7 @@ impl AppState {
                                     ),
                             )
                             .child(theme_section)
+                            .child(input_section)
                             .child(tokens_section)
                             .child(about_section),
                     ),
@@ -4142,10 +5757,11 @@ impl AppState {
         project.expanded = true;
         self.active_project_idx = project_idx;
         let pane_id = project.sessions[session_idx].panes.first().map(|p| p.id);
-        if let Some(pane) = project.sessions[session_idx].panes.first() {
-            pane.terminal.read(cx).focus_handle().focus(window);
+        if let Some(pane_id) = pane_id {
+            self.focus_pane(pane_id, window, cx);
+        } else {
+            self.focused_pane_id = None;
         }
-        self.focused_pane_id = pane_id;
         cx.notify();
     }
 }
@@ -4230,6 +5846,7 @@ impl Render for AppState {
         // "Looking" needs an active window: a visible but backgrounded window
         // has not been seen, so a finish there must still become Done.
         self.window_active = _window.is_window_active();
+        self.ensure_panes_input_state(_window, cx);
 
         if self.theme_preference == ThemePreference::System {
             let sys_mode = self.theme_preference.resolve_mode(_window.appearance());
@@ -4258,7 +5875,12 @@ impl Render for AppState {
         let mut focused_pane = None;
         if let Some(session) = self.active_session() {
             for pane in &session.panes {
-                if pane.terminal.read(cx).focus_handle().is_focused(_window) {
+                let is_term_focused = pane.terminal.read(cx).focus_handle().is_focused(_window);
+                let is_input_focused = pane
+                    .input_state
+                    .as_ref()
+                    .is_some_and(|input| input.read(cx).focus_handle().is_focused(_window));
+                if is_term_focused || is_input_focused {
                     focused_pane = Some(pane.id);
                     break;
                 }
@@ -4560,6 +6182,9 @@ impl Render for AppState {
                     .into_any_element()
             } else {
                 main_content
+            })
+            .when(self.terminal_context_menu.is_some(), |this| {
+                this.child(self.render_terminal_context_menu_layer(cx))
             });
         diagnostics::render_end(diag_render);
         root
@@ -4730,6 +6355,7 @@ fn main() -> Result<()> {
                         palette: palette.clone(),
                         focused_pane_id: None,
                         sidebar_visible: true,
+                        warp_bottom_input: true,
                         active_view: ActiveView::Workspace,
                         theme_preference: ThemePreference::System,
                         integration_panel_visible: false,
@@ -4746,6 +6372,7 @@ fn main() -> Result<()> {
                         attention_seq: 0,
                         project_menu: None,
                         renaming_project: None,
+                        terminal_context_menu: None,
                     });
 
                     let weak_state = app_state.downgrade();
@@ -4920,38 +6547,15 @@ mod resize_tests {
                 .expect("terminal view");
         let title = SharedString::from("terminal 1");
 
-        let pane = TerminalPane {
-            id: 1,
+        let pane = TerminalPane::new(
+            1,
             generation,
-            native_session_id: None,
-            native_session_reporter: None,
-            native_turn_id: None,
-            native_sequence: HashMap::new(),
-            native_reporter_generation: HashMap::new(),
-            pending_approvals: std::collections::HashSet::new(),
-            native_status: None,
-            native_acknowledged: false,
-            osc_report_active: false,
             terminal,
-            status: SessionStatus::Idle,
-            detection: status::DetectionResult::new(
-                SessionStatus::Idle,
-                status::EvidenceSource::NoSignal,
-                status::Confidence::None,
-            ),
-            title: "terminal 1".to_string(),
-            display_title: title.clone(),
+            title.clone(),
+            title.clone(),
             pid,
-            screen_scratch: Vec::new(),
-            poll_cache: None,
-            ack_screen: None,
-            agent_active: false,
-            detector: status::Detector::default(),
-            attention: Default::default(),
-            app: None,
-            is_agent: false,
-            sub_agents: HashMap::new(),
-        };
+            true,
+        );
 
         AppState {
             projects: vec![Project {
@@ -4978,6 +6582,7 @@ mod resize_tests {
             palette,
             focused_pane_id: Some(1),
             sidebar_visible: true,
+            warp_bottom_input: true,
             active_view: ActiveView::Workspace,
             theme_preference: ThemePreference::System,
             integration_panel_visible: false,
@@ -4996,6 +6601,7 @@ mod resize_tests {
             attention_seq: 0,
             project_menu: None,
             renaming_project: None,
+            terminal_context_menu: None,
         }
     }
 
@@ -5793,6 +7399,49 @@ mod settings_and_theme_tests {
     }
 
     #[test]
+    fn settings_terminal_input_style_toggle() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        // Initially enabled
+        assert!(app_state.read_with(&cx, |state, _| state.warp_bottom_input));
+
+        // Switch to settings and set classic
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            state.active_view = ActiveView::Settings;
+            state.warp_bottom_input = false;
+            for project in &mut state.projects {
+                for session in &mut project.sessions {
+                    for pane in &mut session.panes {
+                        pane.bottom_input_enabled = false;
+                    }
+                }
+            }
+            cx.notify();
+        });
+        cx.draw_frame().expect("draw settings with classic input");
+        assert!(!app_state.read_with(&cx, |state, _| state.warp_bottom_input));
+        assert!(!app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].bottom_input_enabled));
+
+        // Switch back to warp style
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            state.warp_bottom_input = true;
+            for project in &mut state.projects {
+                for session in &mut project.sessions {
+                    for pane in &mut session.panes {
+                        pane.bottom_input_enabled = true;
+                    }
+                }
+            }
+            cx.notify();
+        });
+        cx.draw_frame().expect("draw settings with warp input");
+        assert!(app_state.read_with(&cx, |state, _| state.warp_bottom_input));
+        assert!(app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].bottom_input_enabled));
+    }
+
+    #[test]
     fn settings_keyboard_shortcuts() {
         let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
             .expect("headless renderer");
@@ -5904,5 +7553,445 @@ mod settings_and_theme_tests {
             app_state.read_with(&cx, |state, _| state.active_view),
             ActiveView::Workspace
         );
+    }
+}
+
+#[cfg(test)]
+mod warp_bottom_input_tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualContext, point};
+    use resize_tests::open_app;
+
+    #[test]
+    fn warp_bottom_input_renders_and_toggles() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        // By default, warp_bottom_input is enabled
+        let enabled = app_state.read_with(&cx, |state, _| state.warp_bottom_input);
+        assert!(enabled);
+
+        // Drawing a frame ensures panes' input state is created and renders the bottom input bar
+        cx.draw_frame().expect("draw frame with warp bottom input");
+
+        let pane_enabled = app_state.read_with(&cx, |state, _| {
+            state.projects[0].sessions[0].panes[0].bottom_input_enabled
+        });
+        assert!(pane_enabled);
+
+        let has_input_state = app_state.read_with(&cx, |state, _| {
+            state.projects[0].sessions[0].panes[0].input_state.is_some()
+        });
+        assert!(has_input_state);
+
+        // Toggle bottom input off
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.toggle_pane_bottom_input(pane_id, window, cx);
+        });
+        cx.draw_frame().expect("draw frame after toggle off");
+
+        let pane_disabled = app_state.read_with(&cx, |state, _| {
+            state.projects[0].sessions[0].panes[0].bottom_input_enabled
+        });
+        assert!(!pane_disabled);
+
+        // Toggle bottom input back on
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.toggle_pane_bottom_input(pane_id, window, cx);
+        });
+        cx.draw_frame().expect("draw frame after toggle on");
+
+        let pane_enabled_again = app_state.read_with(&cx, |state, _| {
+            state.projects[0].sessions[0].panes[0].bottom_input_enabled
+        });
+        assert!(pane_enabled_again);
+    }
+
+    #[test]
+    fn warp_bottom_input_history_and_execution() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // Execute "echo 1"
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("echo 1", window, cx);
+            });
+            state.execute_pane_input(pane_id, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.command_history, vec!["echo 1"]);
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "");
+        });
+
+        // Execute "echo 2"
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("echo 2", window, cx);
+            });
+            state.execute_pane_input(pane_id, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.command_history, vec!["echo 1", "echo 2"]);
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "");
+        });
+
+        // Start typing a draft "draft cmd"
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("draft cmd", window, cx);
+            });
+            // Press Up: should recall "echo 2" and store "draft cmd" in pending_draft
+            state.step_pane_history(pane_id, true, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.pending_draft, "draft cmd");
+            assert_eq!(pane.history_index, Some(1));
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "echo 2");
+        });
+
+        // Press Up again: should recall "echo 1"
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.step_pane_history(pane_id, true, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.history_index, Some(0));
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "echo 1");
+        });
+
+        // Press Down: should recall "echo 2"
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.step_pane_history(pane_id, false, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.history_index, Some(1));
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "echo 2");
+        });
+
+        // Press Down again: should restore pending_draft "draft cmd"
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.step_pane_history(pane_id, false, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.history_index, None);
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "draft cmd");
+        });
+    }
+
+    #[test]
+    fn warp_bottom_input_clear_and_cancel() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // Type a value and then clear it
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("to be cleared", window, cx);
+            });
+            state.clear_pane_input(pane_id, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.history_index, None);
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "");
+        });
+
+        // Cancel job should be callable without panicking
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            state.cancel_pane_job(pane_id, cx);
+        });
+    }
+
+    #[test]
+    fn terminal_is_read_only_and_cannot_be_written_directly() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        // Terminal must be configured read-only
+        let is_ro = app_state.read_with(&cx, |state, cx| {
+            state.projects[0].sessions[0].panes[0].terminal.read(cx).is_read_only()
+        });
+        assert!(is_ro, "Terminal must be strictly read-only");
+
+        // Attempting to paste on the terminal directly is ignored
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.terminal.update(cx, |term, cx| {
+                term.paste_text("injected text", cx);
+            });
+        });
+    }
+
+    #[test]
+    fn plus_menu_and_message_placeholder() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // Check plus menu toggle
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            state.toggle_plus_menu(pane_id, cx);
+        });
+        let menu_open = app_state.read_with(&cx, |state, _| {
+            state.projects[0].sessions[0].panes[0].plus_menu_open
+        });
+        assert!(menu_open);
+
+        cx.draw_frame().expect("draw frame with plus menu open");
+
+        // Run quick action "clear"
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.run_quick_action(pane_id, "clear", window, cx);
+        });
+
+        let menu_closed = app_state.read_with(&cx, |state, _| {
+            !state.projects[0].sessions[0].panes[0].plus_menu_open
+        });
+        assert!(menu_closed);
+
+        let history = app_state.read_with(&cx, |state, _| {
+            state.projects[0].sessions[0].panes[0].command_history.clone()
+        });
+        assert_eq!(history, vec!["clear"]);
+    }
+
+    #[test]
+    fn terminal_shortcuts_work_in_read_only() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // Ctrl+A selects all
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.terminal.update(cx, |term, cx| {
+                let ev = gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("ctrl-a").unwrap(),
+                    is_held: false,
+                };
+                term.dispatch_key(&ev, window, cx);
+            });
+        });
+
+        // Ctrl+C with no selection sends SIGINT (\x03)
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.terminal.update(cx, |term, cx| {
+                term.clear_selection(cx);
+                let ev = gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("ctrl-c").unwrap(),
+                    is_held: false,
+                };
+                term.dispatch_key(&ev, window, cx);
+            });
+        });
+
+        // In bottom input: Ctrl+Z, Ctrl+D, Ctrl+L work
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let ev_z = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("ctrl-z").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev_z, window, cx);
+
+            let ev_l = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("ctrl-l").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev_l, window, cx);
+        });
+    }
+
+    #[test]
+    fn git_branch_detection_and_warp_badges() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        // Verify git branch detection on the current repo
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let branch = AppState::detect_git_branch(manifest_dir);
+        assert!(branch.is_some(), "Should detect git branch for repo");
+
+        // Temporary directory without git should return None
+        let tmp = std::env::temp_dir();
+        let non_git = AppState::detect_git_branch(&tmp);
+        assert!(non_git.is_none() || tmp.join(".git").exists());
+
+        // Verify placeholder is "Run commands"
+        let placeholder_is_run_commands = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.read(cx).placeholder_str() == "Run commands"
+        });
+        assert!(placeholder_is_run_commands, "Input placeholder must be 'Run commands'");
+
+        // Verify Ctrl+Shift+Enter triggers /agent conversation
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let ev_agent = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("ctrl-shift-enter").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev_agent, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "/agent ");
+        });
+
+        // Frame draws with badges and hint text
+        cx.draw_frame().expect("draw frame with badges and hint");
+    }
+
+    #[test]
+    fn dynamic_auto_focus_like_warp() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let mut is_focused = false;
+        let mut pane_id = 0;
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            pane_id = pane.id;
+            is_focused = input.read(cx).focus_handle().is_focused(window);
+        });
+        assert!(is_focused, "Bottom input must be dynamically focused on start");
+
+        // Focus pane should keep input focused
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.focus_pane(pane_id, window, cx);
+        });
+        cx.draw_frame().expect("draw frame after focus_pane");
+
+        let mut input_focused_again = false;
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input_focused_again = input.read(cx).focus_handle().is_focused(window);
+        });
+        assert!(input_focused_again, "Input must remain focused dynamically");
+    }
+
+    #[test]
+    fn terminal_right_click_copy_and_paste() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // Case 1: Select text in terminal -> right-click opens context menu with Copy option
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.terminal.update(cx, |term, cx| {
+                term.select_all(cx);
+            });
+            state.open_terminal_context_menu(pane_id, point(px(100.0), px(100.0)), window, cx);
+        });
+
+        let is_menu_open = app_state.read_with(&cx, |state, _| state.terminal_context_menu.is_some());
+        assert!(is_menu_open, "Right click must open context menu modal");
+        cx.draw_frame().expect("draw context menu modal");
+
+        // Clicking Copy in modal copies selection and clears selection
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.copy_terminal_selection(pane_id, window, cx);
+        });
+
+        let has_sel = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            pane.terminal.read(cx).has_selection()
+        });
+        assert!(!has_sel, "Copy should clear selection after copying");
+        assert!(app_state.read_with(&cx, |state, _| state.terminal_context_menu.is_none()));
+
+        // Case 2: Right-click opens modal -> clicking Paste inserts clipboard text into input
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("echo copied".to_string()));
+            state.open_terminal_context_menu(pane_id, point(px(100.0), px(100.0)), window, cx);
+            state.paste_from_clipboard_into_pane(pane_id, window, cx);
+        });
+
+        let input_val = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.read(cx).value().to_string()
+        });
+        assert_eq!(input_val, "echo copied", "Paste should insert clipboard text into input");
+
+        // Case 3: Pasting text containing newlines should sanitize and NOT panic
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("", window, cx);
+            });
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("multi\nline\r\ncommand\n".to_string()));
+            state.paste_from_clipboard_into_pane(pane_id, window, cx);
+        });
+
+        // Draw frame: if newlines leaked into single-line shape_line, this would panic
+        cx.draw_frame().expect("drawing frame after multiline paste must not panic");
+
+        let input_val_clean = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.read(cx).value().to_string()
+        });
+        assert_eq!(input_val_clean, "multi line command");
     }
 }

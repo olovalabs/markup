@@ -429,6 +429,14 @@ impl InputState {
         self.placeholder = placeholder.into();
         self
     }
+    pub fn placeholder_str(&self) -> &str {
+        self.placeholder.as_str()
+    }
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus_handle
+    }
+
+
 
     pub fn line_number(mut self, line_number: bool) -> Self {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
@@ -567,6 +575,12 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let value: SharedString = value.into();
+        let value: SharedString = if self.mode.is_single_line() && (value.contains('\n') || value.contains('\r')) {
+            value.replace("\r\n", " ").replace('\n', " ").replace('\r', "").into()
+        } else {
+            value
+        };
         self.history.ignore = true;
         let was_disabled = self.disabled;
         self.disabled = false;
@@ -597,6 +611,11 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let text: SharedString = text.into();
+        let text: SharedString = if self.mode.is_single_line() && (text.contains('\n') || text.contains('\r')) {
+            text.replace("\r\n", " ").replace('\n', " ").replace('\r', "").into()
+        } else {
+            text
+        };
         let range_utf16 = self.range_to_utf16(&(self.cursor()..self.cursor()));
         self.replace_text_in_range_silent(Some(range_utf16), &text, window, cx);
         self.selected_range = (self.selected_range.end..self.selected_range.end).into();
@@ -609,6 +628,11 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let text: SharedString = text.into();
+        let text: SharedString = if self.mode.is_single_line() && (text.contains('\n') || text.contains('\r')) {
+            text.replace("\r\n", " ").replace('\n', " ").replace('\r', "").into()
+        } else {
+            text
+        };
         self.replace_text_in_range_silent(None, &text, window, cx);
         self.selected_range = (self.selected_range.end..self.selected_range.end).into();
     }
@@ -1382,7 +1406,7 @@ impl InputState {
         if let Some(clipboard) = cx.read_from_clipboard() {
             let mut new_text = clipboard.text().unwrap_or_default();
             if !self.mode.is_multi_line() {
-                new_text = new_text.replace('\n', "");
+                new_text = new_text.replace("\r\n", " ").replace('\n', " ").replace('\r', "");
             }
 
             self.replace_text_in_range_silent(None, &new_text, window, cx);
