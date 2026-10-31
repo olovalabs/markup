@@ -127,13 +127,13 @@ impl InputMode {
         }
     }
 
-    pub(super) fn update_auto_grow(&mut self, text_wrapper: &TextWrapper) {
+    pub(super) fn update_auto_grow(&mut self, text_wrapper: &TextWrapper, text: &Rope) {
         if self.is_single_line() {
             return;
         }
 
-        let wrapped_lines = text_wrapper.len();
-        self.set_rows(wrapped_lines);
+        let line_count = (text.chars().filter(|c| *c == '\n').count() + 1).max(text_wrapper.len());
+        self.set_rows(line_count);
     }
 
     pub(super) fn rows(&self) -> usize {

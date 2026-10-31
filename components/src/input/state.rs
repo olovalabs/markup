@@ -412,6 +412,12 @@ impl InputState {
         self
     }
 
+    pub fn set_auto_grow(&mut self, min_rows: usize, max_rows: usize) {
+        if !self.mode.is_auto_grow() {
+            self.mode = InputMode::auto_grow(min_rows, max_rows);
+        }
+    }
+
     pub fn code_editor(mut self, language: impl Into<SharedString>) -> Self {
         let language: SharedString = language.into();
         self.mode = InputMode::code_editor(language);
@@ -469,6 +475,10 @@ impl InputState {
             }
         }
         self
+    }
+
+    pub fn current_rows(&self) -> usize {
+        self.mode.rows()
     }
 
     pub fn set_highlighter(
@@ -1105,7 +1115,7 @@ impl InputState {
         self.pause_blink_cursor(cx);
     }
 
-    pub(super) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
             return;
         }
@@ -1115,7 +1125,7 @@ impl InputState {
             self.clear_inline_completion(cx);
         }
 
-        if self.mode.is_multi_line() {
+        if self.mode.is_multi_line() && !self.mode.is_auto_grow() {
             // Get current line indent
             let indent = if self.mode.is_code_editor() {
                 self.indent_of_next_line()
@@ -1128,7 +1138,7 @@ impl InputState {
             self.replace_text_in_range_silent(None, &new_line_text, window, cx);
             self.pause_blink_cursor(cx);
         } else {
-            // Single line input, just emit the event (e.g.: In a dialog to confirm).
+            // Single line or auto-grow command prompt input: propagate to execute command
             cx.propagate();
         }
 
@@ -1384,6 +1394,7 @@ impl InputState {
 
     pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
+            cx.propagate();
             return;
         }
 
@@ -1744,7 +1755,7 @@ impl InputState {
                 };
 
                 self.text_wrapper.set_wrap_width(wrap_width, cx);
-                self.mode.update_auto_grow(&self.text_wrapper);
+                self.mode.update_auto_grow(&self.text_wrapper, &self.text);
                 cx.notify();
             }
         }
@@ -1918,7 +1929,7 @@ impl EntityInputHandler for InputState {
         self.ime_marked_range.take();
         self.update_preferred_column();
         self.update_search(cx);
-        self.mode.update_auto_grow(&self.text_wrapper);
+        self.mode.update_auto_grow(&self.text_wrapper, &self.text);
         if !self.silent_replace_text {
             self.handle_completion_trigger(&range, &new_text, window, cx);
         }
@@ -1982,7 +1993,7 @@ impl EntityInputHandler for InputState {
                 .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len())
                 .into();
         }
-        self.mode.update_auto_grow(&self.text_wrapper);
+        self.mode.update_auto_grow(&self.text_wrapper, &self.text);
         self.history.start_grouping();
         self.push_history(&old_text, &range, new_text);
         cx.notify();

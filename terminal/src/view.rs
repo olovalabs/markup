@@ -1825,7 +1825,7 @@ impl Render for TerminalView {
         let active_match_index = self.search.current_index();
         let hovered_link: Option<RangeInclusive<GridPoint>> =
             self.hovered_link.as_ref().map(|link| link.range.clone());
-        let cursor_visible = self.cursor_visible;
+        let cursor_visible = self.cursor_visible && !self.read_only;
         let show_scrollbar = self.config.show_scrollbar;
         let scrollbar_active = self.scrollbar_dragging || self.scrollbar_hovered;
         let background = self.config.colors.background();

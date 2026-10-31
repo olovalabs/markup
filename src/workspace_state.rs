@@ -55,7 +55,7 @@ fn default_expanded() -> bool {
     true
 }
 fn default_width() -> f32 {
-    330.0
+    260.0
 }
 
 pub fn state_path() -> Option<PathBuf> {

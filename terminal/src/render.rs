@@ -1461,9 +1461,8 @@ impl TerminalRenderer {
             return;
         }
 
-        // Blinking is suppressed while the terminal is unfocused so an inactive
-        // pane does not flicker in the corner of the user's eye.
-        if !vi_mode && ctx.is_focused && cursor_style.blinking && !ctx.cursor_visible {
+        // Suppress cursor when ctx.cursor_visible is false (read-only / rich input mode, or blink phase)
+        if !vi_mode && !ctx.cursor_visible {
             return;
         }
 

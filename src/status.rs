@@ -608,10 +608,15 @@ pub fn forget_pid(pid: Option<u32>) {
 /// rejected every result. The whole process-tree half of detection was silently
 /// dead: a running CLI could never be reported as `Working`.
 #[cfg(target_os = "linux")]
-fn read_proc_tpgid(pid: u32) -> Option<i64> {
+pub fn read_proc_tpgid(pid: u32) -> Option<i64> {
     let stat =
         std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
     parse_stat_tpgid(&stat)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_proc_tpgid(_pid: u32) -> Option<i64> {
+    None
 }
 
 /// Field 8 (`tpgid`) of one `/proc/<pid>/stat` line.

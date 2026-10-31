@@ -51,6 +51,8 @@ pub enum ActiveView {
 use assets::{CombinedAssets, MONO_FONT, load_embedded_fonts, sync_component_fonts};
 use status::{SessionStatus, StatusInput};
 pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/logo/markup.png");
+/// Fixed width of the navigation sidebar (Codex / Warp style).
+pub const SIDEBAR_WIDTH: Pixels = px(260.0);
 
 #[cfg(unix)]
 static STATUS_BUS: std::sync::LazyLock<Option<status_bus::BusIdentity>> =
@@ -145,6 +147,7 @@ pub struct TerminalPane {
     pub history_index: Option<usize>,
     pub pending_draft: String,
     pub bottom_input_enabled: bool,
+    pub bottom_input_visible: bool,
     pub plus_menu_open: bool,
 }
 
@@ -201,8 +204,28 @@ impl TerminalPane {
             history_index: None,
             pending_draft: String::new(),
             bottom_input_enabled,
+            bottom_input_visible: bottom_input_enabled,
             plus_menu_open: false,
         }
+    }
+
+    /// Whether this pane should show the bottom input bar.
+    /// Can be toggled on or off at anytime by the user without blocking.
+    /// When an AI agent / process is actively working, the bar auto-hides;
+    /// when the agent stops working or asks for input (e.g. Blocked, Idle, Done),
+    /// the bar auto-shows (Warp style).
+    /// Alt-screen full-screen programs (vim, nano, htop, less) also temporarily hide it.
+    pub fn should_show_bottom_input(&self, cx: &App) -> bool {
+        if !self.bottom_input_enabled || !self.bottom_input_visible {
+            return false;
+        }
+
+        // Alternate screen mode (vim, nano, htop, less, etc.) always hides the bottom bar
+        if self.terminal.read(cx).is_alt_screen() {
+            return false;
+        }
+
+        true
     }
 }
 
@@ -479,7 +502,7 @@ impl AppState {
         }
         self.startup_loaded = true;
         self.sidebar_visible = saved.sidebar_visible;
-        self.sidebar_width = px(saved.sidebar_width.clamp(200.0, 500.0));
+        self.sidebar_width = SIDEBAR_WIDTH;
         self.theme_preference = saved.theme;
         self.warp_bottom_input = saved.warp_bottom_input;
         let mode = self.theme_preference.resolve_mode(cx.window_appearance());
@@ -1655,8 +1678,28 @@ impl AppState {
                         );
                     }
                     if pane.status != next {
+                        let prev_status = pane.status;
                         pane.status = next;
                         changed = true;
+
+                        // Dynamic show/hide based on agent / terminal status (Warp style)
+                        if pane.bottom_input_enabled {
+                            if prev_status != SessionStatus::Working && next == SessionStatus::Working {
+                                // Agent or command started working: auto-hide the input bar
+                                if pane.bottom_input_visible {
+                                    pane.bottom_input_visible = false;
+                                    pane.terminal.update(cx, |term, _| term.set_read_only(false));
+                                }
+                            } else if (prev_status == SessionStatus::Working && next != SessionStatus::Working)
+                                || (next == SessionStatus::Blocked && prev_status != SessionStatus::Blocked)
+                            {
+                                // Agent or command stopped working or asks for input (Blocked/Idle/Done): auto-show input bar
+                                if !pane.bottom_input_visible && !pane.terminal.read(cx).is_alt_screen() {
+                                    pane.bottom_input_visible = true;
+                                    pane.terminal.update(cx, |term, _| term.set_read_only(true));
+                                }
+                            }
+                        }
                     }
 
                     if let Some(app) = agent_report
@@ -1946,7 +1989,9 @@ impl AppState {
                 self.warp_bottom_input,
             );
             let input_state = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Run commands")
+                InputState::new(window, cx)
+                    .placeholder("Run commands")
+                    .auto_grow(1, 8)
             });
             if self.warp_bottom_input {
                 input_state.update(cx, |state, cx| {
@@ -2167,7 +2212,9 @@ impl AppState {
                 self.warp_bottom_input,
             );
             let input_state = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Run commands")
+                InputState::new(window, cx)
+                    .placeholder("Run commands")
+                    .auto_grow(1, 8)
             });
             if self.warp_bottom_input {
                 input_state.update(cx, |state, cx| {
@@ -2265,7 +2312,9 @@ impl AppState {
                 self.warp_bottom_input,
             );
             let input_state = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Run commands")
+                InputState::new(window, cx)
+                    .placeholder("Run commands")
+                    .auto_grow(1, 8)
             });
             if self.warp_bottom_input {
                 input_state.update(cx, |state, cx| {
@@ -2376,8 +2425,11 @@ impl AppState {
                 p.active_session_idx = s_idx;
                 if let Some(session) = p.sessions.get_mut(s_idx) {
                     if let Some(pane) = session.panes.iter_mut().find(|p| p.id == pane_id) {
-                        let is_alt = pane.terminal.read(cx).is_alt_screen();
-                        if pane.bottom_input_enabled && !is_alt {
+                        let should_show = pane.should_show_bottom_input(cx);
+                        pane.terminal.update(cx, |term, _| {
+                            term.set_read_only(should_show);
+                        });
+                        if should_show {
                             if let Some(input_state) = &pane.input_state {
                                 input_state.update(cx, |state, cx| {
                                     state.focus(window, cx);
@@ -2434,8 +2486,20 @@ impl AppState {
         let Some(pane) = session.panes.get_mut(pane_idx) else {
             return;
         };
-        pane.bottom_input_enabled = !pane.bottom_input_enabled;
-        if pane.bottom_input_enabled {
+        let is_showing_now = pane.should_show_bottom_input(cx);
+        if is_showing_now {
+            pane.bottom_input_enabled = false;
+            pane.bottom_input_visible = false;
+        } else {
+            pane.bottom_input_enabled = true;
+            pane.bottom_input_visible = true;
+        }
+
+        let should_show = pane.should_show_bottom_input(cx);
+        pane.terminal.update(cx, |term, _| {
+            term.set_read_only(should_show);
+        });
+        if should_show {
             if let Some(input_state) = &pane.input_state {
                 input_state.update(cx, |state, cx| {
                     state.focus(window, cx);
@@ -2581,8 +2645,9 @@ impl AppState {
                 term.send_bytes(b"\r", cx);
             });
         } else {
-            pane.terminal.update(cx, |term, cx| {
-                term.send_text(&format!("{cmd}\r"), cx);
+            let terminal = pane.terminal.clone();
+            terminal.update(cx, |term, cx| {
+                term.send_text(&cmd, cx);
             });
             if pane.command_history.last().map(|s| s.as_str()) != Some(&cmd) {
                 pane.command_history.push(cmd);
@@ -2592,10 +2657,77 @@ impl AppState {
             input_state.update(cx, |state, cx| {
                 state.set_value("", window, cx);
             });
+
+            // Send Enter separately after a brief 25ms tick so raw-mode CLI agents (Claude Code,
+            // Ink, readline) receive it as an authentic Enter keystroke rather than pasted text,
+            // triggering immediate automatic prompt submission.
+            let terminal = terminal.clone();
+            App::spawn(cx, async move |cx: &mut gpui::AsyncApp| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(25))
+                    .await;
+                let _ = terminal.update(cx, |term, cx| {
+                    term.send_bytes(b"\r", cx);
+                });
+            }).detach();
         }
         input_state.update(cx, |state, cx| {
             state.focus(window, cx);
         });
+        cx.notify();
+    }
+    fn handle_pane_ctrl_c(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(p_idx) else {
+            return;
+        };
+        let Some(session) = project.sessions.get_mut(s_idx) else {
+            return;
+        };
+        let Some(pane) = session.panes.get_mut(pane_idx) else {
+            return;
+        };
+
+        // 1. Clear input state and draft
+        if let Some(input_state) = &pane.input_state {
+            input_state.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+        }
+        pane.history_index = None;
+        pane.pending_draft.clear();
+
+        // 2. Send \x03 (ETX/SIGINT) to PTY (interrupts process on Linux, macOS, and Windows ConPTY)
+        pane.terminal.update(cx, |term, cx| {
+            term.send_bytes(b"\x03", cx);
+        });
+
+        // 3. On Unix: also directly signal the active foreground process group
+        #[cfg(unix)]
+        if let Some(pid) = pane.pid {
+            if let Some(tpgid) = status::read_proc_tpgid(pid) {
+                if tpgid > 0 && tpgid != pid as i64 {
+                    unsafe {
+                        libc::kill(-(tpgid as libc::pid_t), libc::SIGINT);
+                    }
+                }
+            }
+        }
+
+        // 4. If an agent/command was working, interrupt and return to Idle
+        if pane.status == SessionStatus::Working {
+            pane.status = SessionStatus::Idle;
+            pane.bottom_input_visible = true;
+            pane.terminal.update(cx, |term, _| term.set_read_only(true));
+        }
+
         cx.notify();
     }
 
@@ -2627,30 +2759,135 @@ impl AppState {
         };
 
         // Enter: execute command
-        if key == "enter" && !modifiers.shift && !modifiers.control && !modifiers.alt {
+        if (key == "enter" || key == "return") && !modifiers.shift && !modifiers.control && !modifiers.alt {
             cx.stop_propagation();
             self.execute_pane_input(pane_id, window, cx);
             return;
         }
-        // Ctrl+Shift+Enter: new /agent conversation
-        if (key == "enter" || key == "return") && modifiers.control && modifiers.shift {
+
+        // Shift+Enter: insert newline in input bar (multiline expansion like Warp)
+        if (key == "enter" || key == "return") && modifiers.shift && !modifiers.control && !modifiers.alt {
+            input_state.update(cx, |state, cx| {
+                state.insert("\n", window, cx);
+            });
             cx.stop_propagation();
-            self.trigger_agent_conversation(pane_id, window, cx);
+            cx.notify();
             return;
         }
 
-        // Ctrl+C: clear input if text present, or send SIGINT to PTY
+        // Ctrl+G: toggle bottom input (Warp shortcut)
+        if (key == "g" || key == "G")
+            && (modifiers.control || modifiers.platform)
+            && !modifiers.shift
+            && !modifiers.alt
+        {
+            cx.stop_propagation();
+            self.toggle_pane_bottom_input(pane_id, window, cx);
+            return;
+        }
+
+        // Ctrl+C: interrupt running command or cancel input line (SIGINT)
         if key == "c" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            cx.stop_propagation();
+            self.handle_pane_ctrl_c(pane_id, window, cx);
+            return;
+        }
+
+        // Tab: accept autosuggestion or trigger native shell completion
+        if key == "tab" && !modifiers.control && !modifiers.alt {
+            cx.stop_propagation();
             let current_val = input_state.read(cx).value().to_string();
             if !current_val.is_empty() {
+                if let Some(suggestion) = pane.command_history.iter().rev().find(|cmd| cmd.starts_with(&current_val) && cmd.as_str() != current_val.as_str()) {
+                    input_state.update(cx, |state, cx| {
+                        state.set_value(suggestion, window, cx);
+                    });
+                    cx.notify();
+                    return;
+                }
+            }
+            pane.terminal.update(cx, |term, cx| {
+                term.send_bytes(b"\t", cx);
+            });
+            cx.notify();
+            return;
+        }
+
+        // Right arrow or Ctrl+E: accept autosuggestion from history if cursor at end
+        if (key == "right" && !modifiers.control && !modifiers.shift && !modifiers.alt)
+            || (key == "e" && modifiers.control && !modifiers.shift && !modifiers.alt)
+        {
+            let current_val = input_state.read(cx).value().to_string();
+            if !current_val.is_empty() {
+                let cursor = input_state.read(cx).cursor();
+                if cursor >= current_val.len() {
+                    if let Some(suggestion) = pane.command_history.iter().rev().find(|cmd| cmd.starts_with(&current_val) && cmd.as_str() != current_val.as_str()) {
+                        input_state.update(cx, |state, cx| {
+                            state.set_value(suggestion, window, cx);
+                        });
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Ctrl+A: move cursor to start of line (native readline/zsh)
+        if key == "a" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            input_state.update(cx, |state, cx| {
+                state.move_to_start_of_line(cx);
+            });
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        // Ctrl+E: move cursor to end of line
+        if key == "e" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            input_state.update(cx, |state, cx| {
+                state.move_to_end_of_line(cx);
+            });
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // Ctrl+U: clear line (native readline/zsh)
+        if key == "u" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            input_state.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+            pane.history_index = None;
+            pane.pending_draft.clear();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        // Ctrl+W / Alt+Backspace: delete word backward (native readline/zsh)
+        if (key == "w" && modifiers.control && !modifiers.shift && !modifiers.alt)
+            || (key == "backspace" && modifiers.alt && !modifiers.control && !modifiers.shift)
+        {
+            let current_val = input_state.read(cx).value().to_string();
+            if let Some(last_boundary) = current_val.trim_end().rfind(|c: char| c.is_whitespace() || c == '/' || c == '-' || c == '_') {
+                let new_val = current_val[..=last_boundary].to_string();
+                input_state.update(cx, |state, cx| {
+                    state.set_value(new_val, window, cx);
+                });
+            } else {
                 input_state.update(cx, |state, cx| {
                     state.set_value("", window, cx);
                 });
-                pane.history_index = None;
-                pane.pending_draft.clear();
             }
-            pane.terminal.update(cx, |term, cx| {
-                term.send_bytes(b"\x03", cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        // Ctrl+K: kill line forward (native readline/zsh)
+        if key == "k" && modifiers.control && !modifiers.shift && !modifiers.alt {
+            input_state.update(cx, |state, cx| {
+                state.set_value("", window, cx);
             });
             cx.stop_propagation();
             cx.notify();
@@ -2777,10 +3014,13 @@ impl AppState {
                     if let Some(input) = &pane.input_state {
                         input.update(cx, |state, cx| {
                             state.set_placeholder(placeholder, window, cx);
+                            state.set_auto_grow(1, 8);
                         });
                     } else {
                         let input = cx.new(|cx| {
-                            InputState::new(window, cx).placeholder(placeholder)
+                            InputState::new(window, cx)
+                                .placeholder(placeholder)
+                                .auto_grow(1, 8)
                         });
                         pane.input_state = Some(input);
                     }
@@ -2795,7 +3035,11 @@ impl AppState {
                     if let Some(project) = self.projects.get(p_idx) {
                         if let Some(session) = project.sessions.get(s_idx) {
                             if let Some(pane) = session.panes.get(pane_idx) {
-                                if pane.bottom_input_enabled && !pane.terminal.read(cx).is_alt_screen() {
+                                let should_show = pane.should_show_bottom_input(cx);
+                                pane.terminal.update(cx, |term, _| {
+                                    term.set_read_only(should_show);
+                                });
+                                if should_show {
                                     if let Some(input_state) = &pane.input_state {
                                         let is_input_focused = input_state.read(cx).focus_handle().is_focused(window);
                                         let is_term_focused = pane.terminal.read(cx).focus_handle().is_focused(window);
@@ -2804,6 +3048,11 @@ impl AppState {
                                                 state.focus(window, cx);
                                             });
                                         }
+                                    }
+                                } else {
+                                    let is_term_focused = pane.terminal.read(cx).focus_handle().is_focused(window);
+                                    if !is_term_focused {
+                                        pane.terminal.read(cx).focus_handle().focus(window);
                                     }
                                 }
                             }
@@ -2880,8 +3129,8 @@ impl AppState {
                         .replace('\n', " ")
                         .replace('\r', "");
                     if !clean.is_empty() {
-                        let is_alt = pane.terminal.read(cx).is_alt_screen();
-                        if pane.bottom_input_enabled && !is_alt {
+                        let should_show = pane.should_show_bottom_input(cx);
+                        if should_show {
                             if let Some(input_state) = &pane.input_state {
                                 input_state.update(cx, |state, cx| {
                                     let cur = state.value().to_string();
@@ -3211,54 +3460,6 @@ impl AppState {
         .into_any_element()
     }
 
-    fn trigger_agent_conversation(
-        &mut self,
-        pane_id: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
-            return;
-        };
-        let Some(project) = self.projects.get_mut(p_idx) else {
-            return;
-        };
-        let Some(session) = project.sessions.get_mut(s_idx) else {
-            return;
-        };
-        let Some(pane) = session.panes.get_mut(pane_idx) else {
-            return;
-        };
-        let Some(input_state) = pane.input_state.clone() else {
-            return;
-        };
-
-        let val = input_state.read(cx).value().trim().to_string();
-        if val.is_empty() {
-            input_state.update(cx, |state, cx| {
-                state.set_value("/agent ", window, cx);
-                state.focus(window, cx);
-            });
-        } else if val.starts_with("/agent") {
-            self.execute_pane_input(pane_id, window, cx);
-        } else {
-            let cmd = format!("/agent {val}");
-            pane.terminal.update(cx, |term, cx| {
-                term.send_text(&format!("{cmd}\r"), cx);
-            });
-            if pane.command_history.last().map(|s| s.as_str()) != Some(&cmd) {
-                pane.command_history.push(cmd);
-            }
-            pane.history_index = None;
-            pane.pending_draft.clear();
-            input_state.update(cx, |state, cx| {
-                state.set_value("", window, cx);
-                state.focus(window, cx);
-            });
-        }
-        cx.notify();
-    }
-
     #[allow(dead_code)]
     fn toggle_plus_menu(&mut self, pane_id: usize, cx: &mut Context<Self>) {
         let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
@@ -3505,26 +3706,33 @@ impl AppState {
         } else {
             rgba(0x236823ff).into()
         };
-        let hint_color: Hsla = if tokens.is_dark {
-            rgba(0x696969ff).into()
-        } else {
-            tokens.text_muted
-        };
         let input_element = if let Some(input_state) = &pane.input_state {
+            let current_val = input_state.read(cx).value().to_string();
+            let ghost_suffix = if !current_val.is_empty() {
+                pane.command_history
+                    .iter()
+                    .rev()
+                    .find(|cmd| cmd.starts_with(&current_val) && cmd.as_str() != current_val.as_str())
+                    .map(|cmd| cmd[current_val.len()..].to_string())
+            } else {
+                None
+            };
+
             div()
                 .id(("warp-input-wrapper", pane_id))
                 .w_full()
-                .h(px(24.0))
+                .min_h(px(24.0))
+                .max_h(px(220.0))
+                .overflow_y_scrollbar()
                 .flex()
-                .items_center()
+                .items_start()
                 .font_family(MONO_FONT)
                 .text_size(px(14.0))
-                .on_action(cx.listener(move |this, enter: &gpui_component::input::Enter, window, cx| {
-                    if enter.secondary {
-                        this.trigger_agent_conversation(pane_id, window, cx);
-                    } else {
-                        this.execute_pane_input(pane_id, window, cx);
-                    }
+                .on_action(cx.listener(move |this, _: &gpui_component::input::Enter, window, cx| {
+                    this.execute_pane_input(pane_id, window, cx);
+                }))
+                .on_action(cx.listener(move |this, _: &gpui_component::input::Copy, window, cx| {
+                    this.handle_pane_ctrl_c(pane_id, window, cx);
                 }))
                 .on_action(cx.listener(move |this, _: &gpui_component::input::Escape, window, cx| {
                     this.clear_pane_input(pane_id, window, cx);
@@ -3539,16 +3747,29 @@ impl AppState {
                     this.handle_pane_input_key(pane_id, event, window, cx);
                 }))
                 .child(
-                    Input::new(input_state)
-                        .appearance(false)
-                        .bordered(false)
-                        .focus_bordered(false)
-                        .cleanable(false)
-                        .px_0()
-                        .py_0(),
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .child(
+                            Input::new(input_state)
+                                .appearance(false)
+                                .bordered(false)
+                                .focus_bordered(false)
+                                .cleanable(false)
+                                .px_0()
+                                .py_0(),
+                        )
+                        .children(ghost_suffix.map(|suffix| {
+                            div()
+                                .text_color(if tokens.is_dark { rgba(0x696969ff).into() } else { tokens.text_muted })
+                                .opacity(0.65)
+                                .child(suffix)
+                        })),
                 )
+                .into_any_element()
         } else {
-            div().id(("warp-input-wrapper-empty", pane_id)).w_full().h(px(24.0))
+            div().id(("warp-input-wrapper-empty", pane_id)).w_full().min_h(px(24.0)).into_any_element()
         };
 
         let plus_menu = if pane.plus_menu_open {
@@ -3724,27 +3945,6 @@ impl AppState {
                     .mt(px(12.0))
                     .child(input_element),
             )
-            // Row 3: Hint Row
-            .child(
-                div()
-                    .id(("warp-hint-row", pane_id))
-                    .w_full()
-                    .mt(px(12.0))
-                    .flex()
-                    .items_center()
-                    .font_family(MONO_FONT)
-                    .text_size(px(11.5))
-                    .text_color(hint_color)
-                    .cursor(CursorStyle::PointingHand)
-                    .child("ctrl-shift-↩ new /agent conversation")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.trigger_agent_conversation(pane_id, window, cx);
-                        }),
-                    ),
-            )
     }
 
     fn render_terminal_pane(
@@ -3806,17 +4006,25 @@ impl AppState {
                                     .justify_center()
                                     .rounded(px(4.0))
                                     .cursor(CursorStyle::PointingHand)
-                                    .bg(if pane.bottom_input_enabled {
+                                    .bg(if pane.should_show_bottom_input(cx) {
                                         tokens.pane_header_btn_hover
                                     } else {
                                         gpui::transparent_black()
                                     })
                                     .hover(|s| s.bg(tokens.pane_header_btn_hover))
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| {
+                                            gpui_component::tooltip::Tooltip::new(SharedString::from(
+                                                "Toggle Warp input editor (Ctrl+G)",
+                                            ))
+                                        })
+                                        .into()
+                                    })
                                     .child(
                                         svg()
                                             .path("icons/terminal-bottom.svg")
                                             .size(px(13.0))
-                                            .text_color(if pane.bottom_input_enabled {
+                                            .text_color(if pane.should_show_bottom_input(cx) {
                                                 rgba(0x38bdf8ff).into()
                                             } else {
                                                 tokens.pane_header_icon
@@ -3968,7 +4176,7 @@ impl AppState {
                     .child(pane.terminal.clone()),
             )
             .when(
-                pane.bottom_input_enabled && !pane.terminal.read(cx).is_alt_screen(),
+                pane.should_show_bottom_input(cx),
                 |this| this.child(self.render_warp_input_bar(pane, is_focused, cx)),
             )
     }
@@ -4090,6 +4298,18 @@ impl AppState {
             cx.stop_propagation();
             cx.notify();
             return;
+        }
+
+        if (keystroke.modifiers.control || keystroke.modifiers.platform)
+            && !keystroke.modifiers.shift
+            && !keystroke.modifiers.alt
+            && (keystroke.key == "g" || keystroke.key == "G")
+        {
+            if let Some(pane_id) = self.focused_pane_id {
+                self.toggle_pane_bottom_input(pane_id, _window, cx);
+                cx.stop_propagation();
+                return;
+            }
         }
 
         if keystroke.modifiers.control && (keystroke.key == "+" || keystroke.key == "=") {
@@ -6158,31 +6378,23 @@ impl Render for AppState {
             .bg(tokens.window_bg)
             .text_color(tokens.text_primary)
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(if self.sidebar_visible {
-                h_resizable("workspace-layout-panels")
-                    .on_resize({
-                        let app_state = cx.entity().downgrade();
-                        move |resize_state, _, app| {
-                            let width = resize_state.read(app).sizes().first().copied();
-                            if let Some(width) = width {
-                                let _ = app_state.update(app, |state, cx| {
-                                    state.sidebar_width = width;
-                                    state.schedule_workspace_save(cx);
-                                });
-                            }
-                        }
-                    })
-                    .child(
-                        resizable_panel()
-                            .size(self.sidebar_width)
-                            .size_range(px(200.0)..px(500.0))
-                            .child(sidebar_content),
-                    )
-                    .child(resizable_panel().child(main_content))
-                    .into_any_element()
-            } else {
-                main_content
+            .when(self.sidebar_visible, |this| {
+                this.child(
+                    div()
+                        .w(self.sidebar_width)
+                        .h_full()
+                        .flex_shrink_0()
+                        .child(sidebar_content),
+                )
             })
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(main_content),
+            )
             .when(self.terminal_context_menu.is_some(), |this| {
                 this.child(self.render_terminal_context_menu_layer(cx))
             });
@@ -6360,7 +6572,7 @@ fn main() -> Result<()> {
                         theme_preference: ThemePreference::System,
                         integration_panel_visible: false,
                         integration_feedback: SharedString::from("Setup is opt-in. Status becomes Reporting only after a live event arrives."),
-                        sidebar_width: px(330.0),
+                        sidebar_width: SIDEBAR_WIDTH,
                         drag_start_pos: None,
                         persistence_path: persistence_path.clone(),
                         save_generation: Arc::new(AtomicU64::new(0)),
@@ -6589,7 +6801,7 @@ mod resize_tests {
             integration_feedback: SharedString::from(
                 "Setup is opt-in. Status becomes Reporting only after a live event arrives.",
             ),
-            sidebar_width: px(330.0),
+            sidebar_width: SIDEBAR_WIDTH,
             drag_start_pos: None,
             persistence_path: None,
             save_generation: Arc::new(AtomicU64::new(0)),
@@ -6709,9 +6921,8 @@ mod resize_tests {
         app_state.update(&mut cx, |state, cx| state.poll_sessions_status(cx));
     }
 
-    /// The sidebar is resized by dragging its handle. That path runs its own
-    /// arithmetic over the panels' sizes, so dragging it past both the min and
-    /// the max has to stay panic-free.
+    /// Simulating dragging across the fixed sidebar and window bounds must
+    /// stay panic-free.
     #[test]
     fn dragging_the_sidebar_handle_does_not_panic() {
         let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
@@ -6752,6 +6963,26 @@ mod resize_tests {
             cx.simulate_resize(size(px(1200.), px(780.)));
             cx.run_until_parked();
             cx.draw_frame().expect("a frame after toggling");
+        }
+    }
+
+    #[test]
+    fn fixed_sidebar_width_stays_constant_on_resize() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        for new_size in [
+            size(px(640.), px(480.)),
+            size(px(1440.), px(900.)),
+            size(px(1920.), px(1080.)),
+        ] {
+            cx.simulate_resize(new_size);
+            cx.run_until_parked();
+            cx.draw_frame().expect("drawn frame");
+
+            let width = app_state.read_with(&cx, |state, _| state.sidebar_width);
+            assert_eq!(width, SIDEBAR_WIDTH, "sidebar width must remain fixed across window resizes");
         }
     }
 }
@@ -7873,24 +8104,8 @@ mod warp_bottom_input_tests {
         });
         assert!(placeholder_is_run_commands, "Input placeholder must be 'Run commands'");
 
-        // Verify Ctrl+Shift+Enter triggers /agent conversation
-        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
-        cx.update_window_entity(&app_state, |state, window, cx| {
-            let ev_agent = gpui::KeyDownEvent {
-                keystroke: gpui::Keystroke::parse("ctrl-shift-enter").unwrap(),
-                is_held: false,
-            };
-            state.handle_pane_input_key(pane_id, &ev_agent, window, cx);
-        });
-
-        app_state.read_with(&cx, |state, cx| {
-            let pane = &state.projects[0].sessions[0].panes[0];
-            let input = pane.input_state.as_ref().unwrap();
-            assert_eq!(input.read(cx).value().as_str(), "/agent ");
-        });
-
-        // Frame draws with badges and hint text
-        cx.draw_frame().expect("draw frame with badges and hint");
+        // Frame draws with badges and input
+        cx.draw_frame().expect("draw frame with badges and input");
     }
 
     #[test]
@@ -7993,5 +8208,403 @@ mod warp_bottom_input_tests {
             input.read(cx).value().to_string()
         });
         assert_eq!(input_val_clean, "multi line command");
+    }
+
+    #[test]
+    fn warp_dynamic_show_hide_and_unblocked_toggle() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        // 1. Initially at shell prompt: bottom input should be shown
+        let initial_show = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            pane.should_show_bottom_input(cx)
+        });
+        assert!(initial_show, "At idle shell prompt, bottom input should be shown");
+
+        // 2. Agent starts working: status becomes Working -> dynamically auto-hides input bar
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            // Simulate poller detecting Working status
+            state.projects[0].sessions[0].panes[0].status = SessionStatus::Working;
+            state.projects[0].sessions[0].panes[0].bottom_input_visible = false;
+            state.projects[0].sessions[0].panes[0].terminal.update(cx, |term, _| term.set_read_only(false));
+        });
+        cx.draw_frame().expect("draw frame with working agent");
+
+        let working_show = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            pane.should_show_bottom_input(cx)
+        });
+        assert!(!working_show, "While agent is working, bottom input auto-hides (Warp style)");
+
+        // 3. User toggles anytime without blocking: even while agent is working, toggle works!
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.toggle_pane_bottom_input(pane_id, window, cx);
+        });
+        cx.draw_frame().expect("draw frame after manual toggle on while working");
+
+        let toggled_on_show = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            pane.should_show_bottom_input(cx)
+        });
+        assert!(toggled_on_show, "User can toggle bottom input ON anytime without blocking");
+
+        // User toggles back off
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.toggle_pane_bottom_input(pane_id, window, cx);
+        });
+        cx.draw_frame().expect("draw frame after manual toggle off");
+        let toggled_off_show = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            pane.should_show_bottom_input(cx)
+        });
+        assert!(!toggled_off_show, "User can toggle bottom input OFF anytime without blocking");
+
+        // 4. Agent asks for input (status becomes Blocked): dynamically auto-shows input bar
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.status = SessionStatus::Blocked;
+            pane.bottom_input_enabled = true;
+            pane.bottom_input_visible = true;
+            pane.terminal.update(cx, |term, _| term.set_read_only(true));
+            state.focus_pane(pane_id, window, cx);
+        });
+        cx.draw_frame().expect("draw frame with blocked status");
+
+        let (blocked_show, is_ro) = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            (pane.should_show_bottom_input(cx), pane.terminal.read(cx).is_read_only())
+        });
+        assert!(blocked_show, "When agent asks for input (Blocked), bottom input dynamically shows");
+        assert!(is_ro, "Terminal is in input-editor mode so user types into bottom input");
+
+        // 5. Agent finishes back to shell prompt
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.status = SessionStatus::Idle;
+            pane.bottom_input_visible = true;
+            pane.terminal.update(cx, |term, _| term.set_read_only(true));
+            state.focus_pane(pane_id, window, cx);
+        });
+        cx.draw_frame().expect("draw frame after agent finishes");
+
+        let finished_show = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            pane.should_show_bottom_input(cx)
+        });
+        assert!(finished_show, "After agent finishes, bottom input is shown");
+    }
+
+    #[test]
+    fn ctrl_g_keyboard_shortcut_toggles_input() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // Initially visible
+        let initial = app_state.read_with(&cx, |state, cx| {
+            state.projects[0].sessions[0].panes[0].should_show_bottom_input(cx)
+        });
+        assert!(initial);
+
+        // Press Ctrl+G while focused in input: toggles off
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("ctrl-g").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+        });
+        cx.draw_frame().expect("draw frame after Ctrl+G");
+
+        let after_ctrl_g = app_state.read_with(&cx, |state, cx| {
+            state.projects[0].sessions[0].panes[0].should_show_bottom_input(cx)
+        });
+        assert!(!after_ctrl_g, "Ctrl+G must toggle bottom input off");
+
+        // Press Ctrl+G at window level: toggles back on
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("ctrl-g").unwrap(),
+                is_held: false,
+            };
+            state.on_key_down(&ev, window, cx);
+        });
+        cx.draw_frame().expect("draw frame after second Ctrl+G");
+
+        let after_second_ctrl_g = app_state.read_with(&cx, |state, cx| {
+            state.projects[0].sessions[0].panes[0].should_show_bottom_input(cx)
+        });
+        assert!(after_second_ctrl_g, "Ctrl+G must toggle bottom input back on");
+    }
+
+    #[test]
+    fn prompt_submission_sends_text_and_enter_without_manual_intervention() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("prompt message", window, cx);
+            });
+            state.execute_pane_input(pane_id, window, cx);
+        });
+
+        // Advance executor so the 25ms timer fires and delivers Enter
+        cx.background_executor.advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+
+        // Terminal received input and cleared draft
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "");
+            assert_eq!(pane.command_history.last().map(|s| s.as_str()), Some("prompt message"));
+        });
+    }
+
+    #[test]
+    fn ctrl_c_cancels_draft_and_interrupts_running_process() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // 1. Typing draft and pressing Ctrl+C clears draft and sends SIGINT
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("some draft command", window, cx);
+            });
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("ctrl-c").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "", "Ctrl+C must clear input draft");
+        });
+
+        // 2. Pressing Ctrl+C while command is working interrupts and restores idle
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.status = SessionStatus::Working;
+            state.handle_pane_ctrl_c(pane_id, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, _| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.status, SessionStatus::Idle, "Ctrl+C must interrupt working command");
+            assert!(pane.bottom_input_visible, "Bottom input must be restored after Ctrl+C");
+        });
+    }
+
+    #[test]
+    fn native_terminal_readline_shortcuts_in_input() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // Test Ctrl+U (clear line)
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("command to clear", window, cx);
+            });
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("ctrl-u").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "", "Ctrl+U must clear line");
+        });
+
+        // Test Ctrl+W (delete previous word)
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("git checkout main", window, cx);
+            });
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("ctrl-w").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().trim_end(), "git checkout", "Ctrl+W must delete last word");
+        });
+    }
+
+    #[test]
+    fn autosuggestion_tab_and_right_arrow_completion() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // Populate history
+        cx.update_window_entity(&app_state, |state, _window, _cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            pane.command_history.push("docker compose up -d".to_string());
+        });
+
+        // Type prefix "doc" and hit Tab
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("doc", window, cx);
+            });
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("tab").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+        });
+
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "docker compose up -d", "Tab must complete autosuggestion");
+        });
+    }
+
+    #[test]
+    fn input_auto_grow_height_increases_with_characters_and_newlines() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // Initially 1 line
+        let initial_rows = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.read(cx).current_rows()
+        });
+        assert_eq!(initial_rows, 1, "Input should start with 1 row");
+
+        // Typing multi-line text increases row count automatically
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("line 1\nline 2\nline 3\nline 4", window, cx);
+            });
+        });
+        cx.draw_frame().expect("draw frame with multi-line text");
+
+        let multiline_rows = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.read(cx).current_rows()
+        });
+        assert!(multiline_rows >= 4, "Input row count must increase as characters/lines increase (auto-grow)");
+
+        // Shift+Enter inserts another line
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("shift-enter").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+        });
+        cx.draw_frame().expect("draw frame after shift-enter");
+
+        let after_shift_enter_rows = app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.read(cx).current_rows()
+        });
+        assert!(after_shift_enter_rows >= 5, "Shift+Enter must add newline and increase height");
+    }
+
+    #[test]
+    fn enter_executes_command_and_does_not_insert_newline() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+
+        // Type command "ls -la"
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("ls -la", window, cx);
+            });
+            // Simulate physical Enter keydown
+            let ev = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("enter").unwrap(),
+                is_held: false,
+            };
+            state.handle_pane_input_key(pane_id, &ev, window, cx);
+        });
+
+        // Verify: Enter executed the command, cleared the input field, and did NOT insert newline into input!
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "", "Enter must execute and clear input, not insert a newline");
+            assert_eq!(pane.command_history.last().map(|s| s.as_str()), Some("ls -la"));
+        });
+
+        // Also test dispatching Enter action directly (e.g. from GPUI action system)
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let pane = &mut state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            input.update(cx, |inp, cx| {
+                inp.set_value("pwd", window, cx);
+            });
+            input.update(cx, |inp, cx| {
+                inp.enter(&gpui_component::input::Enter { secondary: false }, window, cx);
+            });
+        });
+
+        // In auto-grow mode, enter() should NOT have inserted \n into the text
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let input = pane.input_state.as_ref().unwrap();
+            assert!(!input.read(cx).value().contains('\n'), "Enter action must not insert newline into auto-grow prompt");
+        });
     }
 }

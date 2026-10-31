@@ -210,6 +210,18 @@ impl InputState {
         self.move_to(offset, Some(MoveDirection::Down), cx);
     }
 
+    pub fn move_to_start_of_line(&mut self, cx: &mut Context<Self>) {
+        self.pause_blink_cursor(cx);
+        let offset = self.start_of_line();
+        self.move_to(offset, Some(MoveDirection::Up), cx);
+    }
+
+    pub fn move_to_end_of_line(&mut self, cx: &mut Context<Self>) {
+        self.pause_blink_cursor(cx);
+        let offset = self.end_of_line();
+        self.move_to(offset, Some(MoveDirection::Down), cx);
+    }
+
     pub(super) fn move_to_start(
         &mut self,
         _: &MoveToStart,
