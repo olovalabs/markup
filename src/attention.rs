@@ -51,19 +51,6 @@ pub struct AppAlert {
     pub looking: bool,
 }
 
-/// Herdr priority: blocked(4) > done(3) > working(2) > idle(1).
-pub fn rank(status: SessionStatus) -> u8 {
-    match status {
-        SessionStatus::Blocked | SessionStatus::Error => 4,
-        SessionStatus::Done => 3,
-        SessionStatus::Working => 2,
-        SessionStatus::Idle | SessionStatus::Active | SessionStatus::Unknown => 1,
-    }
-}
-
-pub const SECTIONS: [(&str, u8); 4] =
-    [("Needs you", 4), ("Done", 3), ("Working", 2), ("Idle", 1)];
-
 fn busy(status: SessionStatus) -> bool {
     matches!(
         status,
@@ -210,16 +197,6 @@ mod tests {
         assert_eq!(run(&mut a, SessionStatus::Error, true, false, true, 1, &mut seq), SessionStatus::Error);
         assert_eq!(run(&mut a, SessionStatus::Error, true, false, true, 2, &mut seq), SessionStatus::Error);
         assert!(a.seen);
-    }
-
-    #[test]
-    fn rank_matches_herdr_priority() {
-        assert!(rank(SessionStatus::Blocked) > rank(SessionStatus::Done));
-        assert!(rank(SessionStatus::Done) > rank(SessionStatus::Working));
-        assert!(rank(SessionStatus::Working) > rank(SessionStatus::Idle));
-        assert_eq!(rank(SessionStatus::Error), rank(SessionStatus::Blocked));
-        assert_eq!(rank(SessionStatus::Active), rank(SessionStatus::Idle));
-        assert_eq!(rank(SessionStatus::Unknown), rank(SessionStatus::Idle));
     }
 
     #[test]

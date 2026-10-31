@@ -5,18 +5,18 @@ use gpui::{
     Edges, Entity, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, ParentElement, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement as _, Styled, Transformation, Window, WindowBounds,
-    WindowControlArea, WindowDecorations, WindowOptions, div, linear_color_stop, linear_gradient,
+    WindowControlArea, WindowDecorations, WindowOptions, deferred, div,
     percentage, px, rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::{Root, TitleBar};
+use gpui_component::{Root, Sizable as _, TitleBar};
+use gpui_component::input::{Input, InputEvent, InputState};
 use terminal::{ColorPalette, TerminalConfig, TerminalView};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,6 +37,16 @@ mod status;
 #[cfg(unix)]
 mod status_bus;
 mod workspace_state;
+mod theme;
+
+use theme::{ThemePreference, ThemeTokens, load_github_palette};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ActiveView {
+    #[default]
+    Workspace,
+    Settings,
+}
 
 use assets::{CombinedAssets, MONO_FONT, load_embedded_fonts, sync_component_fonts};
 use status::{SessionStatus, StatusInput};
@@ -316,6 +326,8 @@ struct AppState {
     /// Pane that currently owns keyboard focus, tracked every render frame
     /// and consumed by the status poller (Active state, sticky-state clearing).
     focused_pane_id: Option<usize>,
+    pub active_view: ActiveView,
+    pub theme_preference: ThemePreference,
     pub sidebar_visible: bool,
     integration_panel_visible: bool,
     integration_feedback: SharedString,
@@ -336,21 +348,17 @@ struct AppState {
     pending_alerts: Vec<attention::AppAlert>,
     /// Monotonic counter for "most recent status change" ordering.
     attention_seq: u64,
-    /// Sidebar Agents section folded.
-    agents_collapsed: bool,
+    /// Currently open project dropdown menu: Some(project_id).
+    project_menu: Option<usize>,
+    /// Currently active project rename state: Some(RenamingProject).
+    renaming_project: Option<RenamingProject>,
 }
 
-/// One row in the sidebar Agents list, built fresh each render.
-struct AgentRow {
-    pane_id: usize,
-    title: String,
-    status: SessionStatus,
-    since: u64,
-    seq: u64,
-    place: String,
-    sub_agents: Vec<(String, SessionStatus)>,
+struct RenamingProject {
+    project_id: usize,
+    input: Entity<InputState>,
+    _subscription: gpui::Subscription,
 }
-
 impl AppState {
     fn saved_workspace(&self) -> workspace_state::SavedWorkspace {
         workspace_state::SavedWorkspace {
@@ -366,6 +374,7 @@ impl AppState {
             active_project: self.active_project().map(|p| p.path.clone()),
             sidebar_visible: self.sidebar_visible,
             sidebar_width: f32::from(self.sidebar_width),
+            theme: self.theme_preference,
         }
     }
 
@@ -406,6 +415,10 @@ impl AppState {
         self.startup_loaded = true;
         self.sidebar_visible = saved.sidebar_visible;
         self.sidebar_width = px(saved.sidebar_width.clamp(200.0, 500.0));
+        self.theme_preference = saved.theme;
+        let mode = self.theme_preference.resolve_mode(cx.window_appearance());
+        self.palette = load_github_palette(mode.is_dark());
+        gpui_component::Theme::change(mode, None, cx);
         self.projects.clear();
         self.active_project_idx = 0;
         for project in saved.projects {
@@ -485,6 +498,59 @@ impl AppState {
                 .map(|p| p.id);
         }
         self.rebuild_session_index();
+        cx.notify();
+    }
+
+    pub fn tokens(&self, cx: &App) -> ThemeTokens {
+        let mode = self.theme_preference.resolve_mode(cx.window_appearance());
+        ThemeTokens::from_mode(mode)
+    }
+
+    #[allow(dead_code)]
+    pub fn tokens_with_appearance(&self, appearance: gpui::WindowAppearance) -> ThemeTokens {
+        let mode = self.theme_preference.resolve_mode(appearance);
+        ThemeTokens::from_mode(mode)
+    }
+
+    pub fn set_theme_preference(
+        &mut self,
+        preference: ThemePreference,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.theme_preference == preference {
+            return;
+        }
+        self.theme_preference = preference;
+        self.apply_theme_preference(window, cx);
+        self.schedule_workspace_save(cx);
+    }
+
+    pub fn apply_theme_preference(
+        &mut self,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let appearance = window
+            .as_ref()
+            .map(|w| w.appearance())
+            .unwrap_or_else(|| cx.window_appearance());
+        let mode = self.theme_preference.resolve_mode(appearance);
+        let is_dark = mode.is_dark();
+        self.palette = load_github_palette(is_dark);
+        gpui_component::Theme::change(mode, window, cx);
+
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                for pane in &mut session.panes {
+                    let mut config = pane.terminal.read(cx).config().clone();
+                    config.colors = self.palette.clone();
+                    pane.terminal.update(cx, |term, cx| {
+                        term.update_config(config, cx);
+                    });
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -1907,6 +1973,13 @@ impl AppState {
         if project_idx >= self.projects.len() {
             return;
         }
+        let project_id = self.projects[project_idx].id;
+        if self.project_menu == Some(project_id) {
+            self.project_menu = None;
+        }
+        if self.renaming_project.as_ref().map(|r| r.project_id) == Some(project_id) {
+            self.renaming_project = None;
+        }
         let was_active = project_idx == self.active_project_idx;
         let removed = self.projects.remove(project_idx);
         for session in &removed.sessions {
@@ -1928,6 +2001,58 @@ impl AppState {
             self.focused_pane_id = None;
         }
         self.rebuild_session_index();
+        cx.notify();
+        self.schedule_workspace_save(cx);
+    }
+
+    fn start_renaming_project(
+        &mut self,
+        project_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_menu = None;
+        if let Some(project) = self.projects.iter().find(|p| p.id == project_id) {
+            let current_name = project.name.clone();
+            let input = cx.new(|cx| InputState::new(window, cx).default_value(current_name));
+            input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.select_all_text(cx);
+            });
+            let subscription = cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    let new_name = input.read(cx).value();
+                    this.finish_renaming_project(project_id, new_name, cx);
+                }
+            });
+            self.renaming_project = Some(RenamingProject {
+                project_id,
+                input,
+                _subscription: subscription,
+            });
+        }
+        cx.notify();
+    }
+
+    fn finish_renaming_project(
+        &mut self,
+        project_id: usize,
+        new_name: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let trimmed = new_name.trim();
+        if !trimmed.is_empty() {
+            if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
+                project.name = SharedString::from(trimmed.to_string());
+                self.schedule_workspace_save(cx);
+            }
+        }
+        self.renaming_project = None;
+        cx.notify();
+    }
+
+    fn cancel_renaming_project(&mut self, cx: &mut Context<Self>) {
+        self.renaming_project = None;
         cx.notify();
     }
 
@@ -2193,6 +2318,7 @@ impl AppState {
     }
 
     fn focus_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_view = ActiveView::Workspace;
         self.focused_pane_id = Some(pane_id);
         if let Some(&(p_idx, s_idx, _)) = self.pane_index.get(&pane_id) {
             self.active_project_idx = p_idx;
@@ -2216,19 +2342,20 @@ impl AppState {
     ) -> gpui::Stateful<gpui::Div> {
         let pane_id = pane.id;
         let is_focused = self.focused_pane_id == Some(pane_id);
+        let tokens = self.tokens(cx);
 
         div()
             .id(("terminal-pane", pane_id))
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgba(0x0c0d12ff))
+            .bg(tokens.pane_bg)
             .rounded(px(8.0))
             .border_1()
             .border_color(if is_focused {
-                rgba(0x38394eff)
+                tokens.pane_border_focused
             } else {
-                rgba(0x22232cff)
+                tokens.pane_border
             })
             .overflow_hidden()
             .on_mouse_down(
@@ -2245,11 +2372,11 @@ impl AppState {
                     .items_center()
                     .justify_between()
                     .px(px(8.0))
-                    .bg(rgba(0x0c0d12ff))
+                    .bg(tokens.pane_header_bg)
                     .child(
                         div()
                             .text_size(px(11.5))
-                            .text_color(rgba(0x918995ff))
+                            .text_color(tokens.pane_header_fg)
                             .child(pane.display_title.clone()),
                     )
                     .child(
@@ -2266,13 +2393,13 @@ impl AppState {
                                     .justify_center()
                                     .rounded(px(4.0))
                                     .cursor(CursorStyle::PointingHand)
-                                    .hover(|s| s.bg(rgba(0x23242cff)))
+                                    .hover(|s| s.bg(tokens.pane_header_btn_hover))
                                     .child(
                                         svg()
                                             .path("icons/split-vertical.svg")
                                             .size(px(13.0))
-                                            .text_color(rgba(0x817987ff))
-                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                            .text_color(tokens.pane_header_icon)
+                                            .hover(|s| s.text_color(tokens.pane_header_icon_hover)),
                                     )
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -2296,13 +2423,13 @@ impl AppState {
                                     .justify_center()
                                     .rounded(px(4.0))
                                     .cursor(CursorStyle::PointingHand)
-                                    .hover(|s| s.bg(rgba(0x23242cff)))
+                                    .hover(|s| s.bg(tokens.pane_header_btn_hover))
                                     .child(
                                         svg()
                                             .path("icons/split-horizontal.svg")
                                             .size(px(13.0))
-                                            .text_color(rgba(0x817987ff))
-                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                            .text_color(tokens.pane_header_icon)
+                                            .hover(|s| s.text_color(tokens.pane_header_icon_hover)),
                                     )
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -2326,7 +2453,7 @@ impl AppState {
                                     .justify_center()
                                     .rounded(px(4.0))
                                     .cursor(CursorStyle::PointingHand)
-                                    .hover(|s| s.bg(rgba(0x23242cff)))
+                                    .hover(|s| s.bg(tokens.pane_header_btn_hover))
                                     .child(
                                         svg()
                                             .path(if is_maximized {
@@ -2335,8 +2462,8 @@ impl AppState {
                                                 "icons/pane-maximize.svg"
                                             })
                                             .size(px(13.0))
-                                            .text_color(rgba(0x817987ff))
-                                            .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                            .text_color(tokens.pane_header_icon)
+                                            .hover(|s| s.text_color(tokens.pane_header_icon_hover)),
                                     )
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -2355,12 +2482,12 @@ impl AppState {
                                     .justify_center()
                                     .rounded(px(4.0))
                                     .cursor(CursorStyle::PointingHand)
-                                    .hover(|s| s.bg(rgba(0x23242cff)))
+                                    .hover(|s| s.bg(tokens.pane_header_btn_hover))
                                     .child(
                                         svg()
                                             .path("icons/pane-close.svg")
                                             .size(px(13.0))
-                                            .text_color(rgba(0x817987ff))
+                                            .text_color(tokens.pane_header_icon)
                                             .hover(|s| s.text_color(rgba(0xf87171ff))),
                                     )
                                     .on_mouse_down(
@@ -2483,6 +2610,24 @@ impl AppState {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
 
+        if keystroke.key == "escape" && self.active_view == ActiveView::Settings {
+            self.active_view = ActiveView::Workspace;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        if keystroke.modifiers.control && keystroke.key == "," {
+            self.active_view = if self.active_view == ActiveView::Settings {
+                ActiveView::Workspace
+            } else {
+                ActiveView::Settings
+            };
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
         if keystroke.modifiers.control && (keystroke.key == "+" || keystroke.key == "=") {
             if let Some(entity) = self.active_pane_terminal() {
                 entity.update(cx, |terminal, cx| {
@@ -2520,19 +2665,33 @@ impl AppState {
             .map(|(p_idx, project)| self.render_project_entry(p_idx, project, cx))
             .collect();
 
+        let tokens = self.tokens(cx);
+
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(linear_gradient(
-                180.0,
-                linear_color_stop(rgba(0xe5def4ff), 0.0),
-                linear_color_stop(rgba(0xfbe3d1ff), 1.0),
-            ))
+            .bg(tokens.sidebar_bg)
             .border_r_1()
-            .border_color(rgba(0xd8cbd8ff))
+            .border_color(tokens.sidebar_border)
+            .when(self.project_menu.is_some(), |this| {
+                this.child(
+                    deferred(
+                        div()
+                            .id("project-menu-backdrop")
+                            .size_full()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.project_menu = None;
+                                cx.notify();
+                            })),
+                    )
+                    .priority(100),
+                )
+            })
             .child(self.render_sidebar_toolbar(cx))
-            .child(self.render_agents_panel(cx))
             .child(
                 div()
                     .flex_1()
@@ -2548,188 +2707,651 @@ impl AppState {
             .when(self.integration_panel_visible, |this| {
                 this.child(self.render_integrations_panel(cx))
             })
+            .child(self.render_sidebar_footer(cx))
             .into_any_element()
     }
 
-    /// Herdr-style Agents list: Needs you / Done / Working / Idle, most recently
-    /// changed first, with workers indented under the pane that started them.
-    fn render_agents_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut rows: Vec<AgentRow> = Vec::new();
-        for project in &self.projects {
-            for session in &project.sessions {
-                let place = format!("{} · {}", project.name, session.display_title);
-                for pane in &session.panes {
-                    if !pane.is_agent {
-                        continue;
-                    }
-                    let mut sub_agents: Vec<(String, SessionStatus)> = pane
-                        .sub_agents
-                        .values()
-                        .map(|sub| {
-                            (
-                                sub.title.clone().unwrap_or_else(|| sub.id.clone()),
-                                sub.status,
-                            )
-                        })
-                        .collect();
-                    sub_agents.sort_by(|a, b| a.0.cmp(&b.0));
-                    rows.push(AgentRow {
-                        pane_id: pane.id,
-                        title: pane_agent_name(pane),
-                        status: pane.status,
-                        since: pane.attention.since,
-                        seq: pane.attention.seq,
-                        place: place.clone(),
-                        sub_agents,
-                    });
-                }
-            }
-        }
-        let total = rows.len();
-        if total == 0 {
-            return div();
-        }
+    fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let is_settings = self.active_view == ActiveView::Settings;
+        let tokens = self.tokens(cx);
 
-        let mut body = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .max_h(px(280.0))
-            .overflow_y_scrollbar();
-        for (label, rank) in attention::SECTIONS {
-            let mut section: Vec<&AgentRow> = rows
-                .iter()
-                .filter(|row| attention::rank(row.status) == rank)
-                .collect();
-            if section.is_empty() {
-                continue;
-            }
-            section.sort_by(|a, b| b.since.cmp(&a.since).then(b.seq.cmp(&a.seq)));
-            body = body.child(
-                div()
-                    .px(px(14.0))
-                    .pt(px(6.0))
-                    .pb(px(2.0))
-                    .text_size(px(10.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgba(0x746d7aff))
-                    .child(format!("{label} ({})", section.len())),
-            );
-            for row in section {
-                let pane_id = row.pane_id;
-                let dot = row.status.colors().0;
-                body = body.child(
-                    div()
-                        .id(("agent-row", pane_id))
-                        .w_full()
-                        .mx(px(8.0))
-                        .px(px(8.0))
-                        .py(px(4.0))
-                        .rounded(px(6.0))
-                        .cursor(CursorStyle::PointingHand)
-                        .hover(|s| s.bg(rgba(0xffffff66)))
-                        .flex()
-                        .items_center()
-                        .gap(px(7.0))
-                        .child(
-                            div()
-                                .flex_none()
-                                .size(px(7.0))
-                                .rounded_full()
-                                .bg(rgba(dot)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .text_size(px(12.0))
-                                .text_color(rgba(0x343039ff))
-                                .child(row.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(9.5))
-                                .text_color(rgba(0x9a929e99))
-                                .child(row.place.clone()),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                this.focus_pane(pane_id, window, cx);
-                            }),
-                        ),
-                );
-                for (sub_title, sub_status) in &row.sub_agents {
-                    body = body.child(
-                        div()
-                            .pl(px(34.0))
-                            .pr(px(14.0))
-                            .py(px(2.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .size(px(5.0))
-                                    .rounded_full()
-                                    .bg(rgba(sub_status.colors().0)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgba(0x746d7aff))
-                                    .child(sub_title.clone()),
-                            ),
-                    );
-                }
-            }
-        }
-
-        let collapsed = self.agents_collapsed;
         div()
+            .id("sidebar-footer")
             .w_full()
-            .flex()
-            .flex_col()
-            .border_b_1()
-            .border_color(rgba(0xd8cbd8ff))
+            .p(px(8.0))
+            .border_t_1()
+            .border_color(tokens.sidebar_footer_border)
+            .bg(tokens.sidebar_footer_bg)
             .child(
                 div()
-                    .id("agents-panel-header")
+                    .id("sidebar-settings-btn")
+                    .h(px(34.0))
                     .w_full()
-                    .h(px(28.0))
-                    .pl(px(14.0))
-                    .pr(px(12.0))
+                    .px(px(10.0))
+                    .rounded(px(6.0))
                     .flex()
                     .items_center()
                     .justify_between()
                     .cursor(CursorStyle::PointingHand)
+                    .bg(if is_settings {
+                        tokens.sidebar_item_active
+                    } else {
+                        rgba(0x00000000).into()
+                    })
+                    .hover(move |s| {
+                        if is_settings {
+                            s
+                        } else {
+                            s.bg(tokens.sidebar_item_hover)
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.active_view = if this.active_view == ActiveView::Settings {
+                            ActiveView::Workspace
+                        } else {
+                            ActiveView::Settings
+                        };
+                        cx.notify();
+                    }))
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgba(0x38333fff))
-                            .child(format!("Agents ({total})")),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                svg()
+                                    .path("icons/settings.svg")
+                                    .size(px(15.0))
+                                    .text_color(if is_settings {
+                                        tokens.sidebar_item_active_fg
+                                    } else {
+                                        tokens.sidebar_icon
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(if is_settings {
+                                        gpui::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .text_color(if is_settings {
+                                        tokens.sidebar_item_active_fg
+                                    } else {
+                                        tokens.sidebar_fg
+                                    })
+                                    .child("Settings"),
+                            ),
                     )
                     .child(
                         div()
-                            .text_size(px(10.0))
-                            .text_color(rgba(0x746d7aff))
-                            .child(if collapsed { "show" } else { "hide" }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.agents_collapsed = !this.agents_collapsed;
-                            cx.notify();
-                        }),
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(tokens.sidebar_muted)
+                            .child(self.theme_preference.label()),
                     ),
             )
-            .when(!collapsed, |this| this.child(body))
+    }
+
+    fn render_settings_page(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let tokens = self.tokens(cx);
+        let is_maximized = window.is_maximized();
+        let is_fullscreen = window.is_fullscreen();
+        let controls = window.window_controls();
+
+        let window_controls = (!is_fullscreen).then(|| {
+            div()
+                .id("settings-window-controls")
+                .flex()
+                .items_center()
+                .h_full()
+                .when(controls.minimize, |this| {
+                    this.child(
+                        div()
+                            .id("settings-window-minimize-btn")
+                            .w(px(36.0))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(move |s| s.bg(tokens.titlebar_btn_hover))
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                cx.stop_propagation();
+                                window.minimize_window();
+                            })
+                            .child(
+                                svg()
+                                    .path("window-minimize.svg")
+                                    .size(px(14.0))
+                                    .text_color(tokens.titlebar_fg)
+                                    .hover(move |s| s.text_color(tokens.text_primary)),
+                            ),
+                    )
+                })
+                .when(controls.maximize, |this| {
+                    this.child(
+                        div()
+                            .id("settings-window-maximize-btn")
+                            .w(px(36.0))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(move |s| s.bg(tokens.titlebar_btn_hover))
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                cx.stop_propagation();
+                                window.zoom_window();
+                            })
+                            .child(
+                                svg()
+                                    .path(if is_maximized {
+                                        "window-restore.svg"
+                                    } else {
+                                        "window-maximize.svg"
+                                    })
+                                    .size(px(14.0))
+                                    .text_color(tokens.titlebar_fg)
+                                    .hover(move |s| s.text_color(tokens.text_primary)),
+                            ),
+                    )
+                })
+                .child(
+                    div()
+                        .id("settings-window-close-btn")
+                        .w(px(36.0))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(rgba(0xe81123ff)))
+                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                            cx.stop_propagation();
+                            window.remove_window();
+                        })
+                        .child(
+                            svg()
+                                .path("window-close.svg")
+                                .size(px(14.0))
+                                .text_color(tokens.titlebar_fg)
+                                .hover(|s| s.text_color(rgba(0xffffffff))),
+                        ),
+                )
+        });
+
+        let settings_titlebar = self
+            .make_drag_area(cx)
+            .h(px(38.0))
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .pl_3()
+            .bg(tokens.titlebar_bg)
+            .border_b_1()
+            .border_color(tokens.titlebar_border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .when(!self.sidebar_visible, |this| {
+                        this.child(
+                            div()
+                                .id("settings-sidebar-toggle-btn")
+                                .cursor(CursorStyle::PointingHand)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    svg()
+                                        .path("icons/panel-left.svg")
+                                        .size(px(16.0))
+                                        .text_color(tokens.titlebar_fg)
+                                        .hover(move |s| s.text_color(tokens.text_primary)),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.sidebar_visible = true;
+                                        cx.notify();
+                                        this.schedule_workspace_save(cx);
+                                    }),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("settings-back-btn")
+                            .cursor(CursorStyle::PointingHand)
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .bg(tokens.pill_inactive_bg)
+                            .hover(move |s| s.bg(tokens.card_hover))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.active_view = ActiveView::Workspace;
+                                cx.notify();
+                            }))
+                            .child(
+                                svg()
+                                    .path("icons/arrow-left.svg")
+                                    .size(px(13.0))
+                                    .text_color(tokens.text_secondary),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(tokens.text_primary)
+                                    .child("Workspace"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(tokens.titlebar_fg)
+                            .child("Settings"),
+                    ),
+            )
+            .children(window_controls);
+
+        let current_pref = self.theme_preference;
+        let current_appearance = window.appearance();
+        let resolved_mode = current_pref.resolve_mode(current_appearance);
+
+        let theme_card = |id: &'static str,
+                          pref: ThemePreference,
+                          title: &'static str,
+                          subtitle: &'static str,
+                          icon: &'static str,
+                          is_default: bool| {
+            let is_selected = current_pref == pref;
+            div()
+                .id(id)
+                .flex_1()
+                .p(px(16.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(if is_selected {
+                    tokens.pane_border_focused
+                } else {
+                    tokens.card_border
+                })
+                .bg(if is_selected {
+                    tokens.pill_inactive_bg
+                } else {
+                    tokens.card_bg
+                })
+                .cursor(CursorStyle::PointingHand)
+                .hover(move |s| {
+                    if !is_selected {
+                        s.bg(tokens.card_hover)
+                    } else {
+                        s
+                    }
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.set_theme_preference(pref, Some(window), cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .size(px(32.0))
+                                        .rounded(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(if is_selected {
+                                            tokens.pill_active_bg
+                                        } else {
+                                            tokens.pill_inactive_bg
+                                        })
+                                        .child(
+                                            svg()
+                                                .path(icon)
+                                                .size(px(16.0))
+                                                .text_color(if is_selected {
+                                                    tokens.pill_active_fg
+                                                } else {
+                                                    tokens.text_secondary
+                                                }),
+                                        ),
+                                )
+                                .when(is_default, |this| {
+                                    this.child(
+                                        div()
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .bg(tokens.pill_inactive_bg)
+                                            .border_1()
+                                            .border_color(tokens.border_subtle)
+                                            .text_size(px(10.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(tokens.text_secondary)
+                                            .child("Default"),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(14.0))
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(tokens.text_primary)
+                                                .child(title),
+                                        )
+                                        .when(is_selected, |this| {
+                                            this.child(
+                                                div()
+                                                    .size(px(6.0))
+                                                    .rounded_full()
+                                                    .bg(tokens.pill_active_bg),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(tokens.text_secondary)
+                                        .child(subtitle),
+                                ),
+                        ),
+                )
+        };
+
+        let theme_section = div()
+            .w_full()
+            .p(px(20.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(tokens.card_border)
+            .bg(tokens.card_bg)
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(tokens.text_primary)
+                            .child("Appearance & Theme"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(tokens.text_secondary)
+                            .child("Configure interface theme. The token-based theme dynamically styles the workspace and terminal emulators."),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(12.0))
+                    .child(theme_card(
+                        "theme-option-system",
+                        ThemePreference::System,
+                        "System",
+                        "Automatically sync with OS appearance",
+                        "icons/monitor.svg",
+                        true,
+                    ))
+                    .child(theme_card(
+                        "theme-option-dark",
+                        ThemePreference::Dark,
+                        "Dark",
+                        "Sleek dark theme with GitHub Dark terminal",
+                        "icons/moon.svg",
+                        false,
+                    ))
+                    .child(theme_card(
+                        "theme-option-light",
+                        ThemePreference::Light,
+                        "Light",
+                        "Clean light theme with GitHub Light terminal",
+                        "icons/sun.svg",
+                        false,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pt(px(8.0))
+                    .border_t_1()
+                    .border_color(tokens.border_subtle)
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(tokens.text_muted)
+                            .child(format!(
+                                "Current preference: {} · Active resolved mode: {}",
+                                current_pref.label(),
+                                if resolved_mode.is_dark() { "Dark" } else { "Light" }
+                            )),
+                    ),
+            );
+
+        let token_swatch = |label: &'static str, color: gpui::Hsla, name: &'static str| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .p(px(8.0))
+                .rounded(px(6.0))
+                .bg(tokens.pill_inactive_bg)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .size(px(18.0))
+                                .rounded(px(4.0))
+                                .border_1()
+                                .border_color(tokens.border)
+                                .bg(color),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(tokens.text_primary)
+                                .child(label),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(tokens.text_muted)
+                        .child(name),
+                )
+        };
+
+        let tokens_section = div()
+            .w_full()
+            .p(px(20.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(tokens.card_border)
+            .bg(tokens.card_bg)
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(tokens.text_primary)
+                            .child("Design Tokens (Active)"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(tokens.text_secondary)
+                            .child("Markup uses token-based theming. Below are the live tokens active for this theme:"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(token_swatch("Window Background", tokens.window_bg, "window_bg"))
+                    .child(token_swatch("Sidebar Background", tokens.sidebar_bg, "sidebar_bg"))
+                    .child(token_swatch("Terminal Pane Background", tokens.pane_bg, "pane_bg"))
+                    .child(token_swatch("Text Primary", tokens.text_primary, "text_primary"))
+                    .child(token_swatch("Border", tokens.border, "border"))
+                    .child(token_swatch("Primary Accent", tokens.primary_btn_bg, "primary_btn_bg"))
+                    .child(token_swatch("Terminal Border (Focused)", tokens.pane_border_focused, "pane_border_focused")),
+            );
+
+        let about_section = div()
+            .w_full()
+            .p(px(20.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(tokens.card_border)
+            .bg(tokens.card_bg)
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .size(px(36.0))
+                            .rounded(px(8.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(gpui::img(SharedString::from("logo/markup.png")).size(px(32.0))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(tokens.text_primary)
+                                    .child("Markup"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(tokens.text_secondary)
+                                    .child("GPU-accelerated terminal emulator for AI coding agents"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(tokens.text_muted)
+                    .child("v0.1.0"),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(tokens.window_bg)
+            .child(settings_titlebar)
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .p(px(24.0))
+                    .child(
+                        div()
+                            .max_w(px(720.0))
+                            .w_full()
+                            .mx_auto()
+                            .flex()
+                            .flex_col()
+                            .gap(px(20.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(22.0))
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(tokens.text_primary)
+                                            .child("Settings"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .text_color(tokens.text_secondary)
+                                            .child("Manage application preferences, appearance, and theme tokens."),
+                                    ),
+                            )
+                            .child(theme_section)
+                            .child(tokens_section)
+                            .child(about_section),
+                    ),
+            )
     }
 
     fn render_sidebar_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let tokens = self.tokens(cx);
         div()
             .h(px(38.0))
             .w_full()
@@ -2742,6 +3364,7 @@ impl AppState {
                 "sidebar-toggle-btn",
                 "icons/panel-left.svg",
                 16.0,
+                &tokens,
                 cx.listener::<MouseDownEvent>(|this, _, _, cx| {
                     this.sidebar_visible = !this.sidebar_visible;
                     cx.notify();
@@ -2758,6 +3381,7 @@ impl AppState {
                         "sidebar-open-project-btn",
                         "icons/folder-plus.svg",
                         15.0,
+                        &tokens,
                         cx.listener::<MouseDownEvent>(|this, _, window, cx| {
                             this.select_folder_and_add_project(window, cx);
                         }),
@@ -2766,6 +3390,7 @@ impl AppState {
                         "sidebar-new-session-btn",
                         "icons/plus.svg",
                         15.0,
+                        &tokens,
                         cx.listener::<MouseDownEvent>(|this, _, window, cx| {
                             this.create_new_session_for_active_project(window, cx);
                         }),
@@ -2774,6 +3399,7 @@ impl AppState {
                         "sidebar-integrations-btn",
                         "icons/command.svg",
                         15.0,
+                        &tokens,
                         cx.listener::<MouseDownEvent>(|this, _, _, cx| {
                             this.integration_panel_visible = !this.integration_panel_visible;
                             cx.notify();
@@ -2784,26 +3410,27 @@ impl AppState {
 
     fn render_integrations_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let weak = cx.entity().downgrade();
+        let tokens = self.tokens(cx);
         div()
             .w_full()
             .px(px(12.0))
             .py(px(10.0))
             .border_t_1()
-            .border_color(rgba(0xd8cbd8ff))
+            .border_color(tokens.sidebar_border)
             .flex()
             .flex_col()
             .gap(px(7.0))
-            .child(div().text_size(px(12.0)).font_weight(gpui::FontWeight::BOLD).text_color(rgba(0x38333fff)).child("Agent integrations"))
-            .child(div().text_size(px(10.5)).text_color(rgba(0x746d7aff)).child("Claude Code · Codex · OpenCode · Pi · OMP · Command Code"))
-            .child(div().text_size(px(10.0)).text_color(rgba(0x746d7aff)).child("Versions and hook trust: markup integration doctor"))
-            .child(div().text_size(px(10.0)).text_color(rgba(0x746d7aff)).child(self.integration_feedback.clone()))
+            .child(div().text_size(px(12.0)).font_weight(gpui::FontWeight::BOLD).text_color(tokens.sidebar_fg).child("Agent integrations"))
+            .child(div().text_size(px(10.5)).text_color(tokens.sidebar_muted).child("Claude Code · Codex · OpenCode · Pi · OMP · Command Code"))
+            .child(div().text_size(px(10.0)).text_color(tokens.sidebar_muted).child("Versions and hook trust: markup integration doctor"))
+            .child(div().text_size(px(10.0)).text_color(tokens.sidebar_muted).child(self.integration_feedback.clone()))
             .child(
                 div()
                     .id("enable-agent-integrations")
                     .w_full().py(px(6.0)).rounded(px(6.0))
-                    .bg(rgba(0xffffffff)).hover(|s| s.bg(rgba(0xf4eff8ff)))
+                    .bg(tokens.card_bg).hover(move |s| s.bg(tokens.card_hover))
                     .cursor(CursorStyle::PointingHand)
-                    .text_size(px(11.0)).text_color(rgba(0x38333fff))
+                    .text_size(px(11.0)).text_color(tokens.sidebar_fg)
                     .flex().items_center().justify_center()
                     .child("Enable local integrations")
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
@@ -2833,8 +3460,8 @@ impl AppState {
         project: &Project,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let tokens = self.tokens(cx);
         let is_active_project = project_idx == self.active_project_idx;
-        let session_count = project.sessions.len();
         let needs_attention = project
             .sessions
             .iter()
@@ -2855,7 +3482,7 @@ impl AppState {
                         .pr(px(16.0))
                         .py(px(6.0))
                         .text_size(px(11.5))
-                        .text_color(rgba(0x918995ff))
+                        .text_color(tokens.sidebar_muted)
                         .child("No sessions yet")
                         .into_any_element(),
                 );
@@ -2872,6 +3499,180 @@ impl AppState {
             }
         }
 
+        let is_renaming = self
+            .renaming_project
+            .as_ref()
+            .is_some_and(|r| r.project_id == project.id);
+        let is_menu_open = self.project_menu == Some(project.id);
+        let group_name = SharedString::from(format!("project-row-{}", project.id));
+        let project_id = project.id;
+
+        let header_content: gpui::AnyElement = if is_renaming {
+            let renaming = self.renaming_project.as_ref().unwrap();
+            let input_entity = renaming.input.clone();
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            Input::new(&renaming.input)
+                                .with_size(gpui_component::Size::Small)
+                                .cleanable(false),
+                        ),
+                )
+                .child(sidebar_icon_button(
+                    ("project-rename-save", project.id),
+                    "icons/status-check.svg",
+                    12.0,
+                    &tokens,
+                    cx.listener(move |this, _, _, cx| {
+                        let val = input_entity.read(cx).value();
+                        this.finish_renaming_project(project_id, val, cx);
+                    }),
+                ))
+                .child(sidebar_icon_button(
+                    ("project-rename-cancel", project.id),
+                    "icons/x.svg",
+                    11.0,
+                    &tokens,
+                    cx.listener(move |this, _, _, cx| {
+                        this.cancel_renaming_project(cx);
+                    }),
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.5))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(if is_active_project {
+                            tokens.sidebar_fg
+                        } else {
+                            tokens.sidebar_muted
+                        })
+                        .child(project.name.clone()),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .child(
+                            sidebar_icon_button(
+                                ("project-options", project.id),
+                                "icons/ellipsis.svg",
+                                13.0,
+                                &tokens,
+                                cx.listener::<MouseDownEvent>(move |this, _, _, cx| {
+                                    this.project_menu = if this.project_menu == Some(project_id) {
+                                        None
+                                    } else {
+                                        Some(project_id)
+                                    };
+                                    cx.notify();
+                                }),
+                            )
+                            .opacity(if is_menu_open { 1.0 } else { 0.0 })
+                            .group_hover(group_name.clone(), |s| s.opacity(1.0)),
+                        )
+                        .when(is_menu_open, |this| {
+                            this.child(
+                                deferred(
+                                    div()
+                                        .id(("project-menu-popover", project.id))
+                                        .absolute()
+                                        .top(px(24.0))
+                                        .left_0()
+                                        .w(px(130.0))
+                                        .bg(tokens.card_bg)
+                                        .border_1()
+                                        .border_color(tokens.card_border)
+                                        .rounded(px(6.0))
+                                        .shadow_md()
+                                        .p(px(4.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .id(("menu-rename", project.id))
+                                                .px(px(8.0))
+                                                .py(px(5.0))
+                                                .rounded(px(4.0))
+                                                .text_size(px(12.0))
+                                                .text_color(tokens.text_primary)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(move |s| s.bg(tokens.sidebar_item_hover))
+                                                .child("Rename")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.start_renaming_project(project_id, window, cx);
+                                                    }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("menu-remove", project.id))
+                                                .px(px(8.0))
+                                                .py(px(5.0))
+                                                .rounded(px(4.0))
+                                                .text_size(px(12.0))
+                                                .text_color(tokens.text_primary)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(move |s| s.bg(tokens.sidebar_item_hover))
+                                                .child("Remove")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.project_menu = None;
+                                                        if let Some(idx) = this.projects.iter().position(|p| p.id == project_id) {
+                                                            this.close_project(idx, window, cx);
+                                                        }
+                                                    }),
+                                                ),
+                                        ),
+                                 )
+                                .priority(101),
+                            )
+                        }),
+                )
+                .child(div().flex_1())
+                .when(needs_attention > 0, |this| {
+                    this.child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgba(0xb7782fff))
+                            .child(format!("{needs_attention} needs you")),
+                    )
+                })
+                .child(sidebar_icon_button(
+                    ("project-new-session", project.id),
+                    "icons/plus.svg",
+                    13.0,
+                    &tokens,
+                    cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                        this.create_new_session_in_project(project_idx, window, cx);
+                    }),
+                ))
+                .into_any_element()
+        };
+
         div()
             .flex()
             .flex_col()
@@ -2879,6 +3680,7 @@ impl AppState {
             .child(
                 div()
                     .id(("project-row", project.id))
+                    .group(group_name)
                     .ml(px(6.0))
                     .mr(px(6.0))
                     .mt(px(2.0))
@@ -2891,7 +3693,7 @@ impl AppState {
                     .items_center()
                     .gap(px(6.0))
                     .bg(rgba(0x00000000))
-                    .hover(|s| s.bg(rgba(0xffffff55)))
+                    .hover(move |s| s.bg(tokens.sidebar_item_hover))
                     .child(
                         div()
                             .id(("project-chevron", project.id))
@@ -2900,12 +3702,12 @@ impl AppState {
                             .items_center()
                             .justify_center()
                             .rounded(px(3.0))
-                            .hover(|s| s.bg(rgba(0xffffff66)))
+                            .hover(move |s| s.bg(tokens.sidebar_icon_btn_hover))
                             .child(
                                 svg()
                                     .path(chevron)
                                     .size(px(12.0))
-                                    .text_color(rgba(0x817987ff)),
+                                    .text_color(tokens.sidebar_icon),
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -2915,57 +3717,13 @@ impl AppState {
                                 }),
                             ),
                     )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.5))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(if is_active_project {
-                                rgba(0x625b69ff)
-                            } else {
-                                rgba(0x77707dff)
-                            })
-                            .child(project.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(10.5))
-                            .text_color(rgba(0x918995ff))
-                            .child(format!("{session_count}")),
-                    )
-                    .child(div().flex_1())
-                    .when(needs_attention > 0, |this| {
-                        this.child(
-                            div()
-                                .text_size(px(11.0))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(rgba(0xb7782fff))
-                                .child(format!("{needs_attention} needs you")),
-                        )
-                    })
-                    .child(sidebar_icon_button(
-                        ("project-new-session", project.id),
-                        "icons/plus.svg",
-                        13.0,
-                        cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
-                            this.create_new_session_in_project(project_idx, window, cx);
-                        }),
-                    ))
-                    .child(sidebar_icon_button(
-                        ("project-close", project.id),
-                        "icons/x.svg",
-                        12.0,
-                        cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
-                            this.close_project(project_idx, window, cx);
-                        }),
-                    ))
+                    .child(header_content)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
-                            // The whole header selects the project and reveals
-                            // its sessions; the chevron is what collapses it.
+                            if this.renaming_project.as_ref().map(|r| r.project_id) == Some(project_id) {
+                                return;
+                            }
                             this.activate_project(project_idx, window, cx);
                         }),
                     ),
@@ -2984,6 +3742,7 @@ impl AppState {
         is_active_session: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let tokens = self.tokens(cx);
         let selected_evidence = session
             .panes
             .iter()
@@ -3000,7 +3759,7 @@ impl AppState {
         let indicator = match session.status {
             SessionStatus::Working => gpui_component::Icon::new(gpui_component::IconName::Loader)
                 .size(px(16.0))
-                .text_color(rgba(0x625b69ff))
+                .text_color(tokens.sidebar_muted)
                 .with_animation(
                     ("session-spinner", session.id),
                     Animation::new(std::time::Duration::from_millis(900)).repeat(),
@@ -3159,7 +3918,7 @@ impl AppState {
                 .flex()
                 .items_center()
                 .text_size(px(10.0))
-                .text_color(rgba(0x777781ff))
+                .text_color(tokens.sidebar_muted)
                 .child("Unknown")
                 .into_any_element(),
             SessionStatus::Active | SessionStatus::Idle => div().size(px(19.0)).into_any_element(),
@@ -3181,15 +3940,15 @@ impl AppState {
             .items_center()
             .gap(px(8.0))
             .bg(if is_active_session {
-                rgba(0xffffffed)
+                tokens.sidebar_item_active
             } else {
-                rgba(0x00000000)
+                rgba(0x00000000).into()
             })
-            .hover(|s| {
+            .hover(move |s| {
                 if is_active_session {
                     s
                 } else {
-                    s.bg(rgba(0xffffff66))
+                    s.bg(tokens.sidebar_item_hover)
                 }
             })
             .child(
@@ -3208,7 +3967,11 @@ impl AppState {
                             gpui::FontWeight::MEDIUM
                         },
                     )
-                    .text_color(rgba(0x343039ff))
+                    .text_color(if is_active_session {
+                        tokens.sidebar_item_active_fg
+                    } else {
+                        tokens.sidebar_fg
+                    })
                     .child(session.display_title.clone()),
             )
             .child(indicator)
@@ -3216,6 +3979,7 @@ impl AppState {
                 ("session-close", session.id),
                 "icons/x.svg",
                 10.0,
+                &tokens,
                 cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
                     this.close_session(project_idx, session_idx, window, cx);
                 }),
@@ -3230,6 +3994,7 @@ impl AppState {
     }
 
     fn render_sidebar_empty_state(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let tokens = self.tokens(cx);
         div()
             .flex()
             .flex_col()
@@ -3244,25 +4009,25 @@ impl AppState {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba(0x23242cff))
+                    .bg(tokens.card_bg)
                     .child(
                         svg()
                             .path("icons/folder.svg")
                             .size(px(20.0))
-                            .text_color(rgba(0x817987ff)),
+                            .text_color(tokens.sidebar_icon),
                     ),
             )
             .child(
                 div()
                     .text_size(px(12.5))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgba(0x625b69ff))
+                    .text_color(tokens.sidebar_fg)
                     .child("No projects open"),
             )
             .child(
                 div()
                     .text_size(px(11.5))
-                    .text_color(rgba(0x918995ff))
+                    .text_color(tokens.sidebar_muted)
                     .text_center()
                     .child("Open any folder to start a project with its own sessions."),
             )
@@ -3271,6 +4036,7 @@ impl AppState {
                 "Open project",
                 "icons/folder-plus.svg",
                 true,
+                &tokens,
                 cx.listener::<MouseDownEvent>(|this, _, window, cx| {
                     this.select_folder_and_add_project(window, cx);
                 }),
@@ -3282,6 +4048,7 @@ impl AppState {
     fn render_empty_terminal(&self, cx: &mut Context<Self>) -> gpui::Div {
         let has_project = self.active_project().is_some();
         let project_idx = self.active_project_idx;
+        let tokens = self.tokens(cx);
         div()
             .size_full()
             .flex()
@@ -3296,19 +4063,19 @@ impl AppState {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba(0x1b1c22ff))
+                    .bg(tokens.card_bg)
                     .child(
                         svg()
                             .path("icons/folder.svg")
                             .size(px(24.0))
-                            .text_color(rgba(0x8788a5ff)),
+                            .text_color(tokens.text_secondary),
                     ),
             )
             .child(
                 div()
                     .text_size(px(14.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgba(0xc3c1eeff))
+                    .text_color(tokens.text_primary)
                     .child(if has_project {
                         "No session in this project"
                     } else {
@@ -3318,7 +4085,7 @@ impl AppState {
             .child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(rgba(0x656679ff))
+                    .text_color(tokens.text_muted)
                     .child(if has_project {
                         "Create a session to start a terminal in this project."
                     } else {
@@ -3336,6 +4103,7 @@ impl AppState {
                         "Open project",
                         "icons/folder-plus.svg",
                         true,
+                        &tokens,
                         cx.listener::<MouseDownEvent>(|this, _, window, cx| {
                             this.select_folder_and_add_project(window, cx);
                         }),
@@ -3346,6 +4114,7 @@ impl AppState {
                             "New session",
                             "icons/plus.svg",
                             false,
+                            &tokens,
                             cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
                                 this.create_new_session_in_project(project_idx, window, cx);
                             }),
@@ -3362,6 +4131,7 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.active_view = ActiveView::Workspace;
         let Some(project) = self.projects.get_mut(project_idx) else {
             return;
         };
@@ -3387,8 +4157,12 @@ fn sidebar_icon_button(
     id: impl Into<gpui::ElementId>,
     icon: &'static str,
     icon_size: f32,
+    tokens: &ThemeTokens,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    let hover_bg = tokens.sidebar_icon_btn_hover;
+    let icon_color = tokens.sidebar_icon;
+    let icon_hover_color = tokens.sidebar_icon_hover;
     div()
         .id(id)
         .size(px(20.0))
@@ -3398,7 +4172,7 @@ fn sidebar_icon_button(
         .justify_center()
         .flex_shrink_0()
         .cursor(CursorStyle::PointingHand)
-        .hover(|s| s.bg(rgba(0xffffff66)))
+        .hover(move |s| s.bg(hover_bg))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
@@ -3407,20 +4181,23 @@ fn sidebar_icon_button(
             svg()
                 .path(icon)
                 .size(px(icon_size))
-                .text_color(rgba(0x817987ff))
-                .hover(|s| s.text_color(rgba(0x343039ff))),
+                .text_color(icon_color)
+                .hover(move |s| s.text_color(icon_hover_color)),
         )
 }
 
-/// Slightly larger labelled button used for "Open project" / "New session"
-/// empty-state actions.
 fn sidebar_text_button(
     id: impl Into<gpui::ElementId>,
     label: &'static str,
     icon: &'static str,
     primary: bool,
+    tokens: &ThemeTokens,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    let bg_color = if primary { tokens.primary_btn_bg } else { tokens.secondary_btn_bg };
+    let border_color = if primary { tokens.primary_btn_bg } else { tokens.border };
+    let hover_color = if primary { tokens.primary_btn_hover } else { tokens.secondary_btn_hover };
+    let text_color = if primary { tokens.primary_btn_fg } else { tokens.secondary_btn_fg };
     div()
         .id(id)
         .h(px(30.0))
@@ -3430,29 +4207,15 @@ fn sidebar_text_button(
         .flex()
         .items_center()
         .gap(px(6.0))
-        .bg(if primary {
-            rgba(0x1f6febff)
-        } else {
-            rgba(0x26272fff)
-        })
+        .bg(bg_color)
         .border_1()
-        .border_color(if primary {
-            rgba(0x1f6febff)
-        } else {
-            rgba(0xffffff66)
-        })
-        .hover(move |s| {
-            if primary {
-                s.bg(rgba(0x2f81f7ff))
-            } else {
-                s.bg(rgba(0x2d2e38ff))
-            }
-        })
-        .child(svg().path(icon).size(px(13.0)).text_color(rgba(0xffffffff)))
+        .border_color(border_color)
+        .hover(move |s| s.bg(hover_color))
+        .child(svg().path(icon).size(px(13.0)).text_color(text_color))
         .child(
             div()
                 .text_size(px(12.0))
-                .text_color(rgba(0xffffffff))
+                .text_color(text_color)
                 .child(label),
         )
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
@@ -3467,6 +4230,29 @@ impl Render for AppState {
         // "Looking" needs an active window: a visible but backgrounded window
         // has not been seen, so a finish there must still become Done.
         self.window_active = _window.is_window_active();
+
+        if self.theme_preference == ThemePreference::System {
+            let sys_mode = self.theme_preference.resolve_mode(_window.appearance());
+            let current_is_dark = self.palette.background().l < 0.5;
+            if sys_mode.is_dark() != current_is_dark {
+                self.palette = load_github_palette(sys_mode.is_dark());
+                let palette = self.palette.clone();
+                gpui_component::Theme::change(sys_mode, Some(_window), cx);
+                for project in &mut self.projects {
+                    for session in &mut project.sessions {
+                        for pane in &mut session.panes {
+                            let mut config = pane.terminal.read(cx).config().clone();
+                            config.colors = palette.clone();
+                            pane.terminal.update(cx, |term, cx| {
+                                term.update_config(config, cx);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let tokens = self.tokens(cx);
         // Track which pane owns keyboard focus each frame; the poller uses
         // this for Active-state resolution and for clearing sticky Done/Error.
         let mut focused_pane = None;
@@ -3582,7 +4368,7 @@ impl Render for AppState {
                             .items_center()
                             .justify_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.bg(rgba(0x23242cff)))
+                            .hover(move |s| s.bg(tokens.titlebar_btn_hover))
                             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                                 cx.stop_propagation();
                                 window.minimize_window();
@@ -3591,8 +4377,8 @@ impl Render for AppState {
                                 svg()
                                     .path("window-minimize.svg")
                                     .size(px(14.0))
-                                    .text_color(rgba(0x8788a5ff))
-                                    .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                    .text_color(tokens.titlebar_fg)
+                                    .hover(move |s| s.text_color(tokens.text_primary)),
                             ),
                     )
                 })
@@ -3606,7 +4392,7 @@ impl Render for AppState {
                             .items_center()
                             .justify_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.bg(rgba(0x23242cff)))
+                            .hover(move |s| s.bg(tokens.titlebar_btn_hover))
                             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                                 cx.stop_propagation();
                                 window.zoom_window();
@@ -3619,8 +4405,8 @@ impl Render for AppState {
                                         "window-maximize.svg"
                                     })
                                     .size(px(14.0))
-                                    .text_color(rgba(0x8788a5ff))
-                                    .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                    .text_color(tokens.titlebar_fg)
+                                    .hover(move |s| s.text_color(tokens.text_primary)),
                             ),
                     )
                 })
@@ -3642,7 +4428,7 @@ impl Render for AppState {
                             svg()
                                 .path("window-close.svg")
                                 .size(px(14.0))
-                                .text_color(rgba(0x8788a5ff))
+                                .text_color(tokens.titlebar_fg)
                                 .hover(|s| s.text_color(rgba(0xffffffff))),
                         ),
                 )
@@ -3652,7 +4438,7 @@ impl Render for AppState {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgba(0x14151bff))
+            .bg(tokens.window_bg)
             .child(
                 self.make_drag_area(cx)
                     .h(px(38.0))
@@ -3661,9 +4447,9 @@ impl Render for AppState {
                     .items_center()
                     .justify_between()
                     .pl_4()
-                    .bg(rgba(0x14151bff))
+                    .bg(tokens.titlebar_bg)
                     .border_b_1()
-                    .border_color(rgba(0x20212aff))
+                    .border_color(tokens.titlebar_border)
                     .child(
                         div()
                             .flex()
@@ -3682,8 +4468,8 @@ impl Render for AppState {
                                             svg()
                                                 .path("icons/panel-left.svg")
                                                 .size(px(16.0))
-                                                .text_color(rgba(0x8788a5ff))
-                                                .hover(|s| s.text_color(rgba(0xf0f6fcff))),
+                                                .text_color(tokens.titlebar_fg)
+                                                .hover(move |s| s.text_color(tokens.text_primary)),
                                         )
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -3697,7 +4483,7 @@ impl Render for AppState {
                                 )
                             })
                             .text_size(px(12.5))
-                            .text_color(rgba(0x8788a5ff))
+                            .text_color(tokens.titlebar_fg)
                             .children(titlebar_logo.map(|logo| {
                                 div()
                                     .size(px(16.0))
@@ -3731,7 +4517,7 @@ impl Render for AppState {
                     .flex_col()
                     .flex_1()
                     .size_full()
-                    .bg(rgba(0x14151bff))
+                    .bg(tokens.window_bg)
                     .overflow_hidden()
                     .p(px(6.0))
                     .child(div().flex().flex_col().size_full().child(terminal_area)),
@@ -3739,11 +4525,16 @@ impl Render for AppState {
 
         let sidebar_content = self.render_sidebar(cx);
 
+        let main_content = match self.active_view {
+            ActiveView::Workspace => terminal_content.into_any_element(),
+            ActiveView::Settings => self.render_settings_page(_window, cx).into_any_element(),
+        };
+
         let root = div()
             .flex()
             .size_full()
-            .bg(rgba(0x14151bff))
-            .text_color(rgba(0xe6edf3ff))
+            .bg(tokens.window_bg)
+            .text_color(tokens.text_primary)
             .on_key_down(cx.listener(Self::on_key_down))
             .child(if self.sidebar_visible {
                 h_resizable("workspace-layout-panels")
@@ -3765,10 +4556,10 @@ impl Render for AppState {
                             .size_range(px(200.0)..px(500.0))
                             .child(sidebar_content),
                     )
-                    .child(resizable_panel().child(terminal_content))
+                    .child(resizable_panel().child(main_content))
                     .into_any_element()
             } else {
-                terminal_content.into_any_element()
+                main_content
             });
         diagnostics::render_end(diag_render);
         root
@@ -3810,129 +4601,6 @@ fn pane_agent_name(pane: &TerminalPane) -> String {
         return title.to_string();
     }
     "An agent".to_string()
-}
-
-fn parse_hex(s: &str) -> Option<u32> {
-    let hex = s.strip_prefix('#')?;
-    if hex.len() == 6 {
-        u32::from_str_radix(&format!("{hex}ff"), 16).ok()
-    } else if hex.len() == 8 {
-        u32::from_str_radix(hex, 16).ok()
-    } else {
-        None
-    }
-}
-
-fn hex_to_rgb(hex: u32) -> (u8, u8, u8) {
-    (
-        ((hex >> 24) & 0xff) as u8,
-        ((hex >> 16) & 0xff) as u8,
-        ((hex >> 8) & 0xff) as u8,
-    )
-}
-
-fn load_github_dark_palette() -> ColorPalette {
-    let theme_data = assets::AppAssets::get("themes/github.json");
-    if let Some(file) = theme_data {
-        if let Ok(Value::Array(themes)) = serde_json::from_slice::<Value>(&file.data) {
-            if let Some(github_dark) = themes
-                .iter()
-                .find(|t| t.get("name").and_then(Value::as_str) == Some("GitHub Dark"))
-            {
-                let mut builder = ColorPalette::builder();
-                let style = github_dark.get("style").and_then(Value::as_object);
-
-                let get_color = |key: &str| -> Option<(u8, u8, u8)> {
-                    style
-                        .and_then(|s| s.get(key))
-                        .and_then(Value::as_str)
-                        .and_then(parse_hex)
-                        .map(hex_to_rgb)
-                };
-
-                if let Some((r, g, b)) = get_color("terminal.background")
-                    .or_else(|| get_color("editor.background"))
-                    .or_else(|| get_color("background"))
-                {
-                    builder = builder.background(r, g, b);
-                }
-
-                if let Some((r, g, b)) = get_color("terminal.foreground")
-                    .or_else(|| get_color("editor.foreground"))
-                    .or_else(|| get_color("text"))
-                {
-                    builder = builder.foreground(r, g, b);
-                }
-
-                let cursor_color = github_dark
-                    .get("players")
-                    .and_then(Value::as_array)
-                    .and_then(|p| p.first())
-                    .and_then(|p| p.get("cursor"))
-                    .and_then(Value::as_str)
-                    .and_then(parse_hex)
-                    .map(hex_to_rgb)
-                    .or_else(|| get_color("text.accent"))
-                    .or_else(|| get_color("terminal.bright_foreground"))
-                    .or_else(|| get_color("terminal.foreground"));
-
-                if let Some((r, g, b)) = cursor_color {
-                    builder = builder.cursor(r, g, b);
-                }
-
-                let ansi_keys = [
-                    ("terminal.ansi.black", 0),
-                    ("terminal.ansi.red", 1),
-                    ("terminal.ansi.green", 2),
-                    ("terminal.ansi.yellow", 3),
-                    ("terminal.ansi.blue", 4),
-                    ("terminal.ansi.magenta", 5),
-                    ("terminal.ansi.cyan", 6),
-                    ("terminal.ansi.white", 7),
-                    ("terminal.ansi.bright_black", 8),
-                    ("terminal.ansi.bright_red", 9),
-                    ("terminal.ansi.bright_green", 10),
-                    ("terminal.ansi.bright_yellow", 11),
-                    ("terminal.ansi.bright_blue", 12),
-                    ("terminal.ansi.bright_magenta", 13),
-                    ("terminal.ansi.bright_cyan", 14),
-                    ("terminal.ansi.bright_white", 15),
-                ];
-
-                for (key, idx) in ansi_keys {
-                    if let Some((r, g, b)) = get_color(key) {
-                        builder = match idx {
-                            0 => builder.black(r, g, b),
-                            1 => builder.red(r, g, b),
-                            2 => builder.green(r, g, b),
-                            3 => builder.yellow(r, g, b),
-                            4 => builder.blue(r, g, b),
-                            5 => builder.magenta(r, g, b),
-                            6 => builder.cyan(r, g, b),
-                            7 => builder.white(r, g, b),
-                            8 => builder.bright_black(r, g, b),
-                            9 => builder.bright_red(r, g, b),
-                            10 => builder.bright_green(r, g, b),
-                            11 => builder.bright_yellow(r, g, b),
-                            12 => builder.bright_blue(r, g, b),
-                            13 => builder.bright_magenta(r, g, b),
-                            14 => builder.bright_cyan(r, g, b),
-                            15 => builder.bright_white(r, g, b),
-                            _ => builder,
-                        };
-                    }
-                }
-
-                return builder.build();
-            }
-        }
-    }
-
-    ColorPalette::builder()
-        .background(0x01, 0x04, 0x09)
-        .foreground(0xf0, 0xf6, 0xfc)
-        .cursor(0x44, 0x93, 0xf8)
-        .build()
 }
 
 fn detect_shell() -> (String, String) {
@@ -4034,11 +4702,12 @@ fn main() -> Result<()> {
             ensure_linux_desktop_entry();
             let window_icon = gpui::WindowIcon::from_png_bytes(APP_ICON_PNG).ok();
             gpui_component::init(cx);
-            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+            let initial_mode = ThemePreference::System.resolve_mode(cx.window_appearance());
+            gpui_component::Theme::change(initial_mode, None, cx);
             load_embedded_fonts(cx);
             sync_component_fonts(cx);
 
-            let palette = load_github_dark_palette();
+            let palette = load_github_palette(initial_mode.is_dark());
             let persistence_path = workspace_state::state_path();
 
             let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
@@ -4061,6 +4730,8 @@ fn main() -> Result<()> {
                         palette: palette.clone(),
                         focused_pane_id: None,
                         sidebar_visible: true,
+                        active_view: ActiveView::Workspace,
+                        theme_preference: ThemePreference::System,
                         integration_panel_visible: false,
                         integration_feedback: SharedString::from("Setup is opt-in. Status becomes Reporting only after a live event arrives."),
                         sidebar_width: px(330.0),
@@ -4073,7 +4744,8 @@ fn main() -> Result<()> {
                         status_primed: false,
                         pending_alerts: Vec::new(),
                         attention_seq: 0,
-                        agents_collapsed: false,
+                        project_menu: None,
+                        renaming_project: None,
                     });
 
                     let weak_state = app_state.downgrade();
@@ -4306,6 +4978,8 @@ mod resize_tests {
             palette,
             focused_pane_id: Some(1),
             sidebar_visible: true,
+            active_view: ActiveView::Workspace,
+            theme_preference: ThemePreference::System,
             integration_panel_visible: false,
             integration_feedback: SharedString::from(
                 "Setup is opt-in. Status becomes Reporting only after a live event arrives.",
@@ -4320,7 +4994,8 @@ mod resize_tests {
             status_primed: false,
             pending_alerts: Vec::new(),
             attention_seq: 0,
-            agents_collapsed: false,
+            project_menu: None,
+            renaming_project: None,
         }
     }
 
@@ -4971,7 +5646,7 @@ mod pane_tests {
     }
 
     #[test]
-    fn agents_panel_renders_an_agent_with_a_worker() {
+    fn sidebar_renders_with_agent_and_worker() {
         let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
             .expect("headless renderer");
         let (mut cx, app_state) = open_app(&mut cx);
@@ -4996,9 +5671,8 @@ mod pane_tests {
             );
             cx.notify();
         });
-        // The panel builds sections and rows from live state; drawing it is the
-        // contract (a missing `is_agent` row or a bad element would panic).
-        cx.draw_frame().expect("frame with the Agents panel");
+        // Drawing a frame with agent and sub-agent panes succeeds without panic.
+        cx.draw_frame().expect("frame with agent pane");
         let agents = app_state.read_with(&cx, |state, _| {
             state
                 .projects
@@ -5009,5 +5683,226 @@ mod pane_tests {
                 .count()
         });
         assert_eq!(agents, 1);
+    }
+
+    #[test]
+    fn project_rename_flow() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("initial frame");
+
+        let project_id = app_state.read_with(&cx, |state, _| state.projects[0].id);
+
+        // Start rename
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.start_renaming_project(project_id, window, cx);
+        });
+        assert!(app_state.read_with(&cx, |state, _| state.renaming_project.is_some()));
+
+        // Frame should render the inline input cleanly
+        cx.draw_frame().expect("frame while renaming project");
+
+        // Finish rename
+        cx.update_window_entity(&app_state, |state, _, cx| {
+            state.finish_renaming_project(project_id, SharedString::from("renamed-project"), cx);
+        });
+
+        let (name, is_renaming) = app_state.read_with(&cx, |state, _| {
+            (state.projects[0].name.clone(), state.renaming_project.is_some())
+        });
+        assert_eq!(name, "renamed-project");
+        assert!(!is_renaming);
+
+        // Frame renders with new project name
+        cx.draw_frame().expect("frame with renamed project");
+    }
+
+    #[test]
+    fn project_menu_and_remove_flow() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        let dir = scratch_project_dir("markup-menu-remove");
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.open_project_path(dir, window, cx);
+        });
+        cx.draw_frame().expect("frame with two projects");
+
+        let (count, project_id) = app_state.read_with(&cx, |state, _| {
+            (state.projects.len(), state.projects[1].id)
+        });
+        assert_eq!(count, 2);
+
+        // Open 3-dot dropdown menu
+        cx.update_window_entity(&app_state, |state, _, cx| {
+            state.project_menu = Some(project_id);
+            cx.notify();
+        });
+        // Frame renders menu popover and backdrop
+        cx.draw_frame().expect("frame with project menu open");
+
+        // Close/Remove the project
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.close_project(1, window, cx);
+        });
+        cx.draw_frame().expect("frame after removing project");
+
+        let (final_count, menu) = app_state.read_with(&cx, |state, _| {
+            (state.projects.len(), state.project_menu)
+        });
+        assert_eq!(final_count, 1);
+        assert_eq!(menu, None);
+    }
+}
+
+#[cfg(test)]
+mod settings_and_theme_tests {
+    use super::*;
+    use gpui::{KeyDownEvent, Modifiers, TestAppContext, VisualContext};
+    use resize_tests::open_app;
+
+    #[test]
+    fn settings_page_toggle_and_render() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        // Initially on workspace
+        let initial_view = app_state.read_with(&cx, |state, _| state.active_view);
+        assert_eq!(initial_view, ActiveView::Workspace);
+
+        // Switch to settings
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            state.active_view = ActiveView::Settings;
+            cx.notify();
+        });
+        cx.draw_frame().expect("draw settings page frame");
+        let in_settings = app_state.read_with(&cx, |state, _| state.active_view);
+        assert_eq!(in_settings, ActiveView::Settings);
+
+        // Switch back to workspace
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            state.active_view = ActiveView::Workspace;
+            cx.notify();
+        });
+        cx.draw_frame().expect("draw workspace page frame");
+        let back_to_workspace = app_state.read_with(&cx, |state, _| state.active_view);
+        assert_eq!(back_to_workspace, ActiveView::Workspace);
+    }
+
+    #[test]
+    fn settings_keyboard_shortcuts() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        // Ctrl+, opens settings
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let ev = KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    modifiers: Modifiers {
+                        control: true,
+                        ..Default::default()
+                    },
+                    key: ",".to_string(),
+                    key_char: Some(",".to_string()),
+                },
+                is_held: false,
+            };
+            state.on_key_down(&ev, window, cx);
+        });
+        let view = app_state.read_with(&cx, |state, _| state.active_view);
+        assert_eq!(view, ActiveView::Settings);
+
+        // Escape closes settings
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let ev = KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    modifiers: Modifiers::default(),
+                    key: "escape".to_string(),
+                    key_char: None,
+                },
+                is_held: false,
+            };
+            state.on_key_down(&ev, window, cx);
+        });
+        let view = app_state.read_with(&cx, |state, _| state.active_view);
+        assert_eq!(view, ActiveView::Workspace);
+    }
+
+    #[test]
+    fn theme_switching_updates_palette_and_terminals() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        // Default preference is System
+        let pref = app_state.read_with(&cx, |state, _| state.theme_preference);
+        assert_eq!(pref, ThemePreference::System);
+
+        // Switch to Light
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.set_theme_preference(ThemePreference::Light, Some(window), cx);
+        });
+        cx.draw_frame().expect("draw light theme frame");
+
+        app_state.read_with(&cx, |state, cx| {
+            assert_eq!(state.theme_preference, ThemePreference::Light);
+            assert!(state.palette.background().l > 0.8, "Light terminal background should be bright");
+            let pane_term_palette = state.projects[0].sessions[0].panes[0].terminal.read(cx).config().colors.clone();
+            assert_eq!(pane_term_palette.background(), state.palette.background());
+        });
+
+        // Switch to Dark
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.set_theme_preference(ThemePreference::Dark, Some(window), cx);
+        });
+        cx.draw_frame().expect("draw dark theme frame");
+
+        app_state.read_with(&cx, |state, cx| {
+            assert_eq!(state.theme_preference, ThemePreference::Dark);
+            assert!(state.palette.background().l < 0.2, "Dark terminal background should be dark");
+            let pane_term_palette = state.projects[0].sessions[0].panes[0].terminal.read(cx).config().colors.clone();
+            assert_eq!(pane_term_palette.background(), state.palette.background());
+        });
+
+        // Switch back to System
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.set_theme_preference(ThemePreference::System, Some(window), cx);
+        });
+        cx.draw_frame().expect("draw system theme frame");
+        assert_eq!(
+            app_state.read_with(&cx, |state, _| state.theme_preference),
+            ThemePreference::System
+        );
+    }
+
+    #[test]
+    fn session_or_pane_selection_resets_settings_view() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+
+        // In settings, selecting session switches to workspace
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.active_view = ActiveView::Settings;
+            state.select_session(0, 0, window, cx);
+        });
+        assert_eq!(
+            app_state.read_with(&cx, |state, _| state.active_view),
+            ActiveView::Workspace
+        );
+
+        // In settings, focusing pane switches to workspace
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.active_view = ActiveView::Settings;
+            state.focus_pane(1, window, cx);
+        });
+        assert_eq!(
+            app_state.read_with(&cx, |state, _| state.active_view),
+            ActiveView::Workspace
+        );
     }
 }

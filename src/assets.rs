@@ -102,6 +102,12 @@ mod tests {
         assert!(assets.load("icons/folder.svg").unwrap().is_some());
         assert!(assets.load("icons/folder-plus.svg").unwrap().is_some());
         assert!(assets.load("icons/x.svg").unwrap().is_some());
+        assert!(assets.load("icons/settings.svg").unwrap().is_some());
+        assert!(assets.load("icons/arrow-left.svg").unwrap().is_some());
+        assert!(assets.load("icons/sun.svg").unwrap().is_some());
+        assert!(assets.load("icons/moon.svg").unwrap().is_some());
+        assert!(assets.load("icons/monitor.svg").unwrap().is_some());
+        assert!(assets.load("icons/ellipsis.svg").unwrap().is_some());
         assert!(assets.load("logo/markup.png").unwrap().is_some());
         let icon = gpui::WindowIcon::from_png_bytes(crate::APP_ICON_PNG).unwrap();
         assert_eq!(icon.width, 1364);

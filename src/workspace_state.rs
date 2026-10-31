@@ -1,3 +1,4 @@
+use crate::theme::ThemePreference;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -25,6 +26,8 @@ pub struct SavedWorkspace {
     pub sidebar_visible: bool,
     #[serde(default = "default_width")]
     pub sidebar_width: f32,
+    #[serde(default)]
+    pub theme: ThemePreference,
 }
 
 impl Default for SavedWorkspace {
@@ -34,6 +37,7 @@ impl Default for SavedWorkspace {
             active_project: None,
             sidebar_visible: default_visible(),
             sidebar_width: default_width(),
+            theme: ThemePreference::default(),
         }
     }
 }
@@ -98,4 +102,29 @@ fn save_locked(path: &Path, state: &SavedWorkspace) -> io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_workspace_defaults_to_system_theme() {
+        let json = r#"{"projects":[]}"#;
+        let parsed: SavedWorkspace = serde_json::from_str(json).expect("parse workspace");
+        assert_eq!(parsed.theme, ThemePreference::System);
+    }
+
+    #[test]
+    fn saved_workspace_theme_roundtrip() {
+        for pref in [ThemePreference::System, ThemePreference::Light, ThemePreference::Dark] {
+            let workspace = SavedWorkspace {
+                theme: pref,
+                ..Default::default()
+            };
+            let serialized = serde_json::to_string(&workspace).expect("serialize");
+            let deserialized: SavedWorkspace = serde_json::from_str(&serialized).expect("deserialize");
+            assert_eq!(deserialized.theme, pref);
+        }
+    }
 }
